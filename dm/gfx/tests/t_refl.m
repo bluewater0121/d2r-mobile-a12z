@@ -41,7 +41,7 @@ int main(void) { @autoreleasepool {
             struct { int i, kind, reg, aid, rw, dtt, dpf; } w[] = {
                 {0, NVN_RB_SUPPORT, 0, 0, 0, -1, -1}, {1, C, 10, 1, 0, -1, -1}, {4, NVN_RB_C1, 0, 4, 0, -1, -1}, {7, NVN_RB_DRV0, 0, 7, 0, -1, -1},
                 {8, NVN_RB_DRV2, 0, 8, 0, -1, -1}, {11, NVN_RB_SBUFP, 4, 11, 0, -1, -1}, {13, TB, 8, 13, 0, -1, -1}, {14, T, 41, 14, 0, 2, F},
-                {15, S, 3, 15, 0, -1, -1}, {28, T, 39, 28, 0, 3, D}, {34, T, 33, 34, 0, 5, D}, {36, T, 46, 36, 0, 7, F}};
+                {15, S, 3, 15, 0, -1, -1}, {28, T, 39, 28, 0, 3, F}, {34, T, 33, 34, 0, 5, F}, {36, T, 46, 36, 0, 7, F}};
             for (unsigned k = 0; k < sizeof w / sizeof *w; k++) {
                 const nvn_rbind *g = &r.b[w[k].i]; char m[64];
                 snprintf(m, sizeof m, "B 绑定[%d] 种类", w[k].i); check(m, w[k].kind, g->kind);

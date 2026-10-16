@@ -35,7 +35,15 @@ MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/mai
 MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/shader_map.tsv')
 BF_WANT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/bf_want.tsv')
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
-XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
+# 资源绑定档位（BIND）：ab = 参数块（argument buffer，要 argument buffers tier 2，即 Metal 3 / Apple GPU family 7 及以上，A14 起）；
+#                      discrete = 逐槽绑定（spirv-cross 缺省形态，[[buffer(n)]] / [[texture(n)]] / [[sampler(n)]] 各自独立，Metal 2 起可用，老机型走这条）
+# 两档的链版本 V 不同（dmsh_chain.py options() 计入 BIND），产物各自进 b-<V>/，互不覆盖，便于回归对比。
+# Resource binding mode (BIND): ab = argument buffer (needs argument buffers tier 2, i.e. Metal 3 / Apple GPU family 7+, A14 onward);
+#                      discrete = per-slot binding (spirv-cross default, [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]] each independent, available since Metal 2, for older GPUs)
+# The two modes have different chain versions V (BIND is part of dmsh_chain.py options()), so their build output goes to separate b-<V>/ dirs without overwriting, which makes regression comparison easy.
+BIND = os.environ.get('DMSH_BIND', 'ab')
+if BIND not in ('ab', 'discrete'): sys.exit('【红】DMSH_BIND 只可 ab（参数块）或 discrete（逐槽绑定）')
+XC = ['--msl', '--msl-version', '20300'] + (['--msl-argument-buffers'] if BIND == 'ab' else []) + ['--msl-texture-buffer-native', '--msl-pad-fragment-output']
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
@@ -318,14 +326,94 @@ def decode_tex(name):
     s = next((slot(x, SAMP_BASE, sb) for x in words if x * 4 >= SAMP_BASE and slot(x, SAMP_BASE, sb) is not None), None)
     return t, s, ty
 
+def entry_args(msl):
+    """离散绑定（BIND=discrete）：入口函数签名里的逐槽资源 → [(类型, 名字, 槽类, 槽号)]。
+    按 <> 深度感知切分参数，使 texture3d<float, access::write> 这类含逗号的模板类型不被逗号拆开。
+    Per-slot binding (BIND=discrete): the resources in the entry signature → [(type, name, slot class, slot number)].
+    Parameters are split with <> depth awareness so template types containing commas (e.g. texture3d<float, access::write>) are not torn apart by the comma."""
+    m = re.search(r'^(?:vertex|fragment|kernel)\s+\S+\s+\w+\s*\((.*?)\)\s*\{', msl, re.S | re.M)
+    if not m: return []
+    parts, depth, cur = [], 0, ''
+    for ch in m.group(1):
+        if ch == '<': depth += 1
+        elif ch == '>': depth -= 1
+        if ch == ',' and depth == 0: parts.append(cur); cur = ''
+        else: cur += ch
+    parts.append(cur)
+    out = []
+    for p in parts:
+        s = ' '.join(p.split())
+        mm = re.match(r'^(.*?)\s+(\w+)\s*\[\[(buffer|texture|sampler)\((\d+)\)\]\]$', s)
+        if mm: out.append((mm.group(1), mm.group(2), mm.group(3), int(mm.group(4))))
+    return out
+
+LIM_SAMPLER = 16   # MSL 的 [[sampler(n)]] 只有 0–15 十六个位置（语言上限，不是设备能力）| MSL has only sixteen sampler locations, 0-15 (a language limit, not a device capability)
+
+def sampler_vars(src):
+    """入口签名里的 sampler 参数：[(变量名, MSL 槽号)]，按槽号排序 | sampler parameters in the entry signature: [(variable name, MSL slot)], sorted by slot"""
+    m = re.search(r'^(?:vertex|fragment|kernel).*?\((.*?)\)\s*\{', src, re.S | re.M)
+    if not m: return []
+    return sorted(((nm, int(n)) for nm, n in re.findall(r'sampler (\w+) \[\[sampler\((\d+)\)\]\]', m.group(1))), key=lambda x: x[1])
+
+def samp_key(nm):
+    """sampler 变量名 → 分组键（种类, NVN 槽）：种类不同（分离采样器 samp / 合并句柄 samp_tex）取值来源不同
+    （S.samp[stage][r] 对 S.tex[stage][r] >> 20），槽号相同也不能并成一组
+    sampler variable name → group key (kind, NVN slot): different kinds (separate sampler samp / combined handle samp_tex) read from different sources
+    (S.samp[stage][r] vs S.tex[stage][r] >> 20), so even with the same slot number they must not be merged into one group"""
+    d = decode_tex(nm[:-5]) if nm.endswith('Smplr') else None
+    if not d: return None
+    return ('samp', d[1]) if d[2] else ('samp_tex', d[0])
+
+def samp_merge_by_reg(src):
+    """逐槽档：采样器变量多于 16 个时按 NVN 槽合并成一组（返回 合并后的 MSL、组数或 None、诊断或 None）。
+    同一 NVN 槽 r 下的所有 sampler 变量运行时取的是同一个句柄（S.tex[stage][r] >> 20 或 S.samp[stage][r] >> 20），
+    任何一次绘制里配置都相同，所以并为一组永远安全——与游戏怎么改采样器配置无关，不需要真机 dump。
+    合并是「变量级」的：把同组变量在函数体里的引用全换成组代表，再从签名里删掉多余声明并重编号（共用槽位会报
+    cannot reserve 'sampler' resource location，改槽号没用）。全库 6927 个里 25 个需要合并（ps_models_p.bin）。
+    Discrete mode: when there are more than 16 sampler variables, merge them by NVN slot (returns the merged MSL, the group count or None, and a diagnostic or None).
+    All sampler variables of one NVN slot r read the same handle at run time (S.tex[stage][r] >> 20 or S.samp[stage][r] >> 20),
+    so their config is identical in every draw and merging them is always safe - whatever the game does with sampler configs, and without needing a device dump.
+    The merge is variable-level: references to the group's other variables in the body are replaced by the group's representative, the extra declarations are dropped from the signature and the rest renumbered (sharing a location reports
+    cannot reserve 'sampler' resource location; changing the slot number alone does not help). 25 of the 6927 shaders in the whole library need it (ps_models_p.bin)."""
+    sv = sampler_vars(src)
+    if len(sv) <= LIM_SAMPLER: return src, None, None
+    keys = {nm: samp_key(nm) for nm, _ in sv}
+    if any(v is None for v in keys.values()): return src, None, f'{sum(1 for v in keys.values() if v is None)} 个采样器变量名解不出槽（不合并）'
+    g = collections.OrderedDict()
+    for nm, _slot in sv: g.setdefault(keys[nm], []).append(nm)
+    groups = [v for v in g.values()]
+    if len(groups) > LIM_SAMPLER: return src, None, f'按 NVN 槽合并后仍有 {len(groups)} 个采样器 > {LIM_SAMPLER}'
+    m = re.search(r'^((?:vertex|fragment|kernel).*?\)\s*\{)', src, re.S | re.M)
+    if not m: return src, None, '找不到入口函数签名'
+    pre, sig, body = src[:m.start(1)], m.group(1), src[m.end(1):]
+    for i, members in enumerate(groups):
+        rep = members[0]
+        for other in members[1:]:
+            body = re.sub(r'\b' + re.escape(other) + r'\b', rep, body)
+            sig = re.sub(r'\s*sampler ' + re.escape(other) + r' \[\[sampler\(\d+\)\]\],?', '', sig)
+        sig = re.sub(r'(sampler ' + re.escape(rep) + r' \[\[sampler\()\d+(\)\]\])', lambda mm: mm.group(1) + str(i) + mm.group(2), sig)
+    out = pre + sig + body
+    resid = [d for gg in groups for d in gg[1:] if re.search(r'\b' + re.escape(d) + r'\b', out)]
+    if resid: return src, None, f'合并后仍残留 {len(resid)} 个被并掉的变量名'
+    if len(sampler_vars(out)) != len(groups): return src, None, '合并后的签名采样器数与组数不符'
+    return out, len(groups), None
+
 def reflect(key, stage, msl, res):
-    """MSL 参数缓冲结构体成员 → 回放反射：kind（同 nvn_refl.h）+ NVN 槽号 + 参数缓冲成员号 | MSL argument buffer struct member → replay reflection: kind (same as nvn_refl.h) + NVN slot number + argument buffer member index"""
+    """MSL 资源 → 回放反射：kind（同 nvn_refl.h）+ NVN 槽号 + 定位方式
+    （ab 档：参数块内序号 arg_id，全部资源同在 buffer 槽 0；discrete 档：槽类 cls + 槽号 slot，各自独立）
+    MSL resources → replay reflection: kind (same as nvn_refl.h) + NVN slot number + how to locate it
+    (mode ab: index arg_id inside the argument buffer, all resources live in buffer slot 0; mode discrete: slot class cls + slot number slot, each independent)"""
     body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
     sb_cb = {b['binding']: b for b in res['sbufs']}
     binds = []
-    for m in re.finditer(r'^\s*(.+?)\s+(\w+)\s*\[\[id\((\d+)\)\]\];', body.group(1) if body else '', re.M):
-        ty, nm, aid = m.group(1).strip(), m.group(2), int(m.group(3))
-        e = {'msl_name': nm, 'msl_type': ty, 'arg_id': aid}
+    if BIND == 'ab':   # 参数块：成员在 struct 里，序号即 [[id(n)]] | argument buffer: members live in a struct, the index is [[id(n)]]
+        items = [(m.group(1).strip(), m.group(2), 'argbuf', 0, int(m.group(3)))
+                 for m in re.finditer(r'^\s*(.+?)\s+(\w+)\s*\[\[id\((\d+)\)\]\];', body.group(1) if body else '', re.M)]
+    else:              # 逐槽：资源在入口签名里，各自占 [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]] | per-slot: resources are in the entry signature, each with its own [[...]]
+        items = [(ty, nm, cls, slot, None) for ty, nm, cls, slot in entry_args(msl)]
+    for ty, nm, cls, slot, aid in items:
+        e = {'msl_name': nm, 'msl_type': ty, 'cls': cls, 'slot': slot}
+        if aid is not None: e['arg_id'] = aid
         if nm == 'support_buffer': e.update(kind='support')
         elif re.fullmatch(r'[a-z]+_c(\d+)', nm):
             n = int(re.fullmatch(r'[a-z]+_c(\d+)', nm).group(1))
@@ -357,11 +445,14 @@ DRV_FILL = {0: [(0x110, 0x210), (0x310, 0x410), (0x510, 0x610)],   # c0：存储
             2: [(0x168, 0x568), (0x568, 0x968)]}                     # c2：贴图句柄表、采样器句柄表（各 128 槽 × 8） | c2: texture handle table, sampler handle table (128 slots × 8 each)
 
 def drv_reads(src):
-    """MSL 里对驱动段 c0 / c2 的读取：常量下标 → 字节区间；非常量下标记为动态 | Reads of driver segments c0 / c2 in the MSL: constant index → byte range; non-constant indices are recorded as dynamic"""
+    """MSL 里对驱动段 c0 / c2 的读取：常量下标 → 字节区间；非常量下标记为动态。
+    两档写法不同：ab 档经参数块指针解引用 (*spvDescriptorSet0.fp_cN)._m0[i]；discrete 档直接 fp_cN._m0[i]，故 \\) 可选。
+    Reads of driver segments c0 / c2 in the MSL: constant index → byte range; non-constant indices are recorded as dynamic.
+    The two modes write it differently: mode ab dereferences the argument buffer pointer (*spvDescriptorSet0.fp_cN)._m0[i]; mode discrete uses fp_cN._m0[i] directly - hence the \\) is optional."""
     out = {}
     for bank in (0, 2):
         offs, dyn = set(), False
-        for m in re.finditer(r'fp_c%d\)\._m0\[([^\]]+)\]' % bank, src):
+        for m in re.finditer(r'fp_c%d\)?\._m0\[([^\]]+)\]' % bank, src):
             idx = m.group(1).rstrip('u')
             if idx.isdigit(): offs.add(int(idx) * 16)
             else: dyn = True
@@ -376,11 +467,194 @@ def unfillable(dr):
             if not any(a <= o and o + 16 <= b or (a <= o < b) for a, b in DRV_FILL[int(bank)]): bad.append(f'c{bank}+{o:#x}')
     return bad
 
-RULES = []   # 按着色器名挂的 MSL 改写规则（函数, 适用判定）；原有的暗部重映射 toe 已删（回到 Switch 原版亮度） | MSL rewrite rules attached by shader name (function, applicability test); the former dark-range remap toe has been removed (back to the original Switch brightness)
+# SHFL wrapper：Ryujinx 翻译器为每个 SHFL 生成的辅助函数（参数 = 值, 异或量, 立即数, 投票输出, lane）
+# SHFL wrapper: the helper the Ryujinx translator emits for each SHFL (args = value, xor amount, immediate, vote out, lane)
+WRAP_RE = re.compile(r'int _(\d+)\(thread const int& _\d+, thread const int& _\d+, thread const int& _\d+, thread int& _\d+, thread uint& gl_SubgroupInvocationID\)\s*\{(.*?)\n\}', re.S)
+# 调用点：紧邻的两行常量是异或量与立即数；立即数 (imm >> 8) & 31 是段掩码（28 = 4 lane 一组即 quad，0 = 整个 wave 32 lane）
+# Call site: the two adjacent constants are the xor amount and the immediate; (imm >> 8) & 31 is the segment mask (28 = groups of 4 lanes, i.e. a quad; 0 = the whole 32-lane wave)
+SHFL_CALL_RE = re.compile(r'int _\d+ = (\d+);\s*int _\d+ = (\d+);\s*int _\d+;\s*int _\d+ = _(\d+)\(_\d+, _\d+, _\d+, _\d+, gl_SubgroupInvocationID\);')
+
+def shfl_wrappers(src):
+    """SHFL wrapper 编号 → [定义匹配, 调用点常量集合 (异或量, 立即数)] | SHFL wrapper id → [definition match, set of call-site constants (xor, imm)]"""
+    w = {}
+    for m in WRAP_RE.finditer(src): w[m.group(1)] = [m, set()]
+    for m in SHFL_CALL_RE.finditer(src):
+        if m.group(3) in w: w[m.group(3)][1].add((int(m.group(1)), int(m.group(2))))
+    return w
+
+QUAD_DEF = """
+#include <metal_quadgroup>
+// 老显卡（Apple 5 家族，A12Z）没有 SIMD-group 指令，但有 quad 指令（Apple 工程师：A11 起支持 quad group，不支持 simd group）：
+// 掩码 28 的 SHFL 只在 quad 内交换（lane^1 / lane^2），可以用 quad_shuffle 按原语义还原
+// Older GPUs (Apple family 5, A12Z) have no SIMD-group instructions but do have quad ones (Apple engineer: quad groups are supported from A11 on, simd groups are not):
+// an SHFL with mask 28 only exchanges inside the quad (lane^1 / lane^2), so it can be restored to its original semantics with quad_shuffle
+template<typename T> inline T spvQuadShuffle(T value, ushort lane)
+{
+    return metal::quad_shuffle(value, ushort(lane & 3));
+}
+"""
+
+def quad_shuffle_restore(src):
+    """片元着色器里 quad 作用域的 SHFL（掩码 28）→ quad_shuffle，把「降级成本 lane」换回真交换。
+
+    ps_models_p / ps_terrain / ps_glass_p 等主场景着色器每帧都在用这个交换（整库 180 个着色器、278 处调用），
+    它取的是 quad 伙伴的像素值（阴影比较的参考深度等）。降级后取不到（等于取自己），阴影与光照因此算错——
+    实测 iPad Pro 2020 上表现为火光附近的地面出现色斑。
+    Quad-scoped SHFLs (mask 28) in fragment shaders → quad_shuffle, replacing the "downgrade to this lane" with a real exchange.
+    The main scene shaders (ps_models_p / ps_terrain / ps_glass_p ...) use this exchange every frame (180 shaders, 278 call sites across the library);
+    it fetches the quad partner's pixel value (the reference depth of the shadow compare among others). Downgraded it is unreachable (it degenerates to
+    reading itself), so shadows and lighting come out wrong - measured on iPad Pro 2020 as colour patches on the ground next to firelight.
+    """
+    if BIND != 'discrete': return src
+    w = shfl_wrappers(src)
+    quad = [k for k, (m, consts) in w.items() if consts and all(xr < 4 and (imm >> 8) & 31 == 28 for xr, imm in consts)]
+    if not quad: return src
+    for k in quad:   # 从后往前改，前面的区间不受影响 | back to front so earlier spans stay valid
+        m, body = w[k][0], w[k][0].group(2)
+        body2 = body.replace('spvSubgroupShuffle(as_type<float>(', 'spvQuadShuffle(as_type<float>(')
+        if body2 == body: continue
+        src = src[:m.start(2)] + body2 + src[m.end(2):]
+    inc = [m.end() for m in re.finditer(r'#include [^\n]*\n', src)]
+    return src[:inc[-1]] + QUAD_DEF + src[inc[-1]:] if inc else QUAD_DEF + src
+
+def warp_shuffle_threadgroup(src):
+    """整 wave 蝶形归约（掩码 0 = 32 lane 全波，异或 1/2/4/8/16）→ threadgroup 内存 + 屏障。
+
+    只有 cs_light_bin_depth_bounds_c 走这条：它对 32 个 lane 的 tile 深度做 min / max 归约，
+    归约结果由 lane 0 用 threadgroup 原子写入。降级（取自己）会让每个 tile 的深度区间塌成一个采样值，
+    深度分片的灯光剔除就跟着错——灯光会打到本该被挡住的像素上。
+    该 kernel 线程组恰为 [32,1,1]（= 1 个 simdgroup），且归约段在统一控制流里（前面没有 return），
+    所以可以用 threadgroup 内存 + 屏障按原语义实现。
+    Whole-wave butterfly reductions (mask 0 = all 32 lanes, xor 1/2/4/8/16) → threadgroup memory + barriers.
+    Only cs_light_bin_depth_bounds_c takes this path: it reduces the tile depth min / max over the 32 lanes and lane 0 writes
+    the result with threadgroup atomics. The downgrade (reading itself) collapses each tile's depth range to a single sample,
+    which breaks depth-sliced light culling - lights then land on pixels they should be occluded from.
+    This kernel's threadgroup is exactly [32,1,1] (= one simdgroup) and the reduction sits in uniform control flow (no return before it),
+    so it can be implemented with threadgroup memory + barriers at full original semantics.
+    """
+    if BIND != 'discrete': return src
+    w = shfl_wrappers(src)
+    # 判定：helper 体内有一次对 spvSubgroupShuffle 的实调用。不能按调用点常量判定——该着色器的异或量 /
+    # lane 是运行期现算的（as_type<int>(...) ^ mask），SHFL_CALL_RE 匹配不到，ids 为空，函数会静默原样
+    # 返回，从外面看和"生效了但不够"一模一样（10-18 实测踩过：装机库没带上这个还原，画面却查不出原因）。
+    # Detection: the helper body holds one real call to spvSubgroupShuffle. Detecting by call-site constants
+    # does not work - this shader's xor amount / lane is computed at run time (as_type<int>(...) ^ mask), so
+    # SHFL_CALL_RE never matches, ids comes out empty and the function silently returns unchanged, which from
+    # the outside looks exactly like "it applied but was not enough" (hit for real on 10-18: the installed
+    # library shipped without this restoration and the picture gave no clue why).
+    ids = [k for k, (m, consts) in w.items() if len(re.findall(r'spvSubgroupShuffle\(', m.group(2))) == 1]
+    if len(ids) != 1: return src
+    m, body = w[ids[0]][0], w[ids[0]][0].group(2)
+    mm = re.search(r'( *)float (_\d+) = spvSubgroupShuffle\(as_type<float>\((_\d+)\), uint\((_\d+)\)\);', body)
+    if not mm: return src
+    ind, rv, vv, tv = mm.group(1), mm.group(2), mm.group(3), mm.group(4)
+    body2 = body[:mm.start()] + (
+        f'{ind}threadgroup_barrier(mem_flags::mem_threadgroup);   /* 老显卡无 SIMD-group：整 wave 交换改走 threadgroup 内存 */\n'
+        f'{ind}spvWarpTmp[gl_SubgroupInvocationID & 31u] = as_type<uint>({vv});\n'
+        f'{ind}threadgroup_barrier(mem_flags::mem_threadgroup);\n'
+        f'{ind}float {rv} = as_type<float>(spvWarpTmp[uint({tv}) & 31u]);') + body[mm.end():]
+    seg = src[m.start():m.end()]
+    seg = seg.replace(body, body2).replace('thread uint& gl_SubgroupInvocationID)', 'thread uint& gl_SubgroupInvocationID, threadgroup uint* spvWarpTmp)')
+    src = src[:m.start()] + seg + src[m.end():]
+    src = re.sub(r'(_%s\([^;]*?), gl_SubgroupInvocationID\)' % ids[0], r'\1, gl_SubgroupInvocationID, spvWarpTmp)', src)
+    km = re.search(r'^kernel void \w+\(.*?\)\s*\n\{\n', src, re.S | re.M)
+    if not km: return src
+    return src[:km.end()] + '    threadgroup uint spvWarpTmp[32];\n' + src[km.end():]
+
+def grunge_decal_discard(src):
+    """贴花 pass 三面测试全没过时整片丢弃（修掉覆盖度公式退化成的小正数）。
+
+    ps_grunge_p 从 texture_buffer 取三组平面系数，逐片测试贴花盒，命中才往颜色 0 累积。
+    覆盖度项是 max(0, 1e6/(1e5 - z^3))，z 是世界坐标分量：1e5 是按「z 是零点几」估的量级，
+    设计意图是 z^3 << 1e5、覆盖度恒等于 10 的固定增益。实测 z 是数百，z^3 到 1e8~1e9 把 1e5
+    彻底淹没，公式退化成 -1e6/z^3 ≈ 0.004 的小正数 —— 于是「一片都没命中」的像素也被写上一层
+    极淡的暖色，叠在起伏地面 / 水洼边缘就是可见的红斑（iPad Pro 2020 实测，Mac 上同区间但更淡）。
+    相对灵敏度 d(cov)/cov = -3·dz/z，正好对上三个特征：世界锚定、跨分辨率不变、只在地形起伏处出现。
+
+    只掐「未命中」这一支：三面测试全没过就 discard_fragment()，抹掉退化的小正数。
+    实测 iPad 红斑消失，其余场景与原版差 1.4/255。这是止血不是恢复 —— 命中的贴花覆盖度仍是
+    那个退化小值，本该可见的贴花依然偏淡；要恢复得改公式，那是另一件事。
+    与 BIND 无关：公式退化在所有绑定档都成立，所以不加 discrete 判定。
+
+    Decal pass: discard the whole fragment when no decal plane passes the three-plane test.
+    ps_grunge_p fetches three plane sets from a texture_buffer and tests each decal box, accumulating
+    into colour 0 only on a hit. Its coverage term is max(0, 1e6/(1e5 - z^3)) where z is a world-space
+    component: 1e5 assumes z is sub-unit, so that z^3 << 1e5 and the coverage is a constant gain of 10.
+    In practice z is in the hundreds, z^3 reaches 1e8-1e9 and swamps 1e5, so the expression degenerates
+    to -1e6/z^3 ~= 0.004 - a small positive number. Pixels where no decal was hit therefore still get a
+    very faint warm layer, which shows up as red blotches on uneven ground / puddle edges (measured on
+    iPad Pro 2020; the same range exists on Mac but stays below the visible threshold).
+    d(cov)/cov = -3.dz/z explains all three traits: world-anchored, resolution independent, only on
+    undulating terrain.
+    Only the "no hit" branch is cut: if every three-plane test fails, discard_fragment() drops the
+    degenerate value. Measured: blotches gone on iPad, other scenes within 1.4/255 of stock.
+    This is a stop-bleed, not a restoration - a hit decal still carries the degenerate coverage and
+    stays too faint; restoring that means fixing the formula, a separate job.
+    BIND independent: the degeneracy holds in every binding tier, so there is no discrete-only guard.
+    """
+    if 'dmDecalHit' in src: return src   # 幂等：已改过就跳过 | idempotent
+    head = '    main0_out out = {};\n'
+    if src.count(head) != 1:
+        raise RuntimeError('grunge_decal_discard：找不到唯一的 `main0_out out = {};`，MSL 形态已变，规则需重写')
+    # 三面测试的形态是 `abs(d) <= 0.5` 且结果再被 && 串起来；链终点是那个被 `if (...)` 引用的 bool。
+    # 只认左操作数取自 abs 测试的，否则会误抓深度比较（本着色器里 `_626 = _624 && _618` 就是深度区间，
+    # 拿它做 discard 条件会整片误杀）。
+    absb = {m.group(3) for m in re.finditer(r'float (_\d+) = abs\((_\d+)\);\n *bool (_\d+) = \1 <= 0\.5;', src)}
+    finals = [m for m in re.finditer(r'( *)bool (_\d+) = (_\d+) && (_\d+);\n', src)
+              if m.group(3) in absb and re.search(r'if \(%s\)' % m.group(2), src)]
+    if not finals:
+        raise RuntimeError('grunge_decal_discard：找不到被 if 引用的三面测试链终点，MSL 形态已变，规则需重写')
+    for m in reversed(finals):   # 从后往前改，前面的位置不受影响 | back to front so earlier offsets stay valid
+        src = src[:m.end()] + m.group(1) + 'dmDecalHit = fast::max(dmDecalHit, %s ? 1.0 : 0.0);\n' % m.group(2) + src[m.end():]
+    src = src.replace(head, head + '    float dmDecalHit = 0.0;\n', 1)
+    out0 = re.search(r'( *)out\.\w+\.x = ', src)
+    if not out0:
+        raise RuntimeError('grunge_decal_discard：找不到颜色输出 `out.*.x =`，MSL 形态已变，规则需重写')
+    return src[:out0.start()] + out0.group(1) + 'if (dmDecalHit < 0.5) { discard_fragment(); }\n' + src[out0.start():]
+
+# 只有这几个着色器名走上面两条规则（规则按名挂，指纹也按名算，所以别的着色器不会因此重出）
+# Only these shader names take the two rules above (rules are attached by name and the fingerprint is taken by name, so no other shader is rebuilt because of them)
+QUAD_SHFL_NAMES = frozenset(('ps_models_p.bin', 'ps_terrain.bin', 'ps_glass_p.bin', 'ps_foliage_p.bin', 'ps_grunge_p.bin',
+                             'ps_detail_normal_p.bin', 'ps_alpha_threshold_p.bin', 'ps_models_blend_p.bin', 'ps_grass_lighting_p.bin'))
+WARP_SHFL_NAMES = frozenset(('cs_light_bin_depth_bounds_c.bin',))
+GRUNGE_DECAL_NAMES = frozenset(('ps_grunge_p.bin',))
+
+RULES = [(quad_shuffle_restore, lambda n: n in QUAD_SHFL_NAMES), (warp_shuffle_threadgroup, lambda n: n in WARP_SHFL_NAMES), (grunge_decal_discard, lambda n: n in GRUNGE_DECAL_NAMES)]   # 按着色器名挂的 MSL 改写规则（函数, 适用判定）；原有的暗部重映射 toe 已删（回到 Switch 原版亮度） | MSL rewrite rules attached by shader name (function, applicability test); the former dark-range remap toe has been removed (back to the original Switch brightness)
 # 第一段代码指纹不包含 dmsh_fetch.py；可读 tile 变体单独按生成 MSL 做第二段缓存。
 # The first-stage code fingerprint does not include dmsh_fetch.py; readable-tile variants get a separate second-stage cache keyed on the generated MSL.
 CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain,) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
 TOOL_FP = tool_fingerprint().encode()
+
+def msl_downgrade_subgroup(src):
+    """逐槽绑定档（老显卡）专用：把 SIMD-group 操作降级成「只有本 lane」的形式。
+
+    simd_shuffle / simd_ballot 是 Metal 3 起的 SIMD-group 指令，要 A14 / Apple GPU family 7 以上才有；
+    A12Z（Apple 5 家族）上没有对应硬件指令。**编译期查不出来**：xcrun metal 编出的 AIR 里只是一个
+    air.simd_shuffle 调用，要等到真机 newRenderPipelineState 时按 GPU 做 lower 才炸
+    （"Encountered unlowered function call to air.simd_shuffle.f32"，实测 iPad Pro 2020 每帧报几万次，画面全黑）。
+
+    降级后语义不再是真的跨 lane 读值（读不到本 lane 之外的值），但管线能建起来、画面能出；
+    用到 subgroup 的那几处特效可能与原版有差。参数块档（Metal 3 设备）不走这里，保持原样。
+    Per-slot binding mode (older GPUs) only: downgrade SIMD-group operations to "this lane alone".
+    simd_shuffle / simd_ballot are SIMD-group instructions from Metal 3 on, requiring A14 / Apple GPU family 7 or later;
+    the A12Z (Apple family 5) has no matching hardware instruction. **This cannot be caught at compile time**: the AIR
+    xcrun metal emits only holds an air.simd_shuffle call, and it blows up when the real device lowers it for the GPU
+    inside newRenderPipelineState ("Encountered unlowered function call to air.simd_shuffle.f32"; measured tens of
+    thousands of times per frame on iPad Pro 2020, with a fully black picture).
+    After the downgrade the semantics are no longer a true cross-lane read (values outside this lane are unreachable),
+    but pipelines build and the picture shows up; the few effects that use subgroups may differ from the original.
+    The argument-buffer mode (Metal 3 devices) does not come through here and keeps the original code.
+    """
+    s = src
+    # spirv-cross 生成的 shuffle helper：跨 lane 读不到，就退回本 lane 的值
+    s = re.sub(r'return simd_shuffle\(\s*([^;]+?),\s*[^;]+?\);', r'return \1;', s)
+    s = re.sub(r'return !!simd_shuffle\(\(ushort\)value,\s*lane\);', r'return value;', s)
+    s = re.sub(r'return \(vec<bool, N>\)simd_shuffle\(\(vec<ushort, N>\)value,\s*lane\);', r'return value;', s)
+    # ballot：按只有本 lane 投票（uint4 的低位 = 本 lane 的谓词）
+    s = re.sub(r'simd_vote vote = simd_ballot\(value\);',
+               r'uint2 vote = uint2(value ? 1u : 0u, 0u);   /* 降级：老显卡无 SIMD-group，按只有本 lane 投票 */', s)
+    s = re.sub(r'return uint4\(as_type<uint2>\(\(simd_vote::vote_t\)vote\), 0, 0\);', r'return uint4(vote, 0, 0);', s)
+    return s
 
 def finish(key, w, j, c1):
     name, k = loc[key]
@@ -389,6 +663,19 @@ def finish(key, w, j, c1):
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
     src = open(msl).read()
+    for rule, applies in RULES:   # 按着色器名挂的改写（老显卡的两条 subgroup 还原规则） | rewrites attached by shader name (the two subgroup restoration rules for older GPUs)
+        if applies(name): src = rule(src)
+    notes = []
+    if BIND == 'discrete':   # 老显卡上有两处能力缺口要补：SIMD-group 指令（降级）与采样器位置只有 16 个（按 NVN 槽合并）
+        src2 = msl_downgrade_subgroup(src)   # Two gaps to fill on older GPUs: SIMD-group instructions (downgrade) and only 16 sampler locations (merge by NVN slot)
+        if src2 != src:
+            open(msl, 'w').write(src2); src = src2
+            if 'quad_shuffle(' in src2: notes.append('逐槽档：quad 内交换已还原为 quad_shuffle（原语义）')
+            elif 'spvWarpTmp' in src2: notes.append('逐槽档：整 wave 交换已改用 threadgroup 内存 + 屏障（原语义）')
+            else: notes.append('逐槽档：SIMD-group 操作已降级（本 lane）' if 'simd_' not in src2 else '逐槽档：SIMD-group 降级后仍有残留')
+        src2, ngroups, why = samp_merge_by_reg(src)
+        if why: return '采样器合并失败', why[:160], None
+        if ngroups: open(msl, 'w').write(src2); src = src2; notes.append(f'逐槽档：{ngroups} 组采样器（按 NVN 槽合并）')
     try:
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
         tmp_lib = lib + '.tmp-' + str(os.getpid())
@@ -405,9 +692,9 @@ def finish(key, w, j, c1):
         except subprocess.CalledProcessError as e: return 'iOS metal 失败', str(e)[:160], None
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
-    refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
+    refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'bind_model': BIND, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None,
-            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['无配对 PC 反射，查询按缺省'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
+            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + notes + (['无配对 PC 反射，查询按缺省'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src)}

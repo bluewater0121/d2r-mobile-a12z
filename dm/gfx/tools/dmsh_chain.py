@@ -25,14 +25,18 @@ FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_fetch.py', 't
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
 XLATE_DIR = os.path.dirname(os.environ.get('XLATE', f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate'))
 
-def options():
-    return 'debug=%s reduced=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1')
+def options(bind=None):
+    # bind：资源绑定档位（ab = 参数块 / discrete = 逐槽绑定），与 dmsh_build.py 的 DMSH_BIND 同义；
+    # 两档产物不得混在同一 b-<V>/ 里，故计入 V。bind: resource binding mode (ab = argument buffer / discrete = per-slot), same meaning as DMSH_BIND in dmsh_build.py;
+    # the build output of the two modes must not be mixed in one b-<V>/, so it is part of V.
+    return 'debug=%s reduced=%s bind=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1',
+                                            bind or os.environ.get('DMSH_BIND', 'ab'))
 
-def version():
+def version(bind=None):
     h = hashlib.sha256()
     for f in FILES:
         h.update(f.encode() + b'\0' + open(os.path.join(GFX, f), 'rb').read() + b'\0')
-    h.update(options().encode())
+    h.update(options(bind).encode())
     return h.hexdigest()[:12]
 
 def sha16(p): return hashlib.sha256(open(p, 'rb').read()).hexdigest()[:16]
@@ -70,8 +74,12 @@ if __name__ == '__main__':
         for b in bad: print('【红】翻译链工具与锁文件不符：' + b)
         sys.exit(1 if bad else 0)
     elif a == ['--header']:
-        open(HEADER, 'w').write('// 生成文件（dm/gfx/tools/dmsh_chain.py --header）：本源码树期望的 B 着色器库翻译链版本（缺省选项）；宿主只加载 <库目录>/b-<V>/\n'
-                                f'#define DMSH_CHAIN "{version()}"\n')
-        print(version())
+        # 两档都写：宿主按显卡的能力选一套（参数缓冲 tier2 的在的用 ab，没有的（A13 及更早）用 discrete），两档库的反射不同、不能混
+        # Both modes are written: the host picks one by GPU capability (ab when argument buffer tier 2 is present, discrete otherwise, i.e. A13 and earlier); the two libraries' reflection differs and must not be mixed
+        open(HEADER, 'w').write('// 生成文件（dm/gfx/tools/dmsh_chain.py --header）：本源码树期望的 B 着色器库翻译链版本；宿主只加载 <库目录>/b-<V>/\n'
+                                '// DMSH_CHAIN = 参数块档（无绑定，要 argument buffers tier 2）；DMSH_CHAIN_T1 = 逐槽绑定档（Metal 2 起可用，老显卡走这条）\n'
+                                f'#define DMSH_CHAIN "{version("ab")}"\n'
+                                f'#define DMSH_CHAIN_T1 "{version("discrete")}"\n')
+        print(version('ab'), version('discrete'))
     elif not a: print(version())
     else: sys.exit(__doc__ if __doc__ else '用法见文件头')

@@ -56,8 +56,10 @@ cp -R "$APP" "$O/app" || die "拷 App 失败"; A=$O/app
 take() {   # 安装包内路径（以 / 结尾 = 目录） [nolist = 只搬走、不记进清单：使用者不需要补的东西] | path inside the install package (ending with / = a directory) [nolist = only moved away, not recorded in the manifest: things users do not need to add]
   local p=${1%/}; [ -e "$A/$p" ] || return 0
   mkdir -p "$O/ref/$(dirname "$p")" && mv "$A/$p" "$O/ref/$p" || die "搬不走 $p"; [ "${2:-}" = nolist ] || echo "$1" >> "$O/shell_manifest.txt"; }
-V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h); [ -n "$V" ] && [ -d "$A/msl/b-$V" ] || die "着色器库目录不对（链版本「${V}」）"
-take "msl/b-$V/"; rmdir "$A/msl" 2> /dev/null
+V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h); V1=$(sed -n 's/^#define DMSH_CHAIN_T1 "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h)
+for v in "$V" "$V1"; do [ -n "$v" ] && [ -d "$A/msl/b-$v" ] && take "msl/b-$v/"; done
+[ -d "$A/msl/b-$V" ] || [ -d "$A/msl/b-$V1" ] || die "着色器库目录不对（链版本「${V}」/「${V1}」）"
+rmdir "$A/msl" 2> /dev/null
 for d in romfs_overlay romfs_overlay_variants hud_v4_ui mapgoal mercslots; do take "$d/"; done
 # 测试存档（我们自己的回归用）与老机型补充包的覆盖层（没带补充包时是空目录）：壳里不带，使用者也不用补
 # Test saves (for our own regression) and the overlay of the Legacy Device Pack (an empty directory when no Legacy Device Pack is included): not carried in the shell, and users do not need to add them either

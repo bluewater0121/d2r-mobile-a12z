@@ -1590,6 +1590,55 @@ static __attribute__((always_inline)) inline void use_rec(const char *kind, uint
     if (t) fprintf(g_use_f, "%s\t%#llx\t%llu\t%lld\t%d\t%#x\t%ux%u\n", kind, (unsigned long long)addr, (unsigned long long)len, (long long)atomic_load(&g_cur_frame), tid, t->d.format, t->d.width, t->d.height);
     else fprintf(g_use_f, "%s\t%#llx\t%llu\t%lld\t\t\t\n", kind, (unsigned long long)addr, (unsigned long long)len, (long long)atomic_load(&g_cur_frame));
 }
+// DM_NVN_SAMPDUMP=<文件>：把每个「着色器 × 阶段 × 采样器槽」实际用到的采样器配置原样记盘，按（键, 阶段, 槽, 配置）去重，首见时记一行。
+// 用途：离散绑定（DMSH_BIND=discrete）下 MSL 的采样器槽号上限是 15，而本库有 25 个着色器用到 17–26 个采样器；
+// 只要某两个槽在所有记录里配置完全相同，离线就能把它们并为一组（共用 1 个槽），把采样器数压到 16 以内。
+// 列：key  stage  reg  sid  minf  magf  ws  wt  wr  cmp_mode  cmp_func  lod_min  lod_max  lod_bias  aniso  border[4]  first_frame
+// DM_NVN_SAMPDUMP=<file>: records the sampler configuration actually used by every "shader x stage x sampler slot", deduplicated by (key, stage, slot, config), one line on first sight.
+// Purpose: under discrete binding (DMSH_BIND=discrete) the MSL sampler slot index tops out at 15, while 25 shaders in this library use 17-26 samplers;
+// whenever two slots carry exactly the same config in every record, offline they can be merged into one group (sharing a single slot) to bring the sampler count under 16.
+// Columns: key  stage  reg  sid  minf  magf  ws  wt  wr  cmp_mode  cmp_func  lod_min  lod_max  lod_bias  aniso  border[4]  first_frame
+static int g_sdump = -1; static FILE *g_sdump_f; static long g_sdump_rows; static nvn_hmap g_sdump_seen = {.klen = 40};
+static pthread_mutex_t g_sdump_mu = PTHREAD_MUTEX_INITIALIZER;
+static void sdump_exit(void) { if (g_sdump_f) { fflush(g_sdump_f); MLOG("[sampdump] 记录结束：去重后 %ld 行", g_sdump_rows); } }
+static uint64_t sd_fnv(uint64_t h, const void *d, size_t n) { const uint8_t *b = d; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } return h; }
+static int sdump_on(void) {   // 惰性初始化：未设环境变量则恒 0，热路径只多一次整数判断 | Lazy init: stays 0 when the env var is unset, so the hot path only pays one integer test
+    if (g_sdump < 0) {
+        const char *e = getenv("DM_NVN_SAMPDUMP"); g_sdump = 0;
+        if (e) {
+            g_sdump_f = fopen(e, "w");
+            if (!g_sdump_f) MLOG("【红】DM_NVN_SAMPDUMP 打不开 %s", e);
+            else {
+                fprintf(g_sdump_f, "key\tstage\treg\tsid\tminf\tmagf\tws\twt\twr\tcmp_mode\tcmp_func\tlod_min\tlod_max\tlod_bias\taniso\tb0\tb1\tb2\tb3\tfirst_frame\n");
+                fflush(g_sdump_f); g_sdump = 1; atexit(sdump_exit);
+                MLOG("[sampdump] 记录采样器配置 → %s", e);
+            }
+        }
+    }
+    return g_sdump > 0 && g_sdump_f != NULL;
+}
+static void sdump_rec(const char *key, int stage, int reg, int sid, const samp_par *p) {
+    uint8_t k[40] = {0};   // 键：着色器键 24 字节 +（阶段 | 槽）8 字节 + 配置散列 8 字节 | Key: 24 bytes of shader key + 8 bytes of (stage | slot) + 8 bytes of config hash
+    uint64_t h = 1469598103934665603ull;   // FNV-1a 逐字段散列：避开结构体填充字节的不确定性 | FNV-1a hashed field by field, to avoid the uncertainty of struct padding bytes
+    uint8_t u[7] = { p->minf, p->magf, p->ws, p->wt, p->wr, p->cmp_mode, p->cmp_func };
+    float f[8] = { p->lod_min, p->lod_max, p->lod_bias, p->aniso, p->border[0], p->border[1], p->border[2], p->border[3] };
+    h = sd_fnv(sd_fnv(h, u, sizeof u), f, sizeof f);
+    size_t n = 0; while (n < 24 && key[n]) n++;
+    memcpy(k, key, n);
+    uint64_t loc = ((uint64_t)(uint32_t)stage << 24) | (uint64_t)(uint32_t)reg;
+    memcpy(k + 24, &loc, 8); memcpy(k + 32, &h, 8);
+    pthread_mutex_lock(&g_sdump_mu);
+    if (nvn_hm_get(&g_sdump_seen, k)) { pthread_mutex_unlock(&g_sdump_mu); return; }
+    nvn_hm_put(&g_sdump_seen, k, (void *)1);
+    if (g_sdump_f) {
+        g_sdump_rows++;
+        fprintf(g_sdump_f, "%s\t%d\t%d\t%d\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\t%lld\n",
+                n ? key : "?", stage, reg, sid, (unsigned)u[0], (unsigned)u[1], (unsigned)u[2], (unsigned)u[3], (unsigned)u[4], (unsigned)u[5], (unsigned)u[6],
+                (double)f[0], (double)f[1], (double)f[2], (double)f[3], (double)f[4], (double)f[5], (double)f[6], (double)f[7], (long long)atomic_load(&g_cur_frame));
+        fflush(g_sdump_f);
+    }
+    pthread_mutex_unlock(&g_sdump_mu);
+}
 static uint64_t att_bytes(id<MTLTexture> t, NSUInteger level) {
     if (!t) return 0;
     NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
@@ -2166,7 +2215,7 @@ static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 // ---------- 着色器映射表：Switch 控制段哈希 → PC metallib（dm/gfx/tools/shader_map.py 产出） ----------
 // ---------- Shader mapping table: Switch control section hash → PC metallib (produced by dm/gfx/tools/shader_map.py) ----------
 static NSMutableDictionary<NSString *, NSArray *> *g_shmap;
-static NSString *g_shmap_path, *g_msl_dir;
+static NSString *g_shmap_path, *g_msl_dir, *g_chain;   // g_chain：实际在用的那套库的翻译链版本（按显卡选档，见下） | g_chain: chain version of the library actually in use (mode chosen by GPU, see below)
 static NSString *exe_rel(const char *rel) {
     char buf[4096]; uint32_t n = sizeof buf;
     if (_NSGetExecutablePath(buf, &n)) return nil;
@@ -2189,15 +2238,32 @@ static void shmap_load(void) {
     }
     g_shmap_path = path;
     const char *m = getenv("DM_MSL_DIR");
-    // 库目录 = <DM_MSL_DIR 或缺省缓存>/b-<翻译链版本>：版本取自本源码树的 dmsh_chain.h（tools/dmsh_chain.py），旧源码树编的宿主只认旧版本的库
-    // Library directory = <DM_MSL_DIR or default cache>/b-<translation chain version>: the version comes from this source tree's dmsh_chain.h (tools/dmsh_chain.py); a host built from an old source tree only accepts libraries of the old version
-    g_msl_dir = [NSString stringWithFormat:@"%@/b-%s", m ? @(m) : [NSString stringWithFormat:@"%s%s/build/cache/metal_shader_cache", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work"], DMSH_CHAIN];
-    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("【红】着色器库目录 %s 不存在：本源码树的翻译链版本 %s 还没出包（dm/gfx/tools/dmsh_build.py）", g_msl_dir.UTF8String, DMSH_CHAIN);
+    // 库目录 = <DM_MSL_DIR 或缺省缓存>/b-<翻译链版本>：版本取自本源码树的 dmsh_chain.h（tools/dmsh_chain.py），旧源码树编的宿主只认旧版本的库。
+    // 两套库：DMSH_CHAIN = 参数块档（无绑定，要 argument buffers tier 2，A14 / M1 起）；DMSH_CHAIN_T1 = 逐槽绑定档（资源各自占
+    // [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]]，Metal 2 起可用）。按显卡选：没有 tier2 的（A13 及更早，如 iPad Pro 2020 的 A12Z）只能走后者。
+    // 选中的那套不在（出包只出了一档）就退回另一套并报红——两档反射不同，混不得，退回了照样能跑但没了无绑定那套的优化。
+    // Library directory = <DM_MSL_DIR or default cache>/b-<translation chain version>: the version comes from this source tree's dmsh_chain.h (tools/dmsh_chain.py); a host built from an old source tree only accepts libraries of the old version.
+    // Two libraries: DMSH_CHAIN = argument-buffer mode (bindless, needs argument buffers tier 2, A14 / M1 onward); DMSH_CHAIN_T1 = per-slot binding mode (each resource has its own
+    // [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]], available since Metal 2). Chosen by GPU: those without tier 2 (A13 and earlier, e.g. the A12Z of iPad Pro 2020) can only use the latter.
+    // If the chosen one is absent (only one mode was built) fall back to the other and report a failure - the two modes' reflection differs and must not be mixed; after a fallback it still runs, just without the bindless optimizations.
+    NSString *base = m ? @(m) : [NSString stringWithFormat:@"%s%s/build/cache/metal_shader_cache", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work"];
+    int t1 = !(g_dev.argumentBuffersSupport >= MTLArgumentBuffersTier2);   // 1 = 没有参数块 tier2 → 只能逐槽绑定 | 1 = no argument buffer tier 2 → per-slot binding only
+    NSString *dir[2] = { [NSString stringWithFormat:@"%@/b-%s", base, DMSH_CHAIN_T1], [NSString stringWithFormat:@"%@/b-%s", base, DMSH_CHAIN] };
+    int pick = t1 ? 0 : 1;
+    if (![NSFileManager.defaultManager fileExistsAtPath:dir[pick]] && [NSFileManager.defaultManager fileExistsAtPath:dir[1 - pick]]) {
+        MLOG("【红】%s 库目录不存在，退回 %s（出包时 DMSH_BIND=ab 与 discrete 两档都要出）", dir[pick].UTF8String, dir[1 - pick].UTF8String);
+        pick = 1 - pick;
+    }
+    g_msl_dir = dir[pick]; g_chain = pick ? @DMSH_CHAIN : @DMSH_CHAIN_T1;   // 退回发生时按实际在用的那套核反射 | after a fallback the reflection is verified against the library actually in use
+    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("【红】着色器库目录 %s 不存在：本源码树的翻译链版本 %s 还没出包（dm/gfx/tools/dmsh_build.py）", g_msl_dir.UTF8String, g_chain.UTF8String);
+    MLOG("显卡 %s：参数缓冲 %s → %s着色器库 b-%s", g_dev.name.UTF8String, t1 ? "tier 1（无无绑定）" : "tier 2", pick ? "参数块档" : "逐槽绑定档", g_chain.UTF8String);
     NSString *cp = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"c1_full.tsv"];   // 与映射表同目录（Mac：dm/gfx/nvn；iOS：App 内 dm/，run.sh 一起拷） | Same directory as the mapping table (Mac: dm/gfx/nvn; iOS: dm/ inside the App, copied along by run.sh)
     NSString *ct = cp ? [NSString stringWithContentsOfFile:cp encoding:NSUTF8StringEncoding error:nil] : nil;
     NSString *head = ct ? [[ct componentsSeparatedByString:@"\n"] firstObject] : nil;
-    NSString *want = [NSString stringWithFormat:@"# chain b-%s", DMSH_CHAIN];
-    if (!head || ![head hasPrefix:want]) {
+    // 清单头记的是出库时那一档的链版本：两套库的 c1 常数段内容一样，任一档的版本都认（两档都不是 = 过期）
+    // The list header records the chain version of the mode it was built from: the c1 constant segments are the same in both libraries, so either version is accepted (neither = stale)
+    NSString *want = [NSString stringWithFormat:@"# chain b-%s", DMSH_CHAIN], *want1 = [NSString stringWithFormat:@"# chain b-%s", DMSH_CHAIN_T1];
+    if (!head || !([head hasPrefix:want] || [head hasPrefix:want1])) {
         MLOG("【红】c1_full.tsv 清单过期或缺失，全部 c1 独占 64 KiB");
     } else {
         g_c1_full_valid = 1; g_c1_full = [NSMutableSet set];
@@ -2350,13 +2416,13 @@ static NvShader *shader_load(NSString *pc, int stage) {
     NSData *jd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]];
     NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (!lib || !j) { MLOG("【红】加载着色器失败 %s：%s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "无反射 json"); return nil; }
-    if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("【红】着色器 %s 的翻译链版本 %s 与本宿主期望的 %s 不符", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
+    if (![j[@"chain"] isEqual:g_chain]) { MLOG("【红】着色器 %s 的翻译链版本 %s 与本宿主期望的 %s 不符", pc.UTF8String, [[j[@"chain"] description] UTF8String], g_chain.UTF8String); return nil; }
     NvShader *o = [NvShader new];
     char err[160];
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
-    if (o->rf.nb) {
+    if (o->rf.nb && !o->rf.discrete) {   // 逐槽绑定档没有参数块：反射的 cls / slot 已给出槽位，不用建参数编码器 | the per-slot mode has no argument buffer: the reflection's cls / slot give the slot, no argument encoder needed
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
         int max_aid = -1;
         for (int i = 0; i < o->rf.nb; i++) max_aid = MAX(max_aid, o->rf.b[i].aid);
@@ -3022,15 +3088,18 @@ static uint64_t zero_bank_gpu(void) { static uint64_t gpu; if (!gpu) gpu = zero_
 // g_ui_moff is set per draw by draw() (0 = no change); the copies live in a ring buffer, and the same address in the same pass is copied only once.
 static double g_ui_moff;
 static int ui_mat_ok(void) { const p_bind_buf *u = &S.ubo[0][0]; void *mb; uint64_t mo; return u->addr && u->size >= 64 && u->size <= 4096 && !pend_hits(u->addr, u->size) && mtl_addr(u->addr, u->size, &mb, &mo); }
-static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
+// 逐槽绑定档要的是缓冲对象 + 偏移（不是光一个显卡地址），故一并回报（cb / co 可为 NULL）
+// The per-slot binding mode needs the buffer object + offset (not just a GPU address), so they are reported as well (cb / co may be NULL)
+static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo, id<MTLBuffer> *cb, size_t *co) {
     enum { RING = 4 << 20 }; static __strong id<MTLBuffer> ring; static uint64_t ring_gpu, la, ls, lp, lg; static size_t at; static double lo;
     if (!ring) { ring = [g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu = ring.gpuAddress; }
-    if (la == u->addr && ls == u->size && lp == g_pass.serial && lo == g_ui_moff) return lg;
+    if (la == u->addr && ls == u->size && lp == g_pass.serial && lo == g_ui_moff) { if (cb) { *cb = ring; *co = lg - ring_gpu; } return lg; }
     const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents]; if (!src || u->size < 64 || u->size > 4096) return 0;
     size_t n = (u->size + 255) & ~(size_t)255; if (at + n > RING) at = 0;
     uint8_t *dst = (uint8_t *)ring.contents + at; memcpy(dst, src + mo, u->size);
     float m[16], o = (float)g_ui_moff; memcpy(m, dst, 64); m[1] += o * m[3]; m[5] += o * m[7]; m[9] += o * m[11]; m[13] += o * m[15]; memcpy(dst, m, 64);
     la = u->addr; ls = u->size; lp = g_pass.serial; lo = g_ui_moff; lg = ring_gpu + at; at += n;
+    if (cb) { *cb = ring; *co = lg - ring_gpu; }
     return lg;
 }
 #if DM_NVN_M3
@@ -3052,11 +3121,29 @@ static inline int m3_use_seen(void *p, uint32_t u) {
     return 0;
 }
 #endif
+// 逐槽绑定档：绑到编码器槽位上的缓冲偏移要按 16 字节对齐（constant / device 指针对齐要求），参数块档只写显卡地址、没这个约束。
+// 不对齐就把用到的这一段拷进本趟 arena（256 对齐）——NVN 的 uniform / 存储缓冲绑定本身要 256 对齐，按理不该走到这里
+// Per-slot binding mode: the buffer offset bound to an encoder slot must be 16-byte aligned (alignment requirement of constant / device pointers); the argument-buffer mode only writes a GPU address and has no such constraint.
+// When unaligned, copy the used range into this submission's arena (256-aligned) - NVN's own uniform / storage buffer bindings are 256-aligned, so this should not normally happen
+static void disc_align(id<MTLBuffer> *b, size_t *o, size_t n) {
+    if (!(*o & 15)) return;
+    id<MTLBuffer> ab; size_t off = arena_alloc(n ? n : 16, &ab);
+    if (n) memcpy((uint8_t *)ab.contents + off, (const uint8_t *)(*b).contents + *o, n);
+    RED_ONCE(47, "逐槽绑定：缓冲偏移 %#zx 没按 16 字节对齐，已把 %zu 字节拷进对齐块", *o, n);
+    *b = ab; *o = off;
+}
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
-    if (!sh->ae) return 1;
+    if (!sh->rf.nb) return 1;
+    int disc = sh->rf.discrete;   // 1 = 逐槽绑定档：资源直接绑到编码器槽位（无参数块 tier2 的老显卡） | 1 = per-slot binding mode: resources bound straight to encoder slots (older GPUs without argument buffer tier 2)
+    if (!disc && !sh->ae) return 1;
     uint64_t slots[NVN_REFL_MAXB] = {0};
+    // 逐槽档的绑定收集：按槽类各一张表，循环结束后一次性设到编码器上（同一槽位可能被别的着色器占过，每次绘制都要重设）
+    // Collection for the per-slot mode: one table per slot class, all set on the encoder at the end of the loop (the same slot may have been taken by another shader, so every draw must set them again)
+    __unsafe_unretained id<MTLBuffer> dbb[32]; size_t dbo[32]; uint32_t dbm = 0;
+    __unsafe_unretained id<MTLTexture> dtx[128]; uint32_t dtm[4] = {0,0,0,0};
+    __unsafe_unretained id<MTLSamplerState> dsp[16]; uint32_t dsm = 0;
     args_sync_dirty();
-    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+    if (!disc && !passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
@@ -3066,13 +3153,23 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     // 不声明的话只读贴图会和写它的拷贝乱序（迁 Metal 4 前实测过）。同一编码器内重复声明是幂等的
     // Older API: every resource a shader accesses indirectly through an argument block must have its usage declared on this encoder, so that the system knows its ordering dependency against other encoders (upload copies, other passes);
     // without the declaration a read-only texture gets out of order with the copy that writes it (measured before the move to Metal 4). Repeated declarations within one encoder are idempotent
-    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else if (!m3_use_seen((__bridge void *)r_, (uint32_t)(u))) [(id<MTLRenderCommandEncoder>)en useResource:r_ usage:(u) stages:MTLRenderStageVertex | MTLRenderStageFragment]; } \
+    // 逐槽档不声明：资源是直接绑在编码器槽位上的，系统看得见依赖；只有经参数块间接访问的（无绑定）才要声明
+    // The per-slot mode declares nothing: resources are bound straight to encoder slots and the system can see the dependency; only those reached indirectly through an argument buffer (bindless) need it
+    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_ && !disc) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else if (!m3_use_seen((__bridge void *)r_, (uint32_t)(u))) [(id<MTLRenderCommandEncoder>)en useResource:r_ usage:(u) stages:MTLRenderStageVertex | MTLRenderStageFragment]; } \
         if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
     #define USE_SAMP(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)   // 采样器不是资源，不用声明 | samplers are not resources and need no declaration
 #else
     #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
     #define USE_SAMP(r, u) USE(r, u)
 #endif
+    // 登记一处绑定：参数块档写显卡地址 / 资源号进参数块，逐槽档记住对象与槽位（槽号越界 = 反射与 metallib 不符，报红并跳过）
+    // Record one binding: the argument-buffer mode writes the GPU address / resource ID into the argument block, the per-slot mode remembers the object and the slot (a slot number out of range = reflection and metallib disagree, reported and skipped)
+    #define PUTBUF(g, o, of) do { if (disc) { if (b->cls == NVN_RC_BUFFER && b->slot < 32) { dbb[b->slot] = (o); dbo[b->slot] = (of); dbm |= 1u << b->slot; } \
+            else RED_ONCE(48, "逐槽绑定：%s 的槽类 %d / 槽号 %d 不是缓冲槽", sh->key, b->cls, b->slot); } else slots[aid] = (g); } while (0)
+    #define PUTTEX(g, o)     do { if (disc) { if (b->cls == NVN_RC_TEXTURE && b->slot < 128) { dtx[b->slot] = (o); dtm[b->slot >> 5] |= 1u << (b->slot & 31); } \
+            else RED_ONCE(48, "逐槽绑定：%s 的槽类 %d / 槽号 %d 不是贴图槽", sh->key, b->cls, b->slot); } else slots[aid] = (g); } while (0)
+    #define PUTSAMP(g, o)    do { if (disc) { if (b->cls == NVN_RC_SAMPLER && b->slot < 16) { dsp[b->slot] = (o); dsm |= 1u << b->slot; } \
+            else RED_ONCE(48, "逐槽绑定：%s 的槽类 %d / 槽号 %d 不是采样器槽", sh->key, b->cls, b->slot); } else slots[aid] = (g); } while (0)
     // DM_NVN_PASSDUMP：每通道每阶段第一次新编时记着色器键（K）与各绑定的实际来源（B：UBO 地址 / 长度 / 前 4 个浮点，贴图号与序号或「哑」）
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or 「哑」(dummy))
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
@@ -3087,7 +3184,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
-            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
+            id<MTLBuffer> cb = (__bridge id<MTLBuffer>)mb; size_t co = mo;
+            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo, &cb, &co); if (pg) gpu = pg; }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
@@ -3099,15 +3197,18 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                     FILE *f = fopen(p, "wb"); if (f) { fwrite((const void *)u->addr, 1, u->size, f); fclose(f); } else RED_ONCE(41, "CBDUMP 写不出 %s", p);
                 }
             }
-            slots[aid] = gpu;
-            USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
+            if (disc) disc_align(&cb, &co, u->size);
+            PUTBUF(gpu, cb, co);
+            USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT：合并句柄（贴图号 | 采样器号 << 20）的采样器部分 | SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
             int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[nvn_stage][reg] : S.samp[nvn_stage][reg]) >> 20) : 0;
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
-            slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
+            PUTSAMP(sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid(), ss ? ss : dummy_samp());
             USE_SAMP(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // 本段已持 g_rmu | g_rmu is already held in this section
                 if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d（0 最近点 / 1 双线性；2–5 带 mip）", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf); }
+            if (sdump_on() && sid > 0 && sid < g_nsreg && g_sreg_ok[sid])   // DM_NVN_SAMPDUMP：记本槽这次用的采样器配置（本段已持 g_rmu）| DM_NVN_SAMPDUMP: record the sampler config this slot used (g_rmu is already held here)
+                sdump_rec(sh->key[0] ? sh->key : (sh->builtin ? sh->builtin : "?"), nvn_stage, reg, sid, &g_sreg[sid]);
         } else if (b->kind == NVN_RB_TEX) {
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
@@ -3118,7 +3219,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
-            slots[aid] = trid;
+            PUTTEX(trid, t);
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
@@ -3126,7 +3227,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
-            slots[aid] = trid;
+            PUTTEX(trid, t);
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
         } else if (b->kind == NVN_RB_TBUF) {   // 类型化缓冲：贴图槽 r 里的缓冲贴图（目标 BUFFER） | Typed buffer: the buffer texture (target BUFFER) in texture slot r
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
@@ -3134,20 +3235,22 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (t && t.textureType != MTLTextureTypeTextureBuffer) { RED_ONCE(40, "类型化缓冲槽绑的不是缓冲贴图（贴图号 %d 类型 %lu）", tid, (unsigned long)t.textureType); t = nil; }
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
-            slots[aid] = trid;
+            PUTTEX(trid, t);
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B：存储缓冲 / 计算阶段 uniform 是设备指针，按 NVN 槽取地址 | B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
-            else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) {
+                id<MTLBuffer> sb = (__bridge id<MTLBuffer>)mb; size_t so = mo; if (disc) disc_align(&sb, &so, u->size);
+                use_rec("buf", u->addr, u->size, 0, NULL); PUTBUF(gpu, sb, so); USE(sb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            else { PUTBUF(dummy_buf_gpu(), dummy_buf(), 0); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "实" : "哑", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B：着色器自带常数段，取着色器时建好 | B: the shader's own constant segment, built when the shader is fetched
             id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 长 0（全库 600 份）而着色器仍声明：读 0 | c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
-            slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
+            PUTBUF((sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0), cb, sh->c1buf ? sh->c1off : 0);
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer：缩放 1.0、BGRA 互换 0、视口变换未关闭（视口字段不读） | support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
-            slots[aid] = support_gpu();
+            PUTBUF(support_gpu(), support_buf(), 0);
             USE(support_buf(), MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_DRV0 || b->kind == NVN_RB_DRV2) {
             // NVN 驱动常量段：出包时静态统计证明不读的供 0；读的按当前绑定现填——c0 = 存储缓冲表（基址 + 0x10 r：地址 64 位、大小 32 位），
@@ -3155,7 +3258,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
             // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
             int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
-            if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+            if (!sh->rf.drv_read[bank]) { PUTBUF(zero_bank_gpu(), zero_bank(), 0); USE(zero_bank(), MTLResourceUsageRead); }
             else {
                 id<MTLBuffer> db; size_t doff = arena_alloc(0xA00, &db); uint8_t *d = (uint8_t *)db.contents + doff; memset(d, 0, 0xA00);
                 if (bank == 0) {
@@ -3165,13 +3268,36 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 } else {
                     for (int r = 0; r < 128; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][r], sh_ = (uint32_t)S.samp[nvn_stage][r]; memcpy(d + 0x168 + 8 * r, &th, 4); memcpy(d + 0x568 + 8 * r, &sh_, 4); }
                 }
-                slots[aid] = g_cur_arena->gpu + doff;
+                PUTBUF(g_cur_arena->gpu + doff, db, doff);
                 USE(db, MTLResourceUsageRead);
             }
+        } else if (b->kind == NVN_RB_IGN) {   // 认不出种类的入口参数（细分的 spvOut / spvIndirectParams / spvTessLevel 等）：按槽类绑个哑资源，别让槽空着 | Entry argument whose kind was not recognised (tessellation spvOut / spvIndirectParams / spvTessLevel etc.): bind a dummy of the same slot class so the slot is not left empty
+            if (b->cls == NVN_RC_TEXTURE) { id<MTLTexture> t = dummy_tex(b->dtt, b->dpf); PUTTEX(0, t); USE(t, MTLResourceUsageRead); }
+            else if (b->cls == NVN_RC_SAMPLER) { id<MTLSamplerState> ss = dummy_samp(); PUTSAMP(0, ss); USE_SAMP(ss, MTLResourceUsageRead); }
+            else { PUTBUF(dummy_buf_gpu(), dummy_buf(), 0); USE(dummy_buf(), MTLResourceUsageRead); }
         } else RED_ONCE(46, "绑定种类 %d 未实现", b->kind);
     }
     #undef USE
     #undef USE_SAMP
+    #undef PUTBUF
+    #undef PUTTEX
+    #undef PUTSAMP
+    if (disc) {   // 逐槽档：把这一路收集到的资源一次性设到编码器上（还在 g_rmu 里：dtx / dsp 只是登记表里的裸指针） | per-slot mode: set everything collected for this draw on the encoder at once (still inside g_rmu: dtx / dsp are only raw pointers into the registry)
+        if (nvn_stage == 5) {
+            id<MTLComputeCommandEncoder> ce = (id<MTLComputeCommandEncoder>)en;
+            for (int i = 0; i < 32; i++) if (dbm >> i & 1) [ce setBuffer:dbb[i] offset:dbo[i] atIndex:i];
+            for (int i = 0; i < 128; i++) if (dtm[i >> 5] >> (i & 31) & 1) [ce setTexture:dtx[i] atIndex:i];
+            for (int i = 0; i < 16; i++) if (dsm >> i & 1) [ce setSamplerState:dsp[i] atIndex:i];
+        } else {
+            id<MTLRenderCommandEncoder> re = (id<MTLRenderCommandEncoder>)en; int vt = metal_vertex != 0;
+            for (int i = 0; i < 32; i++) if (dbm >> i & 1) { if (vt) [re setVertexBuffer:dbb[i] offset:dbo[i] atIndex:i]; else [re setFragmentBuffer:dbb[i] offset:dbo[i] atIndex:i]; }
+            for (int i = 0; i < 128; i++) if (dtm[i >> 5] >> (i & 31) & 1) { if (vt) [re setVertexTexture:dtx[i] atIndex:i]; else [re setFragmentTexture:dtx[i] atIndex:i]; }
+            for (int i = 0; i < 16; i++) if (dsm >> i & 1) { if (vt) [re setVertexSamplerState:dsp[i] atIndex:i]; else [re setFragmentSamplerState:dsp[i] atIndex:i]; }
+        }
+        pthread_mutex_unlock(&g_rmu);
+        g_args_dirty[nvn_stage] = 0; g_stat_args_enc++;
+        return 1;
+    }
     pthread_mutex_unlock(&g_rmu);
     NSUInteger arg_len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);

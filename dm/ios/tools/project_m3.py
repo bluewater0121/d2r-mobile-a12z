@@ -2,7 +2,10 @@
 # 老接口版的工程描述：project_m3.py <project.yml> <输出.yml> [free]   （run.sh 在 DM_IOS_M3=1 时调）
 # 第三个参数 free = 输入已经过了免费档（tools/project_free.py，DM_FREE_ACCOUNT=1 同时设着）：资源下载扩展那五处免费档已去掉，这里要求一处都不剩
 # 只改主程序三处：部署目标 26.0 → 18.0；编译参数加 -DDM_NVN_M3=1（图形后端不用 Metal 4，见 gfx/nvn/nvn_mtl.m）；
-# 处理器基线 a18 → a14（iOS 18 能装的机器里，内存够跑这个游戏的最老是 A14；宿主汇编要的 LSE 原子指令 A11 起就有）。
+# 处理器基线 a18 → a12（本包要装到 iPad Pro 2020 的 A12Z：LSE 原子指令 A11 起就有，A12Z 够用；但不能再往上——a13 起 clang 会开
+# __ARM_FEATURE_DOTPROD，libdeflate 的 adler32_impl.h 见到它就静态选 dotprod 实现、跳过运行时 CPU 检测，而 A12Z 没有 UDOT/SDOT 指令，
+# 第一次算 adler32 就 SIGILL（实测崩溃 pc=libdeflate_adler32，sig=4）。另外显式关掉 libdeflate 的 dotprod 实现，
+# 免得哪天把基线提上去又踩回来。
 # 资源下载扩展（RomfsDownloader，只服务苹果托管资源包，部署目标 iOS 26.4）不带：扩展的最低系统高于主程序的包在老系统上装不装得上没人验过，
 # 老接口版的资源本来也不走托管资源包（内测直装走自己的下载地址 / 手动拷，公开版用户自备）。去掉的三样与免费账号档相同（tools/project_free.py）：
 # 扩展目标、主程序对它的依赖、Info.plist 里托管资源包的三个键；主程序里见不到这三个键就不碰托管资源包。
@@ -10,7 +13,10 @@
 # Project description for the older-API build: project_m3.py <project.yml> <output.yml> [free]   (called by run.sh when DM_IOS_M3=1)
 # The third argument free = the input has already been through the free tier (tools/project_free.py, with DM_FREE_ACCOUNT=1 set at the same time): the five places of the resource-download extension are already removed by the free tier, and here none may remain
 # Only three things of the main program change: deployment target 26.0 -> 18.0; compile flags gain -DDM_NVN_M3=1 (the graphics backend does not use Metal 4, see gfx/nvn/nvn_mtl.m);
-# processor baseline a18 -> a14 (among the devices that can install iOS 18, the oldest with enough memory for this game is the A14; the LSE atomic instructions the host assembly needs exist from the A11).
+# processor baseline a18 -> a12 (this package has to install on the A12Z of iPad Pro 2020: the LSE atomic instructions exist from the A11, so A12Z is fine; but no higher --
+# from a13 on clang enables __ARM_FEATURE_DOTPROD, and libdeflate's adler32_impl.h statically selects the dotprod implementation when it sees it, skipping the run-time CPU check,
+# while A12Z has no UDOT/SDOT instruction, so the first adler32 computation raises SIGILL (measured crash pc=libdeflate_adler32, sig=4). libdeflate's dotprod implementation is
+# also switched off explicitly, so raising the baseline later cannot step on this again.
 # The resource-download extension (RomfsDownloader, serving only Apple-hosted asset packs, deployment target iOS 26.4) is left out: whether a package whose extension has a higher minimum system than the main program installs on an older system has not been verified by anyone,
 # and the older-API build does not use hosted asset packs for resources anyway (public users bring their own). The three things removed are the same as for the free-account tier (tools/project_free.py):
 # the extension target, the main program's dependency on it, and the three hosted-asset-pack keys in Info.plist; without these three keys the main program does not touch hosted asset packs.
@@ -22,7 +28,7 @@ def one(old, new):
     if s.count(old) != 1: sys.exit(f"🔴 project_m3：工程描述里「{old[:40]}」应恰好出现 1 次，实际 {s.count(old)} 次")
     s = s.replace(old, new)
 one('    iOS: "26.0"', '    iOS: "18.0"')
-one('OTHER_CFLAGS: $(inherited) -mcpu=apple-a18', 'OTHER_CFLAGS: $(inherited) -mcpu=apple-a14 -DDM_NVN_M3=1')
+one('OTHER_CFLAGS: $(inherited) -mcpu=apple-a18', 'OTHER_CFLAGS: $(inherited) -mcpu=apple-a12 -DDM_NVN_M3=1 -DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_DOTPROD')
 import re
 L = s.split('\n'); out, n_ba, n_dep, n_tgt, i = [], 0, 0, 0, 0
 while i < len(L):

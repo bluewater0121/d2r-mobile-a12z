@@ -11,7 +11,7 @@
 # The compile command is the same as in dmsh_build.py with only -mmacosx-version-min added. About 7000 libraries in 3 minutes.
 set -u; MIN=$1; OUTROOT=$2
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=${DM_ROOT:-$HOME/dm-work}
-V=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' "$HERE/../nvn/dmsh_chain.h"); S=$ROOT/build/cache/metal_shader_cache/b-$V; CAS=$ROOT/build/cache/metal_shader_cache/cas/variant
+V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' "$HERE/../nvn/dmsh_chain.h"); S=$ROOT/build/cache/metal_shader_cache/b-$V; CAS=$ROOT/build/cache/metal_shader_cache/cas/variant
 [ -d "$S" ] || { echo "🔴 没有着色器库 ${S}（先跑 dmsh_build.py）"; exit 2; }
 D=$OUTROOT/b-$V; rm -rf "$D"; mkdir -p "$D"
 # 反射 .json 约 7000 个：不用 "$S"/*.json 通配展开——路径长的机器上（如 CI 的深目录）整串超过系统参数长度上限，cp 整条失败、一个都不拷，

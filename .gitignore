@@ -3,3 +3,9 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
+
+# 构建时生成的源码 / 资源中间目录（run.sh build；本机上常是 /tmp 的软链）
+dm/ios/Gen
+
+# 本机工作日志（换机器不需要跟着走）
+.workbuddy/memory/

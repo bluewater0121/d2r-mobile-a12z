@@ -28,10 +28,14 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         if (![bs isKindOfClass:[NSArray class]]) FAIL("缺 bindings");
         if (bs.count > NVN_REFL_MAXB) FAIL("绑定 %lu 个，超上限 %d", (unsigned long)bs.count, NVN_REFL_MAXB);
         o->route_b = 1; o->abi = 0;   // spirv-cross 第 0 组 → [[buffer(0)]] | spirv-cross set 0 → [[buffer(0)]]
+        o->discrete = [j[@"bind_model"] isEqual:@"discrete"];   // 逐槽绑定档：绑定项带 cls + slot，不走参数块 | per-slot binding mode: bindings carry cls + slot and do not go through an argument buffer
         for (NSDictionary *b in bs) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
             r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
+            NSString *c = b[@"cls"];
+            r->cls = [c isEqualToString:@"buffer"] ? NVN_RC_BUFFER : [c isEqualToString:@"texture"] ? NVN_RC_TEXTURE : [c isEqualToString:@"sampler"] ? NVN_RC_SAMPLER : NVN_RC_ARGBUF;
+            r->slot = (uint8_t)[b[@"slot"] intValue];
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
@@ -43,9 +47,11 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"support"]) r->kind = NVN_RB_SUPPORT;
             else if ([k isEqualToString:@"c1"]) r->kind = NVN_RB_C1;
             else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            else if ([k isEqualToString:@"?"]) r->kind = NVN_RB_IGN;   // 逐槽档才可能出现：入口签名里 spirv-cross 的辅助参数（细分的 spvOut / spvIndirectParams / spvTessLevel 等），不是游戏资源；绑哑资源占住槽位，不报红 | Only possible in the per-slot mode: spirv-cross helper arguments in the entry signature (tessellation spvOut / spvIndirectParams / spvTessLevel etc.), not game resources; a dummy holds the slot, no failure reported
             else FAIL("B 绑定种类 %s 未实现（%s）", k.UTF8String, [b[@"msl_name"] UTF8String]);
             if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP) && reg < 0)
                 FAIL("B 绑定 %s 没解出槽号", [b[@"msl_name"] UTF8String]);
+            if (o->discrete && r->cls == NVN_RC_ARGBUF) FAIL("逐槽绑定档的绑定 %s 没解出槽类", [b[@"msl_name"] UTF8String]);
             o->nb++;
         }
         NSDictionary *dr = j[@"drv_reads"];

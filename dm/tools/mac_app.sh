@@ -31,7 +31,7 @@ cp "$DM/gfx/nvn/pso_manifest.tsv" "$APP/Contents/Resources/pso_manifest.tsv"   #
 [ ! -f "$DM/gfx/nvn/c1_full.tsv" ] || cp "$DM/gfx/nvn/c1_full.tsv" "$APP/Contents/Resources/c1_full.tsv"   # 图形后端按「与映射表同目录」找它 | The graphics backend looks for it "in the same directory as the mapping table"
 # 编好的着色器库（Mac 版，dmsh_build.py 出的）：只带运行要用的 .metallib 与反射 .json，源码 .metal 不带
 # The compiled shader library (Mac variant, produced by dmsh_build.py): only the .metallib and reflection .json needed at run time are included, not the .metal sources
-V=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' "$DM/gfx/nvn/dmsh_chain.h")
+V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' "$DM/gfx/nvn/dmsh_chain.h")   # 取参数块档那一套（^ 锚定：后面还有一行 DMSH_CHAIN_T1） | take the argument-buffer one (anchored with ^: there is another line DMSH_CHAIN_T1 below)
 # 老接口版：着色器库也要按它的最低系统重编一份（缓存里那份记的目标是编译机的系统版本，老系统上加载不了）；DM_MSL_DIR 给了就用给的
 # Older-API build: the shader libraries must also be recompiled for its minimum system (the ones in the cache record the system version of the build machine as target and cannot be loaded on an older system); DM_MSL_DIR is used when given
 [ -z "$M3" ] || [ -n "${DM_MSL_DIR:-}" ] || { bash "$DM/gfx/tools/msl_retarget.sh" "$MIN" "$OUT/msl_min$MIN" > /dev/null || { echo "🔴 着色器库按 macOS ${MIN} 重编失败"; exit 2; }; DM_MSL_DIR=$OUT/msl_min$MIN; }

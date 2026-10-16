@@ -1230,14 +1230,22 @@ int main(int argc, char *argv[]) {
         metal_cache_report_and_clean();
         char why[2048];
         { id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); g_no_bc = !dev.supportsBCTextureCompression || getenv("DM_TEST_NO_BC");
-          // 图形层要 Metal 3（参数缓冲里直接写 gpuAddress 的无绑定用法）：A14 / M1（Apple7 家族）起才有，A13 及更早不支持。不支持就不起游戏、弹框说明（不再走到解包 / 建管线时闪退）。
-          // 测试开关 DM_TEST_NO_METAL3=1 当成不支持
-          // The graphics layer needs Metal 3 (bindless use that writes gpuAddress directly into argument buffers): available from A14 / M1 (the Apple7 family); A13 and earlier do not support it. If unsupported, do not start the game and show a message (instead of crashing later while unpacking / building pipelines).
+          // 图形层原本只要 Metal 3（参数缓冲里直接写 gpuAddress 的无绑定用法）：A14 / M1 起才有，A13 及更早一律挡在门外。
+          // 现在多出一套「逐槽绑定」的着色器库（资源各自占 [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]]，Metal 2 起可用），
+          // 没有无绑定的显卡（参数缓冲只到 tier 1，如 iPad Pro 2020 的 A12Z）走那套；判据按实际用的能力对齐——
+          // 门槛降到 Apple 5 家族（A12Z 所在家族；再老的显存与算力都不够，仍挡）。测试开关 DM_TEST_NO_METAL3=1 当成不支持
+          // The graphics layer used to require Metal 3 (bindless use that writes gpuAddress directly into argument buffers): available from A14 / M1, and A13 and earlier were all turned away.
+          // There is now also a per-slot binding shader library (each resource has its own [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]], available since Metal 2),
+          // and GPUs without bindless (argument buffers only reach tier 1, e.g. the A12Z of iPad Pro 2020) use that one; the criterion is aligned with the capability actually used -
+          // the bar drops to the Apple 5 family (the family A12Z belongs to; anything older has neither the memory nor the compute and is still turned away).
           // Test switch DM_TEST_NO_METAL3=1 treats the device as unsupported
-          if (![dev supportsFamily:MTLGPUFamilyMetal3] || getenv("DM_TEST_NO_METAL3")) {
-              g_block_title = T("dmGpuOldTitle"); g_block_msg = T("dmGpuOldMsg"); g_block_why = @"图形芯片不支持 Metal 3";
-              plog("boot: 🔴 显卡 %s 不支持 Metal 3%s——不起游戏，弹框说明", dev.name.UTF8String, getenv("DM_TEST_NO_METAL3") ? "（测试开关 DM_TEST_NO_METAL3）" : ""); }
-          plog("boot: 显卡 %s，BC 压缩格式%s", dev.name.UTF8String, g_no_bc ? (getenv("DM_TEST_NO_BC") ? "按测试开关 DM_TEST_NO_BC 当成不支持" : "不支持——不起游戏，弹框说明后退出") : "支持"); }
+          int ab_tier = (int)dev.argumentBuffersSupport;   // 1 = tier 2（无绑定，参数块档）；0 = tier 1（逐槽绑定档） | 1 = tier 2 (bindless, argument-buffer mode); 0 = tier 1 (per-slot mode)
+          if (![dev supportsFamily:MTLGPUFamilyApple5] || getenv("DM_TEST_NO_METAL3")) {
+              g_block_title = T("dmGpuOldTitle"); g_block_msg = T("dmGpuOldMsg"); g_block_why = @"图形芯片太老（要 Apple 5 家族及以上）";
+              plog("boot: 🔴 显卡 %s 只到 Apple 5 家族以下%s——不起游戏，弹框说明", dev.name.UTF8String, getenv("DM_TEST_NO_METAL3") ? "（测试开关 DM_TEST_NO_METAL3）" : ""); }
+          plog("boot: 显卡 %s，参数缓冲 %s（着色器库走%s），BC 压缩格式%s", dev.name.UTF8String, ab_tier >= MTLArgumentBuffersTier2 ? "tier 2" : "tier 1",
+               ab_tier >= MTLArgumentBuffersTier2 ? "参数块档" : "逐槽绑定档",
+               g_no_bc ? (getenv("DM_TEST_NO_BC") ? "按测试开关 DM_TEST_NO_BC 当成不支持" : "不支持——不起游戏，弹框说明后退出") : "支持"); }
         if (g_no_bc) {   // 不支持 BC：有配套的老机型补充包就照常起（覆盖层换 ASTC 版，见 boot_prepare），没有就弹框 | BC not supported: if the matching Legacy Device Pack is present, start as usual (the overlay switches to the ASTC version, see boot_prepare); otherwise show an alert
             NSString *d = astc_pack_locate(g_astc_why, sizeof g_astc_why);
             if (d) { g_astc_dir = d; g_no_bc = 0; plog("boot: 用老机型补充包 %s", d.UTF8String); }
