@@ -81,6 +81,9 @@ A submission's GPU work is about 1.5 ms, but the blocking wait returns 13 ms lat
 
 The two steps from there to 50-55 fps live in `tuning_defaults()` in `front_win.c` (the engine switches Android measured, as defaults — per frame the submits and fence waits drop from 10/10 to 1/0) and in `vulkan_present_win.cpp` (`FIFO_RELAXED` present and a 3-image swapchain). Numbers in `docs/WINDOWS_ARM64.md` under "Performance".
 
+**3. Windows' timer granularity is 15.6 ms, and every guest timeout is rounded up to it.**
+The median frame time was 13-15 ms but the average stayed in the low 50s with `p95` at 37 ms: the `[长帧]` entries showed no new pipelines and no texture uploads, and the extra block on each spike was 15-16 ms — exactly one system timer quantum, which every `pthread_cond_timedwait` / `nanosleep` timeout is rounded to. Android / iOS timers are microsecond-grade, so phones never saw it. `raise_timer_resolution()`, called from `front_run()`, asks `NtSetTimerResolution(5000, ...)` for 0.5 ms (the log prints `计时器精度：请求 0.5 ms，系统给的是 0.50 ms`), falling back to winmm's `timeBeginPeriod(1)`. The camp went from the low 50s to **55-60 fps**, and `掉帧` from 86/300 down to 51/300.
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.

@@ -350,12 +350,34 @@ static void tuning_defaults(void) {
     env_default("DM_GFX_PERF_SAMPLE", "0");        // 关掉逐帧分项计时：被计时的那一帧多花约 4 ms，安卓也因此关着（要看分项时 DM_GFX_PERF_SAMPLE=1 打开） | turn off the per-part frame timing: a timed frame costs about 4 ms more, which is why Android has it off too (set DM_GFX_PERF_SAMPLE=1 to look at the parts)
 }
 
+// ---------- 计时器精度 ----------
+// Windows 缺省的定时器粒度是 15.6 ms：客体主线程的 pthread_cond_timedwait / nanosleep 超时都要按这个粒度整，
+// 于是「差一点等到」的帧会整块多出 15~16 ms（营地实测整帧 13~15 ms 的基线，尖峰恰好落在 24~33 ms）。
+// 安卓 / iOS 的定时器是 µs 级，没有这个坑。这里把进程的定时器精度提到 0.5 ms（NtSetTimerResolution），
+// 再退一步用 winmm 的 timeBeginPeriod(1)；两者都失败也不影响功能，只是尖峰会回来。
+// Timer resolution. Windows' default timer granularity is 15.6 ms, and every pthread_cond_timedwait / nanosleep timeout in the
+// guest is rounded up to it, so a frame that just missed its wait gains a whole 15-16 ms (the camp's baseline frame is 13-15 ms
+// and the spikes land at 24-33 ms, which is exactly one quantum). Android / iOS timers are microsecond-grade and never see this.
+// Request 0.5 ms through NtSetTimerResolution, then fall back to winmm's timeBeginPeriod(1); if both fail nothing breaks, the
+// spikes just come back.
+static void raise_timer_resolution(void) {
+    typedef long(__stdcall * ntstr_t)(unsigned long, int, unsigned long *);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll"); unsigned long cur = 0;
+    ntstr_t set = ntdll ? (ntstr_t)(void *)GetProcAddress(ntdll, "NtSetTimerResolution") : NULL;
+    if (set && set(5000ul, 1, &cur) >= 0) LOG("计时器精度：请求 0.5 ms，系统给的是 %.2f ms", cur / 10000.0);
+    typedef unsigned int(__stdcall * tbp_t)(unsigned int);
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+    tbp_t begin = winmm ? (tbp_t)(void *)GetProcAddress(winmm, "timeBeginPeriod") : NULL;
+    if (begin) begin(1);
+}
+
 // ---------- 宿主入口 ----------
 void front_run(void (*guest)(void)) {
     // DM_WINDOW=0：不开窗口，当前线程直接跑客体（与 Mac 宿主的无窗口形态同一开关，排障用）
     // DM_WINDOW=0: no window, run the guest directly on the current thread (the same switch as the Mac host's windowless form, for debugging)
     const char *nowin = getenv("DM_WINDOW");
     if (nowin && *nowin == '0') { guest(); return; }
+    raise_timer_resolution();
     tuning_defaults();
     if (create_window()) { fprintf(stderr, "[dm] 建窗口失败 errno=%d\n", errno); guest(); return; }
     char err[512] = "";

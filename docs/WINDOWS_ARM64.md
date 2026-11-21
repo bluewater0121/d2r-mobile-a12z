@@ -12,7 +12,7 @@ The Windows build works the way the Android one does: rewrite the game program f
 | Main menu → class → mode → name → into a run | Works (naming goes through the host input box or the `DM_KBD` channel) |
 | In-run picture in the Rogue Encampment | Works: HUD life 55/55, mana 10/10, minimap, NPC names all correct |
 | Walking, camera follow | Works (WASD as the left stick, left mouse button as a finger) |
-| Frame rate (encampment, 1600x900) | **about 50-55 fps** (median frame time 13-15 ms, tail spikes still there, see "Performance") |
+| Frame rate (encampment, 1600x900) | **55-60 fps** (mostly pinned at 60, 53-55 in the windows that drop a vblank) |
 | Audio | WASAPI is wired up, but nobody has listened to it yet |
 | Fullscreen toggle, window resize | Not tested |
 | Cutscene movies | Not tested (the decode path has not been verified on Windows) |
@@ -142,6 +142,16 @@ The third step is **cutting the long-frame tail**. At that point `[nvn] 计时` 
 - Swapchain changed to **3 images** (two in flight alternately plus one the presentation engine is still reading), so `vkAcquireNextImageKHR` no longer blocks on vsync.
 - `DM_GFX_PERF_SAMPLE=0` (same as Android): the per-part timing costs the timed frame about 4 ms more, so turning it off buys another 1-2 fps; `DM_GFX_PERF_SAMPLE=1` turns it back on when you want the breakdown.
 
+The fourth step is **removing the tail spikes**. After the three steps above the median frame time was already 13-15 ms (about 70 fps), yet more than 130 of 300 frames still ran past 16.7 ms with `p95` around 37 ms, holding the average in the low 50s. Every `[长帧]` entry reads "new pipelines 0 / texture uploads 0", so the spikes are neither compilation nor upload; `DM_3D_SCALE=0.5` and `DM_PRESENT_MODE=immediate` both leave the frame rate unchanged, so it is neither GPU-bound nor vsync-quantized.
+
+The real cause is **Windows' timer granularity**: the default is 15.6 ms, and every `pthread_cond_timedwait` / `nanosleep` timeout in the guest is rounded up to it, so the frame that just missed its wait pays a whole 15-16 ms extra (baseline 13-15 ms, spikes 24-33 ms — exactly one quantum). Android and iOS timers are microsecond-grade, which is why phones never saw this. `raise_timer_resolution()` in `dm/win/front_win.c` (called from `front_run()`) asks for **0.5 ms** through `NtSetTimerResolution(5000, ...)` — the log prints `计时器精度：请求 0.5 ms，系统给的是 0.50 ms` — and falls back to winmm's `timeBeginPeriod(1)`. Results:
+
+- Encampment **55-60 fps** (most windows 57-60; the windows that drop one vblank 53-55), against 50-55 before, and `掉帧` went from 86/300 to **51/300**.
+- Class select 48-55 -> **55-60**; the character list likewise sits at 60.
+- `submit_cpu_ms` from 6-7 down to **4-4.5** (shorter waits mean the translation thread gets squeezed less).
+
+The game presents at the screen refresh (this machine reports 59 Hz; the log says `[nvn] 出图节拍 59.00 Hz`), so 60 is the ceiling for this configuration; going higher would mean reporting a higher refresh, which has no real benefit.
+
 Room left (not done, lowest risk first):
 
 1. The tail spikes are not fully identified: the `[长帧]` detail shows "new pipelines 0 / texture uploads 0", so the spikes are neither compilation nor upload but guest-side work inside the frame; `DM_3D_SCALE=0.5` and `DM_PRESENT_MODE=immediate` both leave the frame rate unchanged, so it is neither GPU-bound nor vsync-quantized.
@@ -158,7 +168,9 @@ Room left (not done, lowest risk first):
 - Audio (WASAPI) is implemented but untested by ear; `hle_lifecycle.c`'s SIGTERM/GCD and `hle_movie.c`'s decode path have not been verified on Windows.
 - The drop-filter rules still fail to be written into `save/Settings/*.fltr` (the log says `规则文件没写成`).
 - On the character-list screen a plain keyboard A does not trigger "select" on this machine (the class and mode screens are fine); the "new character" path is more reliable for automation.
-- Window resize / fullscreen toggle and native gamepads are untested.
+- Drops remain: about 50 of every 300 frames miss one vblank (the `掉帧` column of `[nvn] 上屏`), caused by a few milliseconds of jitter inside some frames; for now the headroom absorbs it.
+- Window resize / fullscreen toggle is untested; with no hardware controller on this machine the pad path was only verified through `DM_PAD_TEST` injection.
 
 See also: [DEPENDENCIES.md](DEPENDENCIES.md), [GAME_FILES.md](GAME_FILES.md), [ANDROID.md](ANDROID.md) (the Android implementation this port follows).
+
 

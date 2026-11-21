@@ -81,6 +81,9 @@ XInput 一律按键帽位置报告（下 = A、右 = B、左 = X、上 = Y），
 
 再往后到 50~55 帧两步在 `front_win.c` 的 `tuning_defaults()`（把安卓实测过的引擎开关按同一套设默认值，每帧的提交与栅栏等待从 10 次 / 10 次变成 1 次 / 0 次）和 `vulkan_present_win.cpp`（出图改用 `FIFO_RELAXED`、交换链 3 张图）。逐项数据见 `docs/WINDOWS_ARM64.zh-CN.md` 的「性能」。
 
+**3. Windows 的定时器粒度是 15.6 ms，客体的每一次超时都被按它取整。**
+帧时间中位数明明 13~15 ms，均值却只有 50 出头、`p95` 37 ms：`[长帧]` 明细里既没有新建管线也没有上传贴图，尖峰整块多出的正好是 15~16 ms，也就是一个系统定时器粒度——`pthread_cond_timedwait` / `nanosleep` 的超时全被它取整。安卓 / iOS 的定时器是 µs 级，所以手机上没这个坑。`front_run()` 里调 `raise_timer_resolution()`：先 `NtSetTimerResolution(5000, ...)` 要 0.5 ms（日志 `计时器精度：请求 0.5 ms，系统给的是 0.50 ms`），失败再退 winmm 的 `timeBeginPeriod(1)`。营地因此从 50 出头到 **55~60 帧**，`掉帧` 从 86/300 降到 51/300。
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。
