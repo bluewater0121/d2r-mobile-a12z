@@ -13,6 +13,12 @@
 // Fetch the start address and byte count of section name (p = NULL, bytes = 0 when the section is missing)
 #define DM_SECT_GET(name, type, p, bytes) do { unsigned long dm_sz_ = 0; \
     (p) = (type *)getsectiondata(&_mh_execute_header, "__DATA", #name, &dm_sz_); (bytes) = (p) ? dm_sz_ : 0; } while (0)
+#elif defined(_WIN32)
+// PE/COFF：段名用「名字」本身（≤8 字节），运行时按段表取（__start_/__stop_ 是 ELF 链接器专有）
+// PE/COFF: the section name is the bare name (≤8 bytes), fetched at run time from the section table (__start_/__stop_ are ELF-only)
+#define DM_SECT(name) __attribute__((used, retain, section(#name)))
+void *dm_pe_section(const char *name, unsigned long *bytes);
+#define DM_SECT_GET(name, type, p, bytes) (void)((p) = (type *)dm_pe_section(#name, &(bytes)))
 #else
 #define DM_SECT(name) __attribute__((used, retain, section(#name)))
 #define DM_SECT_GET(name, type, p, bytes) do { \

@@ -77,7 +77,8 @@ static int read_file(const char *full, const char *rel, cs_unit *u) {
     FILE *f = fopen(full, "rb"); if (!f) return -1;
     cs_file *x = &u->f[u->n]; x->data = malloc((size_t)st.st_size + 1); x->size = (uint32_t)st.st_size;
     int ok = x->data && fread(x->data, 1, x->size, f) == x->size; fclose(f); if (!ok) { free(x->data); return -1; }
-    strlcpy(x->path, rel, sizeof x->path); x->mt = (uint64_t)st.st_mtimespec.tv_sec * 1000 + (uint64_t)st.st_mtimespec.tv_nsec / 1000000; u->n++; return 0;
+    strlcpy(x->path, rel, sizeof x->path); struct timespec mt = dm_stat_mtime(&st);
+    x->mt = (uint64_t)mt.tv_sec * 1000 + (uint64_t)mt.tv_nsec / 1000000; u->n++; return 0;
 }
 static int read_dir(const char *root, const char *rel, cs_unit *u) {   // rel 目录下的普通文件（一层，存档里的目录都是一层） | regular files under the rel directory (one level; directories in the save are all one level)
     char d[1300]; snprintf(d, sizeof d, "%s/%s", root, rel); DIR *dp = opendir(d); struct dirent *e; if (!dp) return -1; int r = 0;

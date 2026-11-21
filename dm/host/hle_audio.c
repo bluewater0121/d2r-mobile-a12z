@@ -32,6 +32,19 @@ static dm_sem sem_new(void) { dm_sem s = malloc(sizeof *s); if (!s || sem_init(s
 static void sem_up(dm_sem s) { sem_post(s); }
 static void sem_down(dm_sem s) { while (sem_wait(s)) {} }
 static void sem_free(dm_sem s) { sem_destroy(s); free(s); }
+#elif defined(_WIN32)
+// Windows：WASAPI 共享模式的 16 位 PCM 输出（AUTOCONVERTPCM 让系统替我们转采样率 / 格式 / 声道数，游戏给的 48 kHz 原样进）
+// Windows: WASAPI shared-mode 16-bit PCM output (AUTOCONVERTPCM lets the system convert sample rate / format / channel count for us; the game's 48 kHz goes in as is)
+#include <initguid.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <semaphore.h>
+typedef struct dm_wa *dm_audev;
+typedef sem_t *dm_sem;
+static dm_sem sem_new(void) { dm_sem s = malloc(sizeof *s); if (!s || sem_init(s, 0, 0)) die("音频信号量"); return s; }
+static void sem_up(dm_sem s) { sem_post(s); }
+static void sem_down(dm_sem s) { while (sem_wait(s)) {} }
+static void sem_free(dm_sem s) { sem_destroy(s); free(s); }
 #else
 #include <aaudio/AAudio.h>
 #include <semaphore.h>
@@ -292,6 +305,93 @@ static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 
 static int dev_start(aout *a) { return OH_AudioRenderer_Start(a->au) == AUDIOSTREAM_SUCCESS ? 0 : -1; }
 static void dev_stop(aout *a) { OH_AudioRenderer_Stop(a->au); }
 static void dev_close(aout *a) { OH_AudioRenderer_Release(a->au); a->au = NULL; }
+#elif defined(_WIN32)
+// WASAPI：一个事件驱动的渲染线程从 IAudioRenderClient 里取缓冲，填 render()，释放。
+// 与安卓同一套约定：dev_start / dev_stop 只启停客户端，线程常驻（客户端不跑时它就在事件上等到超时）。
+// WASAPI: an event-driven render thread takes a buffer from IAudioRenderClient, fills it via render(), then releases it.
+// Same conventions as Android: dev_start / dev_stop only start and stop the client, the thread stays resident (when the client is
+// not running it just times out waiting on the event).
+struct dm_wa {
+    IAudioClient *client;
+    IAudioRenderClient *render;
+    HANDLE evt;
+    pthread_t th;
+    _Atomic int run;
+    UINT32 frames;      // 客户端缓冲帧数（我们请求的格式） | client buffer frames (in the format we requested)
+    uint32_t bpf;       // 每帧字节（我们请求的格式） | bytes per frame (in the format we requested)
+    aout *owner;
+};
+static void *wa_thread(void *p) {
+    struct dm_wa *w = p; aout *a = w->owner;
+    // WASAPI 客户端要求调用线程进 MTA；音频线程要抢在渲染前跑，优先级提到时间关键
+    // The WASAPI client requires an MTA thread; the audio thread has to run ahead of rendering, so raise it to time-critical
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (atomic_load_explicit(&w->run, memory_order_acquire)) {
+        DWORD r = WaitForSingleObject(w->evt, 20);
+        if (r != WAIT_OBJECT_0) continue;   // 超时 / 停播：不取缓冲 | timeout / stopped: do not take a buffer
+        UINT32 pad = 0;
+        if (FAILED(w->client->lpVtbl->GetCurrentPadding(w->client, &pad))) continue;
+        UINT32 avail = w->frames > pad ? w->frames - pad : 0;
+        if (!avail) continue;
+        BYTE *buf = NULL;
+        if (FAILED(w->render->lpVtbl->GetBuffer(w->render, avail, &buf))) continue;
+        render(a, buf, (uint32_t)(avail * w->bpf));
+        w->render->lpVtbl->ReleaseBuffer(w->render, avail, 0);
+    }
+    CoUninitialize();
+    return NULL;
+}
+static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 置空，调用方走静音接收端） | 0 = the sound card is open; -1 = it cannot be opened (a->au set to null, the caller uses the silent sink)
+    a->mix = a->ch == 6; if (a->mix && !a->mixbuf) a->mixbuf = malloc(MIXMAX * 12);   // 5.1：我们自己下混，声卡只收双声道 | 5.1: we downmix ourselves, the sound card only takes stereo
+    if (a->mix && !a->mixbuf) { a->au = NULL; LOG("【红】下混暂存申请不到：这一路改用静音接收端（不出声）"); return -1; }
+    int och = a->mix ? 2 : a->ch;
+    HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);   // 已经初始化过（S_FALSE / RPC_E_CHANGED_MODE）也继续 | keep going when already initialized (S_FALSE / RPC_E_CHANGED_MODE)
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) { a->au = NULL; LOG("【红】WASAPI：COM 初始化失败 %#lx：这一路改用静音接收端", (long)com); return -1; }
+    struct dm_wa *w = calloc(1, sizeof *w);
+    IMMDeviceEnumerator *en = NULL; IMMDevice *dev = NULL; HRESULT hr;
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en);
+    if (FAILED(hr) || !en) { free(w); a->au = NULL; LOG("【红】WASAPI：设备枚举器建不出来 %#lx：这一路改用静音接收端", (long)hr); return -1; }
+    hr = en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
+    if (FAILED(hr) || !dev) { en->lpVtbl->Release(en); free(w); a->au = NULL; LOG("【红】WASAPI：没有默认输出设备 %#lx：这一路改用静音接收端", (long)hr); return -1; }
+    hr = dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&w->client);
+    dev->lpVtbl->Release(dev); en->lpVtbl->Release(en);
+    if (FAILED(hr) || !w->client) { free(w); a->au = NULL; LOG("【红】WASAPI：IAudioClient 拿不到 %#lx：这一路改用静音接收端", (long)hr); return -1; }
+    WAVEFORMATEX fmt = {0};
+    fmt.wFormatTag = WAVE_FORMAT_PCM; fmt.nChannels = (WORD)och; fmt.nSamplesPerSec = RATE;
+    fmt.wBitsPerSample = 16; fmt.nBlockAlign = (WORD)(och * 2); fmt.nAvgBytesPerSec = RATE * (DWORD)och * 2;
+    // 20 ms 缓冲；事件驱动 + 系统转换（采样率 / 位深 / 声道数都交给它，避免设备只认自己的混音格式时开不了）
+    // 20 ms buffer; event driven + system conversion (sample rate / bit depth / channel count are its job, so a device that only
+    // accepts its own mix format still opens)
+    hr = w->client->lpVtbl->Initialize(w->client, AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      200000, 0, &fmt, NULL);
+    if (FAILED(hr)) { w->client->lpVtbl->Release(w->client); free(w); a->au = NULL; LOG("【红】WASAPI：Initialize 失败 %#lx（%d 声道）：这一路改用静音接收端（不出声）", (long)hr, och); return -1; }
+    UINT32 frames = 0;
+    if (FAILED(w->client->lpVtbl->GetBufferSize(w->client, &frames)) || !frames) { w->client->lpVtbl->Release(w->client); free(w); a->au = NULL; LOG("【红】WASAPI：缓冲大小取不到：这一路改用静音接收端"); return -1; }
+    hr = w->client->lpVtbl->GetService(w->client, &IID_IAudioRenderClient, (void **)&w->render);
+    if (FAILED(hr) || !w->render) { w->client->lpVtbl->Release(w->client); free(w); a->au = NULL; LOG("【红】WASAPI：IAudioRenderClient 拿不到 %#lx：这一路改用静音接收端", (long)hr); return -1; }
+    w->evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!w->evt || FAILED(w->client->lpVtbl->SetEventHandle(w->client, w->evt)) ) { w->render->lpVtbl->Release(w->render); w->client->lpVtbl->Release(w->client); if (w->evt) CloseHandle(w->evt); free(w); a->au = NULL; LOG("【红】WASAPI：事件句柄设不进去：这一路改用静音接收端"); return -1; }
+    w->frames = frames; w->bpf = (uint32_t)och * 2u; w->owner = a;
+    atomic_init(&w->run, 1);
+    if (pthread_create(&w->th, NULL, wa_thread, w)) { w->render->lpVtbl->Release(w->render); w->client->lpVtbl->Release(w->client); CloseHandle(w->evt); free(w); a->au = NULL; LOG("【红】WASAPI：渲染线程起不来：这一路改用静音接收端"); return -1; }
+    if (a->mix) LOG("audio：游戏给 6 声道（5.1）→ 交给声卡前自己下混成双声道（中置 / 后环绕 ×0.707 并入左右，低音不并入，整体 −3 dB、饱和截断）");
+    a->au = w;
+    LOG("audio：WASAPI 共享模式 %d Hz %d 声道（系统负责重采样），缓冲 %u 帧（%u 字节/帧）", RATE, och, (unsigned)frames, (unsigned)w->bpf);
+    return 0;
+}
+static int dev_start(aout *a) { return FAILED(a->au->client->lpVtbl->Start(a->au->client)) ? -1 : 0; }
+static void dev_stop(aout *a) { a->au->client->lpVtbl->Stop(a->au->client); }
+static void dev_close(aout *a) {
+    struct dm_wa *w = a->au;
+    w->client->lpVtbl->Stop(w->client);
+    atomic_store_explicit(&w->run, 0, memory_order_release);
+    SetEvent(w->evt);
+    pthread_join(w->th, NULL);
+    w->render->lpVtbl->Release(w->render); w->client->lpVtbl->Release(w->client); CloseHandle(w->evt);
+    free(w); a->au = NULL;
+}
 #else
 // 安卓：AAudio 低延迟输出流（16 位、48 kHz、游戏用途），回调直接调 render。
 // 流断开（耳机插拔、蓝牙切换、系统音频服务重启）时 AAudio 在错误回调里通知：回调里不能关流，交给一条普通线程关掉重开，原来在播就接着播。

@@ -220,6 +220,7 @@ void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s�
 // itself holds; if it has not finished within 3 s this alarm exits the process. It has to beat the system's "not responding" (5 s): a stuck allocator
 // lock drags the UI thread down with it, and exiting with the first part's record beats leaving the player in front of a "not responding" dialog
 static volatile sig_atomic_t g_crash_sig;
+#ifndef _WIN32
 static void crash_deadman(int sig) {
     (void)sig;
     static const char msg[] = "[dm] CRASH：现场导出 3 秒没走完（多半卡在分配器或 stdio 的锁上），直接退出 | the crash dump did not finish in 3 s (likely stuck on an allocator or stdio lock), exiting\n";
@@ -264,11 +265,101 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);
 }
+#else   // Windows：没有信号，走 SEH 的异常分发（dm_win_crash_install，实现在 dm/win/compat/crash_win.c 装、这里分发）
+// Windows 上的「信号处理」= 向量化异常处理器（VEH）里按异常码分流：
+//   访问违例 → 先给缺页钩子（写保护脏页跟踪靠它），没人认领才按崩溃处理；
+//   断点 / 非法指令 / 整数除零 / 栈溢出 → 同苹果的 SIGTRAP / SIGILL / SIGFPE / SIGSEGV 路径；
+//   第一段写寄存器和帧指针回溯（仍用 cw_*，保证在异常上下文里安全），第二段拿 dump 钩子，最后结束进程。
+// "Signal handling" on Windows = dispatch by exception code inside a vectored exception handler (VEH):
+//   access violation -> page fault hooks first (write-protect dirty-page tracking relies on them), and only if nobody claims it, the crash path;
+//   breakpoint / illegal instruction / integer divide-by-zero / stack overflow -> the SIGTRAP / SIGILL / SIGFPE / SIGSEGV paths as on Apple;
+//   the first part writes the registers and the frame-pointer backtrace (still through cw_*, safe in exception context), the second part runs the dump hook, then the process ends.
+static void crash_report_win(ucontext_t *uc, uint64_t fault_addr, int sig) {
+    cw_t w; w.n = 0;
+    cw_s(&w, "[dm] CRASH（Windows 异常）sig="); cw_dec(&w, sig);
+    cw_addr(&w, "addr", fault_addr); cw_addr(&w, "pc", UC_PC(uc)); cw_addr(&w, "lr", UC_LR(uc));
+    cw_s(&w, " sp="); cw_hex(&w, UC_SP(uc)); cw_s(&w, "\n");
+    for (int i = 0; i < 29; i++) { cw_s(&w, "x"); cw_dec(&w, i); cw_s(&w, "="); cw_hex(&w, UC_X(uc, i)); cw_s(&w, i % 6 == 5 ? "\n" : " "); }
+    cw_s(&w, "\n"); cw_flush(&w);
+    cw_s(&w, "[dm] bt（异常上下文 | exception context）:");
+    uint64_t fp = UC_FP(uc);
+    for (int i = 0; i < 32 && fp && !(fp & 7); i++) {
+        uint64_t nfp = 0, ra = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (void *)(fp + 8), &ra, 8, NULL) ||
+            !ReadProcessMemory(GetCurrentProcess(), (void *)fp, &nfp, 8, NULL)) break;
+        cw_addr(&w, "", ra);
+        if (nfp <= fp) break;
+        fp = nfp;
+    }
+    cw_s(&w, "\n"); cw_flush(&w);
+}
+int crash_handle_win_exception(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    // DM_VEH_TRACE 阶段标记：u=已抄现场、h=钩子跑完、s=已交给引擎处理器、r=即将返回；死在哪个字母上就说明死在哪一步
+    // DM_VEH_TRACE stage markers: u=context copied, h=hooks done, s=handed to the engine handler, r=about to return; dying on a letter tells which step it was
+    int vtr = getenv("DM_VEH_TRACE") != NULL;
+    ucontext_t uc; dm_win_uctx_from_context(&uc, ep->ContextRecord);
+    if (vtr) { DWORD n; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "Vu", 2, &n, NULL); }
+    uint64_t addr = (uint64_t)(uintptr_t)er->ExceptionAddress;
+    int sig = SIGSEGV, is_write = 0, is_fault = 0;
+    switch (er->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        is_fault = 1; addr = er->NumberParameters > 1 ? (uint64_t)er->ExceptionInformation[1] : addr;
+        is_write = er->NumberParameters > 0 && er->ExceptionInformation[0] == 1;
+        break;
+    case EXCEPTION_BREAKPOINT: sig = SIGTRAP; break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION: sig = SIGILL; break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: sig = SIGFPE; break;
+    case EXCEPTION_STACK_OVERFLOW: sig = SIGSEGV; break;
+    case 0xC0000409u:   // STATUS_STACK_BUFFER_OVERRUN / __fastfail：参数 0 是 fail-fast 码
+        // The fail-fast code is parameter 0 (EXCEPTION_STACK_BUFFER_OVERRUN / __fastfail)
+        fprintf(stderr, "[dm] FAILFAST code=%#llx pc=%#llx lr=%#llx sp=%#llx\n",
+                (unsigned long long)(er->NumberParameters ? er->ExceptionInformation[0] : 0),
+                (unsigned long long)UC_PC(&uc), (unsigned long long)UC_LR(&uc), (unsigned long long)UC_SP(&uc));
+        { module_t *mp = module_of((void *)(uintptr_t)UC_PC(&uc)); if (mp) fprintf(stderr, "[dm] FAILFAST pc 在客体模块 %s+%#llx\n", mp->name, (unsigned long long)(UC_PC(&uc) - (uint64_t)mp->base)); }
+        fflush(stderr);
+        crash_report_win(&uc, addr, SIGSEGV);
+        TerminateProcess(GetCurrentProcess(), (UINT)(0xC0000409u));
+        return 1;
+    default: return 0;   // 别的异常（C++ 异常、调试断点等）交给系统 | other exceptions (C++ exceptions, debug breaks, etc.) go to the system
+    }
+    if (sig == SIGTRAP && g_trap_hook && g_trap_hook(&uc)) return 1;
+    if (is_fault) {
+        // DM_FAULT_LOG：逐条记录缺页（地址 / 读或写 / 谁认领），排「写了保护页却反复缺页」用
+        // DM_FAULT_LOG: record every page fault (address / read or write / who claimed it), for "a write to a protected page keeps faulting"
+        int fl = getenv("DM_FAULT_LOG") != NULL;
+        int claimed = -1;
+        for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i]((void *)addr, is_write, &uc)) { claimed = i; break; }
+        if (fl) {
+            module_t *mp = module_of((void *)(uintptr_t)UC_PC(&uc));
+            fprintf(stderr, "[dm] FAULT addr=%#llx %s pc=%#llx claimed=%d", (unsigned long long)addr,
+                              is_write ? "写" : "读", (unsigned long long)UC_PC(&uc), claimed);
+            if (mp) fprintf(stderr, " pcmod=%s+%#llx", mp->name, (unsigned long long)(UC_PC(&uc) - (uint64_t)mp->base));
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+        if (claimed >= 0) { if (vtr) { DWORD n; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "Vr", 2, &n, NULL); } return 1; }
+    }
+    if (vtr) { DWORD n; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "Vh", 2, &n, NULL); }
+    // 引擎自己登记的 SIGSEGV 处理器（xbg 的写跟踪 wtrack，页被写保护后靠认领缺页继续）：没被钩子认领时交给它
+    // The engine's own SIGSEGV handler (xbg's write tracking wtrack, which claims write-protected pages): hand over when no hook claims
+    if (is_fault && dm_win_sig_raise(sig, (void *)addr)) { if (vtr) { DWORD n; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "Vr", 2, &n, NULL); } return 1; }
+    crash_report_win(&uc, addr, sig);
+    fprintf(stderr, "[dm] CRASH 符号 | symbols:");
+    off("addr", addr); off("pc", UC_PC(&uc)); off("lr", UC_LR(&uc));
+    fprintf(stderr, "\n");
+    dm_backtrace(UC_FP(&uc));
+    if (g_dump_hook) g_dump_hook();
+    // 结束进程：异常上下文里不跑 atexit / 静态析构（与苹果的 _exit 同一取舍）
+    // End the process: no atexit / static destructors from exception context (the same choice as Apple's _exit)
+    TerminateProcess(GetCurrentProcess(), (UINT)(128 + sig));
+    return 1;
+}
+#endif
 // 信号备用栈是每线程的：每个客体线程起跑时都要调（栈溢出时才能在备用栈上打出现场）
 // 备用栈随线程退出释放：pthread 键的析构在线程退出时调用（先停用备用栈再 free）。游戏会频繁起短命线程，不释放每个漏 64 KiB。
 // The signal alternate stack is per thread: every guest thread must call this when it starts running (only then can the crash state be printed on the alternate stack on a stack overflow)
 // The alternate stack is released when the thread exits: the pthread key destructor is called at thread exit (disable the alternate stack first, then free). The game frequently starts short-lived threads, and without releasing each one leaks 64 KiB.
-#if !TARGET_OS_TV   // tvOS 的 SDK 没有 sigaltstack：不设备用栈，崩溃处理在原栈上跑（栈溢出时打不出现场） | The tvOS SDK has no sigaltstack: no alternate stack is set, so the crash handler runs on the original stack (no crash state can be printed on stack overflow)
+#if !TARGET_OS_TV && !defined(_WIN32)   // tvOS 的 SDK 没有 sigaltstack：不设备用栈，崩溃处理在原栈上跑（栈溢出时打不出现场） | The tvOS SDK has no sigaltstack: no alternate stack is set, so the crash handler runs on the original stack (no crash state can be printed on stack overflow)
 static pthread_key_t g_altstack_key;
 static pthread_once_t g_altstack_once = PTHREAD_ONCE_INIT;
 static void altstack_free(void *p) { stack_t off = {.ss_flags = SS_DISABLE}; sigaltstack(&off, 0); free(p); }
@@ -286,6 +377,22 @@ void crash_thread_init(void) {}
 #endif
 void crash_install(void) {
     crash_thread_init();
+#ifdef _WIN32
+    // VEH 先于 SEH：缺页钩子（写保护脏页跟踪）必须在系统判访问违例之前拿到现场
+    // VEH runs before SEH: page fault hooks (write-protect dirty-page tracking) must see the fault before the system rules it an access violation
+    extern int crash_handle_win_exception(EXCEPTION_POINTERS *ep);
+    extern void dm_win_crash_install(int (*fn)(EXCEPTION_POINTERS *));
+    dm_win_crash_install(crash_handle_win_exception);
+    // 看门狗：DM_WATCH / DM_WATCH_STALL 与苹果同开关（产品不设环境变量就不开）
+    // Watchdogs: same switches as Apple's DM_WATCH / DM_WATCH_STALL (the product sets no environment variables and enables neither)
+    const char *watch = getenv("DM_WATCH"), *stall = getenv("DM_WATCH_STALL");
+    if (watch || stall) {
+        g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : 15;
+        atomic_store(&g_watch_last_ns, watch_now_ns());
+        pthread_t th; if (pthread_create(&th, NULL, watchdog_main, NULL)) die("看门狗线程");
+        pthread_detach(th);
+    }
+#else
     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | CRASH_SA_ONSTACK};
     sigaction(SIGALRM, &sa, 0);
     // 两种看门狗都只在测试显式设了 DM_WATCH / DM_WATCH_STALL 时开：产品（玩家从桌面启动，无环境变量）一个不开。
@@ -301,4 +408,5 @@ void crash_install(void) {
         pthread_detach(th);
     }
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0); sigaction(SIGTRAP, &sa, 0);
+#endif
 }

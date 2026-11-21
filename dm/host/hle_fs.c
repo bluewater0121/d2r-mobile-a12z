@@ -678,7 +678,14 @@ static int rm_tree(const char *p) {
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         snprintf(c, sizeof c, "%s/%s", p, e->d_name);
-        rc |= e->d_type == DT_DIR ? rm_tree(c) : unlink(c);
+#if defined(_WIN32)
+        // Windows 的 dirent 没有 d_type（要另做一次 stat），只在这里多一次系统调用
+        // Windows' dirent has no d_type (a separate stat is needed); one extra system call only here
+        struct stat sb; int isdir = !stat(c, &sb) && S_ISDIR(sb.st_mode);
+#else
+        int isdir = e->d_type == DT_DIR;
+#endif
+        rc |= isdir ? rm_tree(c) : unlink(c);
     }
     closedir(d);
     return rc | rmdir(p);

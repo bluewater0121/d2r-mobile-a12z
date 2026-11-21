@@ -25,3 +25,6 @@ dm/android/.cxx/
 /private/
 /artifacts/
 dm/android/local.env
+# Windows ARM64 构建产物与运行目录 | Windows ARM64 build outputs and runtime dirs
+/build/
+*.bmp

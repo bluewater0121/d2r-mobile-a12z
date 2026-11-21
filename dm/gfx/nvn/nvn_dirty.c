@@ -106,6 +106,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
     if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
     atomic_fetch_add(&g_adds_total, 1);
+    if (getenv("DM_NVN_DIRTY_LOG")) LOG("脏页跟踪区间 %p +%zu", mem, size);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
     int slot = -1;

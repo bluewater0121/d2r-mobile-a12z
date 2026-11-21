@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
@@ -13,7 +15,7 @@
 // 只表示「产品缺省」；真正依赖 iOS 系统的分支（内嵌签名代码段、CoreFoundation 等）仍按 TARGET_OS_IPHONE。
 // Phone product (iOS, Android, HarmonyOS): the package players install -- touch default settings, real sound, performance logging, 3D render scale etc. are on by default; the counterpart is the Mac development host (gates / A-B comparisons, all off by default).
 // It only means "product defaults"; branches that truly depend on the iOS system (embedded signed code segments, CoreFoundation, etc.) still use TARGET_OS_IPHONE.
-#if defined(__ANDROID__) || defined(__OHOS__) || (defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+#if defined(__ANDROID__) || defined(__OHOS__) || defined(_WIN32) || (defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
 #define DM_PHONE 1
 #else
 #define DM_PHONE 0
@@ -52,9 +54,36 @@ typedef struct {
 extern module_t g_mod[MAX_MOD];
 extern int g_nmod;
 // 四个线程本地槽：K18 = Switch 的 x18、KTLS = tpidr_el0、KTLR = tpidrro_el0（ThreadLocalRegion）、KGATE = 宿主门入口；实际键号由装载器写入键页
+// 苹果 / 安卓 / 鸿蒙用 pthread 键；Windows 用「槽号」——TPIDR_EL0 指向每线程的槽块，槽号 = 块内下标（见 dm/win/compat/tls_win.c）
 // Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
-extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
-extern pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;
+// Apple / Android / HarmonyOS use pthread keys; Windows uses "slot numbers" -- TPIDR_EL0 points at a per-thread slot block and the slot number is an index into it (see dm/win/compat/tls_win.c)
+#if defined(_WIN32)
+typedef int dm_key_t;
+void *dm_slot_get(dm_key_t k);
+void dm_slot_set(dm_key_t k, void *v);
+void dm_win_tls_bind(void);   // 给本线程绑上槽块（TPIDR_EL0 = 块地址）；已绑则空操作 | bind the slot block to this thread (TPIDR_EL0 = block address); a no-op if already bound
+#define dm_key_set(k, v) dm_slot_set((k), (void *)(v))
+#define dm_key_get(k) dm_slot_get(k)
+#else
+typedef pthread_key_t dm_key_t;
+#define dm_key_set(k, v) pthread_setspecific((k), (void *)(v))
+#define dm_key_get(k) pthread_getspecific(k)
+#endif
+extern dm_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+extern dm_key_t g_keyres[2], g_keyaspect, g_keyaspectui;
+// 文件修改时刻（秒 + 纳秒）：苹果是 st_mtimespec，Linux 是 st_mtim，Windows 只有秒
+// File modification time (seconds + nanoseconds): st_mtimespec on Apple, st_mtim on Linux, seconds only on Windows
+static inline struct timespec dm_stat_mtime(const struct stat *s) {
+    struct timespec t = {0, 0};
+#if defined(__APPLE__)
+    t.tv_sec = s->st_mtimespec.tv_sec; t.tv_nsec = s->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    t.tv_sec = s->st_mtime;
+#else
+    t.tv_sec = s->st_mtim.tv_sec; t.tv_nsec = s->st_mtim.tv_nsec;
+#endif
+    return t;
+}
 
 void load_modules(const char *dir, const char **names, int n);
 void run_module_inits(void);

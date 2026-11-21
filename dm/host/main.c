@@ -7,8 +7,28 @@
 #include <sys/sysctl.h>
 #endif
 #include <sys/time.h>
+#include <sys/mman.h>
 #include <unistd.h>
 void probe_install(void); void ticks_install(void); void hid_keys_init(void); void tact_prefetch_start(const char *outdir); void tact_chk_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); uint32_t svc_thread_main_init(void);
+void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
+// DM_TEST_FAULT_GUEST=2 用：在真客体线程上让客体 memset 写只读页，看客体线程上的访问违例能不能到 VEH
+// Used by DM_TEST_FAULT_GUEST=2: have the guest memset write a read-only page inside a real guest thread,
+// to see whether access violations on guest threads reach the VEH
+static void *g_test_pg, *g_test_memset;
+static void test_thread_body(void *a) {
+    (void)a;
+    LOG("DM_TEST_FAULT_GUEST=2：客体线程 tid=%lu memset=%p 页=%p", (unsigned long)GetCurrentThreadId(), g_test_memset, g_test_pg);
+    fflush(stderr);
+    ((void *(*)(void *, int, size_t))g_test_memset)(g_test_pg, 0, 16);
+    LOG("DM_TEST_FAULT_GUEST=2：没有违例");
+}
+static void dm_win_fault_on_thread_test(void) {
+    g_test_pg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    mprotect(g_test_pg, 4096, PROT_READ);
+    g_test_memset = guest_sym("memset");
+    dm_guest_thread_spawn(test_thread_body, NULL, 2, 256 * 1024);
+    for (int k = 0; k < 200; k++) Sleep(100);
+}
 typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void (*fnp)(void *);
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("缺符号 %s", n); return p; }
 
@@ -136,6 +156,9 @@ static void host_preload(int argc, char **argv) {
     // Only deterministic comparison (DM_FIXED_TIME) pins it to UTC: the same replay must convert to the same calendar time on this machine (UTC+8) and on the second Mac (UTC+9)
     if (getenv("DM_FIXED_TIME")) setenv("TZ", "UTC", 1);
     crash_install();
+    // DM_TEST_FAULT=1：装完处理器立刻制造一次访问违例，验证 VEH 是否真的在这台机器上被调用（排障用）
+    // DM_TEST_FAULT=1: raise an access violation right after installing the handler, to verify the VEH really is called on this machine (diagnostics)
+    if (getenv("DM_TEST_FAULT")) { *(volatile int *)(uintptr_t)atoi(getenv("DM_TEST_FAULT")) = 1; }
     const char *race = getenv("DM_TEST_KEYRACE");
     if (race && *race) {
         g_race_want = (unsigned)strtoul(race, NULL, 10);
@@ -152,6 +175,23 @@ static void host_preload(int argc, char **argv) {
     if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = argv[i];
     if (!n) { names[n++] = "main"; names[n++] = "sdk"; }
     load_modules(argv[1], names, n);
+    // DM_TEST_FAULT_GUEST=2：在客体线程里触发（验证客体线程上的访问违例能不能到 VEH）
+    // DM_TEST_FAULT_GUEST=2: raise it inside a guest thread (verify that access violations on guest threads reach the VEH)
+    if (getenv("DM_TEST_FAULT_GUEST") && atoi(getenv("DM_TEST_FAULT_GUEST")) == 2) {
+        dm_win_fault_on_thread_test();
+        exit(0);
+    }
+    // DM_TEST_FAULT_GUEST=1：用客体自己的 memset 写一页只读内存，验证「客体代码里的访问违例」会不会走到 VEH
+    // DM_TEST_FAULT_GUEST=1: have the guest's own memset write a read-only page, to verify that access violations raised
+    // inside guest code reach the VEH
+    if (getenv("DM_TEST_FAULT_GUEST")) {
+        void *pg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        mprotect(pg, 4096, PROT_READ);
+        void *g_memset = guest_sym("memset");
+        LOG("DM_TEST_FAULT_GUEST：客体 memset=%p 写只读页 %p", g_memset, pg);
+        ((void *(*)(void *, int, size_t))g_memset)(pg, 0, 16);
+        LOG("DM_TEST_FAULT_GUEST：没有违例（保护没生效）");
+    }
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE 探针（诊断用） | DM_PROBE probes (for diagnostics)
     ticks_install();   // DM_TICKS 逐拍状态哈希（拍入口观测门） | DM_TICKS per-tick state hash (tick-entry observation gate)

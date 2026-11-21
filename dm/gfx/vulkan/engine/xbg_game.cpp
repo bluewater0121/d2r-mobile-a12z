@@ -583,6 +583,7 @@ struct Slot {
     uint64_t hud_frame=0;
     struct WaitCount{std::atomic<int> n{0};WaitCount()=default;WaitCount(const WaitCount&){}WaitCount &operator=(const WaitCount&){n.store(0);return *this;}} waiters;   // 不持引擎锁等本槽栅栏的线程数（xbg_legacy_wait）；复位栅栏前须等它们离开 | threads waiting on this slot's fence without the engine lock (xbg_legacy_wait); the fence is reset only after they leave
     VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
+    uint64_t submit_ns=0; // 本次提交的时刻（诊断栅栏延迟） | when this submission was queued (fence-latency diagnostics)
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
     // gfx-xview-guard (recording_slot, readback_buffer): ranges of this slot's readback buffers the other slot read through
@@ -610,6 +611,23 @@ struct Slot {
     std::vector<struct Descriptors*> desc_used; // pooled per-draw descriptor records, returned after this slot's fence // handed out this frame; recycled into spare_sets after the slot fence (no per-frame pool reset)
 };
 Slot slots[2];unsigned slot_index=0;
+// 栅栏等待的诊断与自旋（DM_GFX_FENCE_SPIN / DM_GFX_FENCE_LOG）。
+// Diagnostics for fence waits and the optional spin (DM_GFX_FENCE_SPIN / DM_GFX_FENCE_LOG).
+bool fence_spin=false,fence_lat_log=false;bool fence_env_read=false;
+void fence_env_init(){if(fence_env_read)return;fence_env_read=true;
+    // 默认自旋：这块 Windows ARM 驱动上 vkWaitForFences 的唤醒延迟约 12-14 ms，而一次提交的 GPU 工作只有约 1.5 ms，
+    // 每帧 10 次等待就吃掉 120 ms（局内 6 fps）。轮询 vkGetFenceStatus 后同一帧到 15-28 fps。DM_GFX_FENCE_SPIN=0 可退回阻塞等待。
+    // Spin by default: on this Windows ARM driver the wake-up of vkWaitForFences lags 12-14 ms while a submission's GPU
+    // work is about 1.5 ms, so 10 waits a frame cost 120 ms (6 fps in a run). Polling vkGetFenceStatus took it to 15-28 fps.
+    // DM_GFX_FENCE_SPIN=0 goes back to the blocking wait.
+    const char *a=getenv("DM_GFX_FENCE_SPIN");
+#ifdef _WIN32
+    bool def=true;   // Windows ARM（Adreno）驱动上阻塞等待的唤醒延迟 12-14 ms | on the Windows ARM (Adreno) driver a blocking wait wakes 12-14 ms late
+#else
+    bool def=false;  // 安卓 / iOS 维持阻塞等待，别白烧 CPU | Android / iOS keep the blocking wait instead of burning CPU
+#endif
+    fence_spin=a&&*a ? !(*a=='0') : def;
+    const char *b=getenv("DM_GFX_FENCE_LOG");fence_lat_log=b&&*b&&*b!='0';}
 // Pending views of the other slot's results (xviews), and arena reuse while a slot with such views was in flight (races).
 // gfx-xview-guard (marker 1 / 0, else DM_GFX_XVIEW_GUARD; A/B target xguard): at such a reuse, a new readback buffer that
 // overlaps a range the reader viewed is not written by the CPU; its contents go to a stream buffer and a prologue command
@@ -808,8 +826,20 @@ void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
     {CPU_SCOPE(Fence);bool busy=vkGetFenceStatus(cfg.device,s.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-     VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)));
-     if(busy){block_ns[sync_site]+=timing_clock()-b0;++block_calls[sync_site];}}
+     const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);
+     // 栅栏自旋（DM_GFX_FENCE_SPIN=1）：驱动阻塞等待的唤醒延迟在这块 Windows ARM 显卡上占大头，
+     // 先轮询 vkGetFenceStatus 再退回阻塞等待，超时行为不变。
+     // Fence spin (DM_GFX_FENCE_SPIN=1): on this Windows ARM driver the wake-up latency of a blocking wait dominates;
+     // poll vkGetFenceStatus first and fall back to the blocking wait at the timeout, so the timeout semantics stay the same.
+     if(fence_spin){const uint64_t t0=timing_clock();for(;;){VkResult fr=vkGetFenceStatus(cfg.device,s.fence);if(fr==VK_SUCCESS)break;
+         if(fr!=VK_NOT_READY){VK(fr);break;}
+         const uint64_t el=timing_clock()-t0;
+         if(el>8000000ull){VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,timeout));break;}   // 自旋预算用完退回阻塞 | spin budget spent: block
+         if(el>2000000ull)std::this_thread::yield();}}
+     else VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,timeout));
+     if(busy){block_ns[sync_site]+=timing_clock()-b0;++block_calls[sync_site];}
+     if(fence_lat_log){const uint64_t w=busy?timing_clock()-b0:0;const uint64_t since=s.submit_ns?timing_clock()-s.submit_ns:0;
+         xbg_logf("NVN FENCE wait_ms=%.2f since_submit_ms=%.2f spin=%d site=%u",double(w)/1e6,double(since)/1e6,int(fence_spin),unsigned(sync_site));}}
     ++perf.waits;
     if(s.prof){
         s.prof=false;
@@ -941,7 +971,7 @@ void submit_slots(bool wait){
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
-        {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}++submit_by[sync_site];poolreset::queue(s);
+        {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}s.submit_ns=timing_clock();++submit_by[sync_site];poolreset::queue(s);
         s.recording=false;s.pending=true;s.covers=submitted;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
@@ -2180,10 +2210,21 @@ bool spv_override(const std::string &key,std::vector<uint32_t> &words){
     std::vector<uint32_t> w(size_t(n)/4);bool ok=fread(w.data(),1,size_t(n),f)==size_t(n);fclose(f);if(!ok || w[0]!=0x07230203u)return false;
     words.swap(w);xbg_logf("NVN spv override %s words=%zu",key.c_str(),words.size());return true;
 }
-Shader *load_shader(const void *control){
+Shader *load_shader(const void *control,uintptr_t code=0){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");
+    // DM_SHD_DUMP=目录：库里没有这把键时，把控制段（0x880 字节）另存为 <键>.ctl，供离线补包时找最接近的记录
+    // DM_SHD_DUMP=dir: when the library has no such key, save the control segment (0x880 bytes) as <key>.ctl, so an offline top-up build can find the closest record
+    if(!f){const char *d=getenv("DM_SHD_DUMP");if(d&&*d){std::string p=std::string(d)+"/"+key+".ctl";FILE *o=fopen(p.c_str(),"wb");if(o){fwrite(control,1,0x880,o);fclose(o);}
+            // 同一目录存一段机器码（64 KiB，从 NVNshaderData.data 起）：控制段里的元数据随烘焙常量变，认不出是哪份记录，机器码认得准
+            // Save a stretch of machine code (64 KiB from NVNshaderData.data) in the same directory: the metadata inside the control segment changes with the baked constants, so it cannot identify a record, but the code can
+            if(code){std::string q=std::string(d)+"/"+key+".code";FILE *o2=fopen(q.c_str(),"wb");if(o2){fwrite((const void*)code,1,0x10000,o2);fclose(o2);}}
+            xbg_logf("NVN 控制段已另存 %s",p.c_str());}}
+    // DM_SHD_DUMP_ALL=目录：连命中的也另存（前 200 个），用来核对「游戏给的控制段」与「离线包里的控制段」是否逐字节一致
+    // DM_SHD_DUMP_ALL=dir: save even the hits (first 200), to check whether the control the game hands over matches the one in the offline package byte for byte
+    if(f){const char *d=getenv("DM_SHD_DUMP_ALL");if(d&&*d){static int n;if(n<200){++n;std::string p=std::string(d)+"/"+key+".ctl";FILE *o=fopen(p.c_str(),"wb");if(o){fwrite(control,1,0x880,o);fclose(o);}}}}
+    if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
     fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");std::vector<uint8_t> bytes(length);need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
@@ -2223,7 +2264,7 @@ Shader *load_shader(const void *control){
 std::map<uint64_t,std::array<Shader*,6>> program_cache;
 const std::array<Shader*,6> &program_shaders(const prog_t *prog){
     if(prog->serial){auto it=program_cache.find(prog->serial);if(it!=program_cache.end())return it->second;}
-    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control);
+    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control,prog->sd[i].data);
     if(!prog->serial){static std::array<Shader*,6> scratch;scratch=out;return scratch;}
     return program_cache.emplace(prog->serial,out).first->second;
 }
@@ -4262,6 +4303,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');choose_depth_storage(cut==std::string::npos?dir:dir.substr(0,cut));}
     pipeguard::load();xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
+    fence_env_init();xbg_logf("NVN fence spin=%d latency log=%d (DM_GFX_FENCE_SPIN, DM_GFX_FENCE_LOG)",int(fence_spin),int(fence_lat_log));
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pool-reset").c_str(),"rb");poolreset::enabled=false;if(w){poolreset::enabled=fgetc(w)!='0';fclose(w);}else if(const char *e=getenv("DM_GFX_ASYNC_POOL_RESET"))poolreset::enabled=atoi(e)!=0;poolreset::start();xbg_logf("NVN async command pool reset=%d (marker gfx-async-pool-reset)",int(poolreset::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;unsigned long long from=0,period=0,count=0;if(fscanf(w,"%llu %llu %llu",&from,&period,&count)>=2){pass_prof_next=from;pass_prof_period=period?period:1;if(count)pass_prof_until=from+count;}fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1' || (marker("/gfx-readback-cached")<0 && getenv("DM_GFX_READBACK_CACHED") && *getenv("DM_GFX_READBACK_CACHED")=='1');texel_memo_enabled=marker("/gfx-no-texel-memo")<0;no_occlusion_queries=marker("/gfx-no-occlusion")=='1';samples_report_seen=false;open_occlusion=OpenOcclusion{};occlusion_queries_started=0;occlusion_batch_enabled=marker("/gfx-query-per-draw")!='1' && marker("/gfx-no-query-batch")<0;heavy_timestamps=marker("/gfx-heavy-timestamps")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d texel memo=%d (markers gfx-no-persistent-fb, gfx-no-slot-pools, gfx-readback-cached, gfx-no-texel-memo)",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached),int(texel_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");wtrack::marker=-1;if(w){wtrack::marker=fgetc(w)=='1'?1:0;fclose(w);}wtrack::enabled=wtrack::marker==1;}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;wtrack::marker=0;fclose(w);}xbg_logf("NVN wtrack enabled=%d (markers gfx-no-wtrack, gfx-wtrack=0)",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
      /* Android: no guest memory remapping probe. */
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");if(m){fclose(m);pstat_props=reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutablePropertiesKHR"));

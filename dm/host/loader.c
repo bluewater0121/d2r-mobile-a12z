@@ -16,15 +16,15 @@
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
-pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
-pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;   // g_keyaspect：宽高比上限参数位（KASPECT）          // 分辨率参数位（改写器 PARAMS，KRES0 掌机 / KRES1 主机）；产物没有即 0、不占 | g_keyaspect: aspect ratio upper-limit parameter slot (KASPECT)          // resolution parameter slots (rewriter PARAMS, KRES0 handheld / KRES1 docked); 0 and not allocated if the build output lacks them
+dm_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+dm_key_t g_keyres[2], g_keyaspect, g_keyaspectui;   // g_keyaspect：宽高比上限参数位（KASPECT）          // 分辨率参数位（改写器 PARAMS，KRES0 掌机 / KRES1 主机）；产物没有即 0、不占 | g_keyaspect: aspect ratio upper-limit parameter slot (KASPECT)          // resolution parameter slots (rewriter PARAMS, KRES0 handheld / KRES1 docked); 0 and not allocated if the build output lacks them
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_KRES0, KEY_KRES1, KEY_KASPECT, KEY_KASPECTUI, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name, int weak);
 static void tsd_probe(void);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
-static pthread_key_t key_value(unsigned i) {
+static dm_key_t key_value(unsigned i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
     case KEY_KGATE: return g_keygate; case KEY_KRES0: return g_keyres[0]; case KEY_KRES1: return g_keyres[1];
@@ -32,12 +32,22 @@ static pthread_key_t key_value(unsigned i) {
     }
 }
 static void create_keys(void) {
+#if defined(_WIN32)
+    // Windows：不用 pthread 键，直接给固定的槽号 0..7（TPIDR_EL0 指向每线程的槽块，槽号就是块内下标）。
+    // 槽号与改写器无关（键页存的是「槽号×8」这个偏移），所以这里能自己定；参数位同样全建。
+    // Windows: no pthread keys, just fixed slot numbers 0..7 (TPIDR_EL0 points at the per-thread slot block and the slot number is an index into it).
+    // The slot numbers are independent of the rewriter (the key page stores the offset "slot * 8"), so they can be chosen here; the parameter slots are all allocated too.
+    g_key18 = 0; g_keytls = 1; g_keytlr = 2; g_keygate = 3;
+    g_keyres[0] = 4; g_keyres[1] = 5; g_keyaspect = 6; g_keyaspectui = 7;
+    dm_win_tls_bind();   // 主线程先绑上槽块，装载期的键页校验才能读 | bind the slot block on the main thread first, so the load-time key page check can read
+#else
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("创建宿主键失败");
     // 参数位键一律建（不按产物有没有用到判断：iOS 包里没有 params.tsv，按文件判断会漏建、键页写成 0 → 游戏读到 TSD 0 号槽）
     // Parameter slot keys are always created (not decided by whether the build output uses them: an iOS app has no params.tsv, so deciding by file would miss creating them and the key page would be written as 0 → the game reads TSD slot 0)
     if (pthread_key_create(&g_keyres[0], NULL) || pthread_key_create(&g_keyres[1], NULL) ||
         pthread_key_create(&g_keyaspect, NULL) || pthread_key_create(&g_keyaspectui, NULL)) die("创建参数位键失败");
+#endif
     // 键号先转 unsigned 再放宽：bionic 的 pthread_key_t 是 int（有效键带最高位，如 0x80000020），直接转 unsigned long 会符号扩展成 0xffffffff80000020；苹果是 unsigned long 小整数，打印不变
     // Keys go through unsigned before widening: bionic's pthread_key_t is int (valid keys carry the top bit, e.g. 0x80000020), and a direct unsigned long cast sign-extends to 0xffffffff80000020; on Apple it is a small unsigned long, printed unchanged
     LOG("键号 K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu KRES0=%lu KRES1=%lu KASPECT=%lu KASPECTUI=%lu",
@@ -60,19 +70,19 @@ static uint64_t g_tsd_off;
 static uint8_t *tsd_base(void) { uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return ((uint8_t **)tp)[-1]; }
 // bionic 的键号 = 键表下标 | KEY_VALID_FLAG（第 31 位，实测 0x80000006 这种），取下标要去掉标记位
 // A bionic key number = key table index | KEY_VALID_FLAG (bit 31; measured values look like 0x80000006); strip the flag bit to get the index
-static uint64_t key_index(pthread_key_t k) { return (uint32_t)k & 0x7fffffffu; }
-static uint64_t slot_off(pthread_key_t k) { return g_tsd_off + key_index(k) * 16 + 8; }
+static uint64_t key_index(dm_key_t k) { return (uint32_t)k & 0x7fffffffu; }
+static uint64_t slot_off(dm_key_t k) { return g_tsd_off + key_index(k) * 16 + 8; }
 static void tsd_probe(void) {
     void *const magic = (void *)0x6d4d7d5d4d3d2d1dull, *const magic2 = (void *)0x1d2d3d4d5d7d4d6dull;
-    pthread_setspecific(g_key18, magic);
+    dm_key_set(g_key18, magic);
     uint8_t *b = tsd_base(); uint64_t at = 0;
     for (uint64_t o = 8; o < 0x4000 && !at; o += 8) if (*(void **)(b + o) == magic) at = o;
-    pthread_setspecific(g_key18, 0);
+    dm_key_set(g_key18, 0);
     if (!at || at < key_index(g_key18) * 16 + 8) die("bionic 键表没找到（键 %#x 设的值不在 bionic_tls 前 16 KB 里）", (unsigned)g_key18);
     g_tsd_off = at - key_index(g_key18) * 16 - 8;
-    pthread_setspecific(g_keygate, magic2);
+    dm_key_set(g_keygate, magic2);
     int ok = *(void **)(b + slot_off(g_keygate)) == magic2;
-    pthread_setspecific(g_keygate, 0);
+    dm_key_set(g_keygate, 0);
     if (!ok) die("bionic 键表布局不符（键表偏移 %#llx 对键 %#x 不成立）", (unsigned long long)g_tsd_off, (unsigned)g_keygate);
     LOG("bionic 键表偏移 %#llx", (unsigned long long)g_tsd_off);
 }
@@ -85,27 +95,43 @@ static void tsd_probe(void) {
 #define DM_PATCH_TARGET 2
 #define DM_OHOS_TSD_OFF 272
 static uint8_t *tsd_base(void) { uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return *(uint8_t **)(tp - DM_OHOS_TSD_OFF); }
-static uint64_t slot_off(pthread_key_t k) { return (uint64_t)k * 8; }
+static uint64_t slot_off(dm_key_t k) { return (uint64_t)k * 8; }
 static void tsd_probe(void) {
     void *const magic = (void *)0x6d4d7d5d4d3d2d1dull;
-    pthread_setspecific(g_keygate, magic);
+    dm_key_set(g_keygate, magic);
     int ok = *(void **)(tsd_base() + slot_off(g_keygate)) == magic;
-    pthread_setspecific(g_keygate, 0);
+    dm_key_set(g_keygate, 0);
     if (!ok) die("musl 线程键布局不符（tpidr_el0-%d 处不是 tsd 指针）：系统 libc 变了，需重测偏移并重出改写产物", DM_OHOS_TSD_OFF);
 }
+#elif defined(_WIN32)
+// Windows：TPIDR_EL0 指向每线程的槽块（compat/tls_win.c），槽号 = 块内下标，槽偏移 = 槽号×8。
+// 不用 pthread 键：winpthreads 的 TSD 布局与苹果不同，也没有必要去猜它——槽块是我们自己的，布局由这里和改写器共同决定。
+// 改写器 DM_TARGET=win（patch_nso.py）写出同一种取基址方式（mrs tpidr_el0），两边一一对应。
+// Windows: TPIDR_EL0 points at the per-thread slot block (compat/tls_win.c), the slot number is an index into it and the offset is slot * 8.
+// No pthread keys: winpthreads' TSD layout differs from Apple's and there is no reason to guess it -- the slot block is ours, and its layout is
+// decided here together with the rewriter. patch_nso.py with DM_TARGET=win emits the same way of fetching the base (mrs tpidr_el0), so the two
+// correspond one-to-one.
+#define DM_PATCH_TARGET 3
+static uint8_t *tsd_base(void) { uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return (uint8_t *)tp; }
+// 槽号即块内下标：第 0 号槽的偏移就是 0（不是「没建」）。苹果 / 安卓的偏移含基址，永远不会是 0，
+// 所以那边用「键页项为 0」判「键没建」；Windows 不能这么判（见 install_key_page）。
+// The slot number is an index into the block, so slot 0 legitimately has offset 0 (not "unset"). Apple / Android offsets include a base and
+// are never 0, so there "a key page entry of 0" means "the key was not created"; Windows cannot use that test (see install_key_page).
+static uint64_t slot_off(dm_key_t k) { return (uint64_t)k * 8; }
+static void tsd_probe(void) { dm_win_tls_bind(); }
 #else
 #define DM_PATCH_TARGET 0
 static uint8_t *tsd_base(void) { uint64_t b; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(b)); return (uint8_t *)(b & ~7ull); }
-static uint64_t slot_off(pthread_key_t k) { return (uint64_t)k * 8; }
+static uint64_t slot_off(dm_key_t k) { return (uint64_t)k * 8; }
 static void tsd_probe(void) {}
 #endif
 // K 槽校验：经键页取到的槽与 pthread_setspecific 写的是同一格
 // K slot check: the slot reached through the key page is the same cell that pthread_setspecific writes
 static void tsd_check(void) {
-    pthread_setspecific(g_key18, (void *)0x1234);
+    dm_key_set(g_key18, (void *)0x1234);
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
     if (*(uint64_t *)(tsd_base() + off) != 0x1234) die("TSD 布局不符");
-    pthread_setspecific(g_key18, 0);
+    dm_key_set(g_key18, 0);
 }
 
 static void build_symhash(module_t *m);
@@ -233,9 +259,9 @@ static void read_layout(module_t *m, const char *dir) {
     fclose(f);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != 0xff)
         die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
-    static const char *const tname[] = {"苹果", "安卓", "鸿蒙"}, *const tflag[] = {"apple", "android", "ohos"};
+    static const char *const tname[] = {"苹果", "安卓", "鸿蒙", "Windows"}, *const tflag[] = {"apple", "android", "ohos", "win"};
     if (target != DM_PATCH_TARGET) die("%s: 产物是给%s出的（TARGET %lu），本机要 %s 的产物（patch_nso.py 用 DM_TARGET=%s 重出）", path,
-                                       target < 3 ? tname[target] : "未知平台", target, tname[DM_PATCH_TARGET], tflag[DM_PATCH_TARGET]);
+                                       target < 4 ? tname[target] : "未知平台", target, tname[DM_PATCH_TARGET], tflag[DM_PATCH_TARGET]);
 }
 
 static void install_key_page(module_t *m) {
@@ -243,7 +269,16 @@ static void install_key_page(module_t *m) {
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
     for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = slot_off(key_value(i));
+#if !defined(_WIN32)
+    // 苹果 / 安卓：键页项为 0 说明宿主键没建 | Apple / Android: a key page entry of 0 means the host key was not created
     for (int k = 0; k < 8; k++) if (!page[m->key_idx[k]]) die("%s: 键页第 %d 项为 0（宿主键没建）——游戏会读到 TSD 0 号槽", m->name, k);
+#else
+    // Windows：0 号槽偏移本就是 0，只能查「八项互不相同且都在槽块内」| Windows: slot 0's offset is 0 by construction, so check the eight entries are distinct and inside the block
+    for (int k = 0; k < 8; k++) {
+        if (page[m->key_idx[k]] >= 64 * 8) die("%s: 键页第 %d 项越出槽块（%llu）", m->name, k, (unsigned long long)page[m->key_idx[k]]);
+        for (int j = 0; j < k; j++) if (page[m->key_idx[k]] == page[m->key_idx[j]] && m->key_idx[k] != m->key_idx[j]) die("%s: 键页第 %d 与第 %d 项偏移相同", m->name, k, j);
+    }
+#endif
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s 键页 mprotect", m->name);
 }
 

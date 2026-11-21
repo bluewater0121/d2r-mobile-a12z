@@ -84,10 +84,22 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time
 HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
           "连 time 服务的时区规则；改用宿主 localtime_r", Result, h_time_ToCalendarTime, CalendarTime *ct, CalendarAdditionalInfo *ai, const int64_t *pt) {
     time_t t = *pt; struct tm tm; localtime_r(&t, &tm);
-    static int once; if (!once++) LOG("ToCalendarTime：首次换算 %lld → %04d-%02d-%02d %02d:%02d（时区 %s，偏移 %ld 秒）", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_zone ? tm.tm_zone : "?", (long)tm.tm_gmtoff);
+    // 时区名与 UTC 偏移：苹果的 struct tm 带 tm_zone / tm_gmtoff，Windows 的没有，改问系统
+    // Time zone name and UTC offset: Apple's struct tm carries tm_zone / tm_gmtoff, Windows' does not, so ask the system
+#if defined(_WIN32)
+    TIME_ZONE_INFORMATION tzi; DWORD tzr = GetTimeZoneInformation(&tzi);
+    long gmtoff = -(long)(tzi.Bias + (tzr == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : tzi.StandardBias)) * 60;
+    const wchar_t *wz = tzr == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightName : tzi.StandardName;
+    char tzbuf[32]; int k = 0; for (; k < 31 && wz[k]; k++) tzbuf[k] = (char)(wz[k] < 128 ? wz[k] : '?'); tzbuf[k] = 0;
+    const char *tzname_s = tzbuf;
+#else
+    const char *tzname_s = tm.tm_zone ? tm.tm_zone : "?";
+    long gmtoff = (long)tm.tm_gmtoff;
+#endif
+    static int once; if (!once++) LOG("ToCalendarTime：首次换算 %lld → %04d-%02d-%02d %02d:%02d（时区 %s，偏移 %ld 秒）", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tzname_s, gmtoff);
     if (ct) *ct = (CalendarTime){(int16_t)(tm.tm_year + 1900), (int8_t)(tm.tm_mon + 1), (int8_t)tm.tm_mday, (int8_t)tm.tm_hour, (int8_t)tm.tm_min, (int8_t)tm.tm_sec, 0};
-    if (ai) { memset(ai, 0, sizeof *ai); ai->wday = tm.tm_wday; ai->yday = tm.tm_yday; strlcpy(ai->tzname, tm.tm_zone ? tm.tm_zone : "UTC", sizeof ai->tzname);
-              ai->dst = tm.tm_isdst > 0; ai->offset = (int32_t)tm.tm_gmtoff; }
+    if (ai) { memset(ai, 0, sizeof *ai); ai->wday = tm.tm_wday; ai->yday = tm.tm_yday; strlcpy(ai->tzname, tzname_s, sizeof ai->tzname);
+              ai->dst = tm.tm_isdst > 0; ai->offset = (int32_t)gmtoff; }
     return RES_OK;
 }
 // 本地时刻换算强制接宿主 libc：SDK 自带的 localtime / localtime_r / mktime 没有时区数据、恒按 UTC（宿主实测：编年史「首次发现」由

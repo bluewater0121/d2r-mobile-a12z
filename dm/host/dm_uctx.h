@@ -12,6 +12,15 @@
 #define UC_FP(uc) ((uc)->uc_mcontext->__ss.__fp)
 #define UC_X(uc, i) ((uc)->uc_mcontext->__ss.__x[i])
 static inline uint64_t UC_ESR(const ucontext_t *uc) { return uc->uc_mcontext->__es.__esr; }
+#elif defined(_WIN32)
+// Windows：现场由 VEH 抄进 dm_win_mcontext_t（见 dm/win/compat/crash_win.c）；没有 ESR，缺页的读写方向由异常码区分
+// Windows: the state is copied into dm_win_mcontext_t by the VEH (see dm/win/compat/crash_win.c); there is no ESR, the fault direction comes from the exception code
+#define UC_PC(uc) ((uc)->uc_mcontext.pc)
+#define UC_LR(uc) ((uc)->uc_mcontext.regs[30])
+#define UC_SP(uc) ((uc)->uc_mcontext.sp)
+#define UC_FP(uc) ((uc)->uc_mcontext.regs[29])
+#define UC_X(uc, i) ((uc)->uc_mcontext.regs[i])
+static inline uint64_t UC_ESR(const ucontext_t *uc) { (void)uc; return 0; }
 #else
 #define UC_PC(uc) ((uc)->uc_mcontext.pc)
 #define UC_LR(uc) ((uc)->uc_mcontext.regs[30])
