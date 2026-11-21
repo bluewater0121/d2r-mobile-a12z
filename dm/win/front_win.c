@@ -107,6 +107,17 @@ static void set_finger(int down) {
 }
 
 // ---------- 窗口过程 ----------
+// 标题栏：分辨率 + 动态帧率（"1600x900 · 43 fps"）。每秒刷一次，值来自呈现层真正上屏的次数
+// Title bar: resolution + live frame rate ("1600x900 · 43 fps"). Refreshed once a second from the presentation layer's actual present count
+static void update_title(void) {
+    if (!g_hwnd) return;
+    uint64_t r = front_game_res(1);
+    unsigned gw = (unsigned)(r & 0xffffffffu), gh = (unsigned)(r >> 32);
+    int fps = dm_win_vk_fps();
+    wchar_t t[160];
+    swprintf(t, 160, L"D2R Mobile（Windows ARM64） — %ux%u · %d fps", gw, gh, fps);
+    SetWindowTextW(g_hwnd, t);
+}
 static void on_key_msg(int vk, int down) {
     switch (vk) {
     case 'W': g_kw = down; break; case 'A': g_ka = down; break; case 'S': g_ks = down; break; case 'D': g_kd = down; break;
@@ -156,6 +167,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0; }
     case WM_TIMER:
         if (wp == 1) { KillTimer(h, 1); g_stick_rx = 0; push_input(); }
+        else if (wp == 2) update_title();
         return 0;
     case WM_SETFOCUS: return 0;
     case WM_KILLFOCUS:
@@ -182,6 +194,8 @@ static int create_window(void) {
                              wx, wy, ww, wh, NULL, NULL, hi, NULL);
     if (!g_hwnd) return -1;
     ShowWindow(g_hwnd, SW_SHOW); UpdateWindow(g_hwnd); SetForegroundWindow(g_hwnd); SetFocus(g_hwnd);
+    SetTimer(g_hwnd, 2, 1000, NULL);   // 标题栏每秒刷一次分辨率与帧率 | refresh resolution and frame rate in the title bar once a second
+    update_title();
     const char *full = getenv("DM_WIN_FULL");
     if (full && *full == '1') ShowWindow(g_hwnd, SW_MAXIMIZE);
     return 0;

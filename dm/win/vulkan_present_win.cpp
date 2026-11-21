@@ -60,6 +60,11 @@ bool in_flight[2] = {false, false};
 unsigned flight = 0;
 std::string shader_dir;
 std::string device_name;
+// 上屏帧率（标题栏用）：每次真正上屏记一次，最近约 0.75 s 的窗口算一次显示值
+// Present frame rate (for the title bar): count every frame actually put on screen, publish a value per ~0.75 s window
+std::atomic<int> fps_value{0};
+uint64_t fps_window_start = 0;
+unsigned fps_window_frames = 0;
 
 __attribute__((format(printf, 1, 2))) void vlog(const char *format, ...) {
     char text[1100]; va_list a; va_start(a, format); int n = vsnprintf(text, sizeof text - 1, format, a); va_end(a);
@@ -317,9 +322,17 @@ int present(void *, void *, VkImage source, VkFormat source_format, uint32_t wid
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR) { swap_dirty = true; return VK_SUCCESS; }    if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) return pr;
     if (rebuild || pr == VK_SUBOPTIMAL_KHR) swap_dirty = true;   // 下一帧重建 | rebuild on the next frame
+    // 帧率统计：窗口 0.75 s 一次，取整后给标题栏 | frame rate: a 0.75 s window, rounded, handed to the title bar
+    { uint64_t now = GetTickCount64() / 2;   // 2 ms 粒度够用 | 2 ms granularity is enough
+      if (!fps_window_start) fps_window_start = now;
+      ++fps_window_frames;
+      uint64_t span = now - fps_window_start;
+      if (span >= 750) { fps_value.store(int((fps_window_frames * 1000ull + span / 2) / span)); fps_window_start = now; fps_window_frames = 0; } }
     return VK_SUCCESS;
 }
 }   // namespace
+
+extern "C" int dm_win_vk_fps(void) { return fps_value.load(); }
 
 extern "C" void dm_win_vk_notify_resize(void) {
     std::lock_guard<std::mutex> l(render_mutex);

@@ -19,6 +19,9 @@ int dm_win_vk_initialize(int image_count, char *error, size_t bytes);
 void dm_win_vk_notify_resize(void);
 int dm_win_vk_has_window(void);
 const char *dm_win_vk_device_name(void);
+// 最近的实际上屏帧率（整数，约 0.75 s 更新一次；还没上过屏时为 0）。标题栏显示用。
+// The latest actual present rate (integer, updated about every 0.75 s; 0 before the first present). For the title bar.
+int dm_win_vk_fps(void);
 #ifdef __cplusplus
 }
 #endif

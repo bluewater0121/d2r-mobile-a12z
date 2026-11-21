@@ -81,6 +81,10 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 `shader_dir` 取 `DM_SHADER_DIR`，缺省是当前目录下的 `shaders`，所以工作目录放在 `build\win` 就能命中第二步的产物。
 
+省事的办法是双击工程根目录的 `start-win-arm64.bat`：它把上面这些环境变量都设好（RomFS 缺省取 `..\Diablo\RomFS`），顺手建好 `save` / `temp`，并在启动前关掉旧实例。`--rebuild` 先重编译，`--res 1280x720` 换渲染分辨率。
+
+**标题栏**显示当前渲染分辨率与实时帧率（`1600x900 · 43 fps`，每秒刷新一次，数字来自呈现层真正上屏的帧数）。
+
 ### 键鼠
 
 | 键 | 对应 |

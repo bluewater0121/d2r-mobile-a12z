@@ -81,6 +81,10 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 `shader_dir` comes from `DM_SHADER_DIR` and defaults to `shaders` under the working directory, so running from `build\win` picks up step 2's output.
 
+The easy way is to double-click `start-win-arm64.bat` at the checkout root: it sets all of the above (RomFS defaults to `..\Diablo\RomFS`), creates `save` / `temp`, and closes an older instance first. `--rebuild` rebuilds, `--res 1280x720` changes the render resolution.
+
+The **title bar** shows the current render resolution and the live frame rate (`1600x900 · 43 fps`, refreshed once a second, counted from the frames the presentation layer actually put on screen).
+
 ### Keyboard and mouse
 
 | Key | Maps to |
