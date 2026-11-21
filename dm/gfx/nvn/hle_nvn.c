@@ -1150,13 +1150,25 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
-    uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns(), wait = at > now ? at - now : 0;
+    // 提前量：不等「正好到节拍点」，提前 DM_PRESENT_LEAD_MS 毫秒就放行（缺省 0 = 关）。窗口模式下出图是排队给 DWM 的，
+    // 提前交出去的这一帧会在下一个垂直同步上被取走，理论上留出的余量能吃掉「差一两毫秒」的抖动，不再整块丢一个周期。
+    // 实测（营地随机走动 60 s）：缺省 4 ms 与 0 相比不改善反而略差（整帧 ≥30 ms 7.5% → 8.5%，尖峰 9 帧周期不变），所以缺省关闭，只留开关。
+    // Lead-in: instead of waiting for the exact present slot, release DM_PRESENT_LEAD_MS milliseconds early (default 0 = off). In windowed mode the
+    // presented frame is queued for DWM and picked up at the next vblank, so handing it over slightly early was meant to absorb "just missed by a
+    // millisecond or two" jitter instead of losing a whole period. Measured in the camp random-walk test (60 s): 4 ms is no better than 0 and slightly
+    // worse (frames >= 30 ms 7.5% -> 8.5%, the 9-frame spike cycle unchanged), so it stays off by default and the switch remains for experiments.
+    static int64_t g_lead_ns = -1;
+    if (g_lead_ns < 0) { const char *e = getenv("DM_PRESENT_LEAD_MS"); g_lead_ns = e ? atoll(e) * 1000000ll : 0; if (!dm_detclock_enabled() && g_lead_ns > 0) LOG("[nvn] 出图提前量 %lld ms（DM_PRESENT_LEAD_MS）", (long long)(g_lead_ns / 1000000ll)); }
+    uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    uint64_t stop = at;
+    if (g_lead_ns > 0 && at > (uint64_t)g_lead_ns) stop = at - (uint64_t)g_lead_ns;
+    uint64_t wait = stop > now ? stop - now : 0;
     if (!dm_detclock_enabled()) {   // 取图线程登记为时间约束线程（不再只在「来早了」时才登记：热态一直落后时也要声明） | Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(&g_rt_main, period); }
         rt_comp_tick(&g_rt_main, period);
-        if (mtl_link_active()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
-        else if (wait) sleep_until_ns(at);
+        if (mtl_link_active()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull) && wait) sleep_until_ns(stop); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        else if (wait) sleep_until_ns(stop);
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -1164,7 +1176,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace < 0) { const char *e = getenv("DM_DETCLOCK_PACE"), *d = getenv("DM_DETCLOCK"); step = d ? strtoull(d, 0, 0) : 0; pace = e && atoi(e) && step; }
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
-    g_acq_wait_ns += wait; g_pa_wait += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    g_acq_wait_ns += wait; g_pa_wait += wait; trow(g_frame, "@late_ms", wait ? (int64_t)(now_ns() - at) / 1e6 : 0);
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
@@ -1482,6 +1494,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     gfx_enter();
     uint64_t t0 = now_ns();
+#if defined(DM_WIN)
+    { void dm_stall_probe_frame(uint64_t); dm_stall_probe_frame(t0); }   // DM_STALL_PROBE：把帧起点交给采样线程 | DM_STALL_PROBE: hand the frame start to the sampler
+#endif
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // 只入队，立即返回；ticket 存翻译队列的任务号 | Enqueue only and return at once; ticket holds the translation queue's job number
         xjob j = {XJ_PRESENT, 0, NULL, snap_tex(o->tex[idx]), present_period(o) / 1e9}; memcpy(j.crop, o->crop, sizeof j.crop);
         o->ticket[idx] = x_push(&j); }

@@ -88,6 +88,7 @@ endforeach()
 set(WIN_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/front_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/pad_win.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/stall_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_win.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/tls_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/misc_win.c

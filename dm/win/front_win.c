@@ -203,6 +203,7 @@ static int create_window(void) {
 static void *guest_main_tramp(void *p) {
     (void)p;
     atomic_store(&g_guest_running, 1);
+    { void dm_stall_probe_begin(void); dm_stall_probe_begin(); }   // DM_STALL_PROBE：在这条客体主线程上起 PC 采样 | DM_STALL_PROBE: start PC sampling on this guest main thread
     g_guest();
     atomic_store(&g_guest_running, 0);
     LOG("客体线程结束");

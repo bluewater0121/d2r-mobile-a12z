@@ -131,7 +131,10 @@ int create_swap() {
     if (!extent.width || !extent.height) return VK_NOT_READY;
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = surface;
-    ci.minImageCount = std::clamp(3u, std::max(2u, cap.minImageCount), cap.maxImageCount ? cap.maxImageCount : 3u);   // 三张图：两张交替在途 + 一张给呈现引擎读，获取图片这一步不再卡在垂直同步上 | three images: two in flight alternately plus one the presentation engine is still reading, so acquiring an image no longer blocks on vsync
+    // DM_PRESENT_IMAGES：交换链张数（缺省 3 = 两张交替在途 + 一张给呈现引擎读）。加大可以压住「取图没有空图」
+    // DM_PRESENT_IMAGES: number of swapchain images (default 3 = two in flight alternately plus one the presentation engine reads). Raising it relieves "no free image on acquire"
+    unsigned want_images = 3u; { const char *e = getenv("DM_PRESENT_IMAGES"); if (e && atoi(e) > 0) want_images = (unsigned)atoi(e); }
+    ci.minImageCount = std::clamp(want_images, std::max(2u, cap.minImageCount), cap.maxImageCount ? cap.maxImageCount : want_images);   // 三张图：两张交替在途 + 一张给呈现引擎读，获取图片这一步不再卡在垂直同步上 | three images: two in flight alternately plus one the presentation engine is still reading, so acquiring an image no longer blocks on vsync
     if (cap.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, cap.maxImageCount);
     ci.imageFormat = sf.format; ci.imageColorSpace = sf.colorSpace; ci.imageExtent = extent; ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -178,6 +181,15 @@ int create_swap() {
 }
 int has_window(void *) { return window ? 1 : 0; }
 
+// 出图线程上的长时间阻塞（栅栏 / 取图）：客机等出图线程的时候，原因通常在这里，逐次打一行
+// Long blocks on the present thread (fence / acquire): when the guest waits for the present thread, the cause is usually here, one line per block
+static uint64_t qpc_now_ns() { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (uint64_t)(c.QuadPart * 1000000000ll / f.QuadPart); }
+static void note_block(const char *what, uint64_t ns) {
+    if (ns < 8000000ull) return;
+    static unsigned long blocks;
+    vlog("[呈现] %s 阻塞 %.1f ms（第 %lu 次 >=8 ms）", what, double(ns) / 1e6, ++blocks);
+}
+
 // present：源图（引擎交来，TRANSFER_SRC_OPTIMAL）→ 交换链（居中留边、按比例缩放到客户区）
 // present: source image (handed over by the engine in TRANSFER_SRC_OPTIMAL) -> swapchain (centered with letterbox, scaled to the client area)
 int present(void *, void *, VkImage source, VkFormat source_format, uint32_t width, uint32_t height, const int32_t crop[4], int32_t) {
@@ -211,13 +223,17 @@ int present(void *, void *, VkImage source, VkFormat source_format, uint32_t wid
     VkSemaphore acq = f ? overlap_acquired : acquired;
     VkFence done = f ? overlap_fence : fence;
     if (in_flight[f]) {
+        uint64_t t_w = qpc_now_ns();
         r = vkWaitForFences(device, 1, &done, VK_TRUE, 10ull * 1000000000ull);
+        note_block("栅栏", qpc_now_ns() - t_w);
         if (r) return r;
         if ((r = vkResetFences(device, 1, &done))) return r;
         in_flight[f] = false;
     }
     uint32_t index = 0;
+    uint64_t t_a = qpc_now_ns();
     r = vkAcquireNextImageKHR(device, swapchain, 50ull * 1000000ull, acq, VK_NULL_HANDLE, &index);
+    note_block("取图", qpc_now_ns() - t_a);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) return VK_SUCCESS;   // 本帧不上屏：引擎把出图交给我们，这里不重试、不占队列 | this frame is not shown: the engine handed the picture to us, we do not retry or hold the queue
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_dirty = true; return VK_SUCCESS; }
     bool rebuild = r == VK_SUBOPTIMAL_KHR;
@@ -492,3 +508,5 @@ extern "C" int dm_win_vk_initialize(int image_count, char *error, size_t bytes) 
     }
     return status;
 }
+
+
