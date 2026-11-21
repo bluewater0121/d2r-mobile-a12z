@@ -11,6 +11,7 @@ English: [README.md](README.md)
 | `CMakeLists.txt` | llvm-mingw（aarch64-w64-mingw32）构建。Vulkan 没有 ARM64 导入库，所以直接链 `C:\Windows\System32\vulkan-1.dll`；`log` 库用空的 INTERFACE 目标顶替，好让 `dm/gfx/vulkan/CMakeLists.txt` 原样复用 |
 | `toolchain-aarch64-w64-mingw32.cmake` | 工具链文件（`clang` / `clang++` / `llvm-ar` / `llvm-nm`） |
 | `front_win.c` | 窗口、键盘鼠标注入、`swkbd` 宿主输入框。客户区缺省 1600x900，`DM_WIN_SIZE` 可改；画面按游戏比例居中留边 |
+| `pad_win.c` | 实体手柄：XInput 轮询线程 → 宿主 `dm_pad_set`，判据与 iOS `dm_gamepad.m` / 安卓 `PadInput.java` 一致（见下「手柄」） |
 | `vulkan_present_win.cpp` | 交换链（1600x900、3 张、格式 0x25、`imageUsage` 只有 `TRANSFER_DST`）、blit 上屏、`DM_WIN_SHOT` 读回 |
 | `compat/` | Windows 兼容层：PE 段表、自写 `setjmp`/`longjmp`、二进制读 `open`、arena 用的 `aligned_alloc`/`dm_free`、栈预提交、VEH 崩溃处理 |
 | `tools/` | 平台工具，见下 |
@@ -36,6 +37,37 @@ ninja -C build/win/obj
 | `tools/extract_casc.py` | `python extract_casc.py <RomFS> <输出目录>`：从静态 CASC 取出着色器包 |
 | `tools/asm_coff.py` | 把 Mach-O 写法的 `.S` 转成 COFF（构建时自动调用） |
 | `tools/sym_off.py` | 符号 → 偏移，配合崩溃回溯定位 |
+
+## 手柄
+
+`pad_win.c` 用 XInput（`xinput1_4` → `1_3` → `9_1_0` 依次动态加载，不引导入库），8 ms 轮询一次（125 Hz，比游戏取手柄的 60 Hz 快，短按不会漏），把状态交给宿主 `dm_pad_set`。与 iOS / 安卓同一套判据：
+
+- 手柄有明确输入（按下任何键、或摇杆推出 25%）→ 切手柄布局（`dm_padmode_request(1)`），并先报键帽样式；
+- 敲键盘 / 用鼠标点画面 → 切回触屏布局，摇杆要先回中、再推出来才算重新接管；
+- 触屏布局下手柄的键和摇杆都不交给游戏；手柄布局下没推出来的摇杆给 0；
+- 多只手柄按键取或、每根摇杆取推得最远的。
+
+面键（**这个游戏是 Switch 版，键位含义按 Switch 键帽走**）：
+
+| XInput 物理键 | 默认（按位置） | `DM_PAD_AB=switch` |
+|---|---|---|
+| 下 A | A 确认 | B 返回 |
+| 右 B | B 返回 | A 确认 |
+| 左 X | Y | Y |
+| 上 Y | X（放进堆叠仓库） | X |
+
+XInput 一律按键帽位置报告（下 = A、右 = B、左 = X、上 = Y），而 Xbox 手柄字母与位置一致，所以默认就是「下 = 确认」，与 PC / Xbox 版同位置同功能。**如果手柄是按 Switch 字母报键的**（Switch Pro 经转换器、或玩家习惯「右 A 确认」），设 `DM_PAD_AB=switch` 只换 A/B。键帽样式报 Xbox（覆盖层没有那套图时 `dm_padmode.c` 退回原版 Switch 键帽）。
+
+肩键 L/R、扳机 ZL/ZR（按过 30/255）、摇杆按下 LS/RS、菜单键 → ＋、视图键 → －、十字键照位对。
+
+| 环境变量 | 作用 |
+|---|---|
+| `DM_PAD=0` | 不接手柄 |
+| `DM_PAD_AB=switch` | 面键换 Switch 语义（右 A 确认） |
+| `DM_PAD_LOG=1` | 打连接与状态变化 |
+| `DM_PAD_TEST=<秒>` | 没有实体手柄时，在启动后第 N 秒注入一次 0.4 s 的 A 短按，验通路（只一次） |
+
+没有实体手柄也能验：`DM_PAD_TEST=52` 启动，日志会依次出现 `手柄：XInput 已就绪`、`注入 A`、`有明确输入 → 手柄布局`，画面从标题页跳到角色列表即可确认「前端 → 宿主 → 游戏」这条通路通了。
 
 ## 两个踩过的坑（改之前先看）
 

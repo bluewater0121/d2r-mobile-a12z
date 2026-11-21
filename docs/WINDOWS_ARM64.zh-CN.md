@@ -99,6 +99,12 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 注意：客体是**每帧采样一次按键状态**，按下和松开落在同一帧里等于没按。自己写脚本注入按键时，按下与松开之间至少留 100 ms（本仓库的 `dm/win/tools/keys_win.py` 默认 140 ms 就是为这个）。
 
+### 手柄
+
+接上手柄（XInput：Xbox 手柄、以及 PC 上以 XInput 模式出现的第三方手柄）可以直接玩，判据与 iOS / 安卓一致：手柄一有输入就换成手柄布局，敲键盘或点画面换回触屏布局，摇杆要先回中才重新接管。
+
+面键默认按位置（下 = A 确认、右 = B 返回、左 = Y、上 = X），与 PC / Xbox 版同位置同功能；按 Switch 字母报键的手柄（或习惯「右 A 确认」）加 `DM_PAD_AB=switch` 只换 A/B。细节与验证方法见 [../dm/win/README.zh-CN.md](../dm/win/README.zh-CN.md) 的「手柄」一节。
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -108,6 +114,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 | `DM_SHADER_DIR` | 着色器包目录（缺省 `./shaders`） |
 | `DM_TACT_PREFETCH=0` | 关掉战术预取（Windows 上建议关） |
 | `DM_KBD=<文本>` | `swkbd` 起名面板直接返回这段文本，跳过宿主输入框 |
+| `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<秒>` | 手柄开关 / Switch 面键语义 / 手柄日志 / 无手柄时注入一次 A 验通路 |
 | `DM_WIN_SHOT=<首帧>[+<步长>]:<路径模板>` | 在呈现线程把上屏前的图读回成 32 位 BMP，例如 `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=宽x高` | 窗口客户区尺寸（缺省 1600x900，按屏幕工作区不超过 90%） |
 | `DM_GAME_RES=宽x高` | 游戏渲染分辨率（缺省按原版 16:9：1600x900） |

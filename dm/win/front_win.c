@@ -68,6 +68,10 @@ static void push_input(void) {
     int32_t lx = (g_kd - g_ka) * 32767, ly = (g_kw - g_ks) * 32767;
     dm_input_set(g_btn, lx, ly, g_stick_rx, 0);
 }
+// 实体手柄（pad_win.c）：XInput 轮询线程 → dm_pad_set；敲键盘 / 点画面就切回触屏布局
+// Physical controllers (pad_win.c): the XInput poll thread feeds dm_pad_set; typing or clicking the picture switches back to the touch layout
+void dm_win_pad_start(void);
+void dm_win_pad_touch(void);
 static int vk_bit(int vk) {
     switch (vk) {
     case 'J': return 0; case 'K': return 1; case 'U': return 2; case 'I': return 3;      // A B X Y
@@ -93,6 +97,7 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
 static void set_finger(int down) {
     if (down && !g_mouse_down) {
         g_mouse_down = 1; g_finger = 1;
+        dm_win_pad_touch();
     } else if (!down && g_mouse_down) {
         g_mouse_down = 0; g_finger = 0;
         dm_touch_set(NULL, 0);
@@ -107,7 +112,10 @@ static void on_key_msg(int vk, int down) {
     case 'W': g_kw = down; break; case 'A': g_ka = down; break; case 'S': g_ks = down; break; case 'D': g_kd = down; break;
     }
     int b = vk_bit(vk);
-    if (down && (b >= 0 || vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D')) dm_padmode_request_glyph(DM_GLYPH_KBD);
+    if (down && (b >= 0 || vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D')) {
+        dm_padmode_request_glyph(DM_GLYPH_KBD);
+        dm_win_pad_touch();   // 键盘 = 触屏侧：手柄布局切回触屏布局 | keyboard counts as the touch side: back to the touch layout
+    }
     if (b >= 0) g_btn = down ? (g_btn | 1ull << b) : (g_btn & ~(1ull << b));
     push_input();
 }
@@ -318,6 +326,7 @@ void front_run(void (*guest)(void)) {
         MessageBoxA(g_hwnd, err, "Vulkan 不可用", MB_ICONERROR | MB_OK);
     } else LOG("呈现：Vulkan 已就绪（%s）", dm_win_vk_device_name());
     g_guest = guest;
+    dm_win_pad_start();
     // 排障：把映像基址打出来，崩溃日志里的绝对 pc 才能换算成 dmhost.exe 内的偏移（llvm-nm 对照）
     // Diagnostics: print the image base so absolute pcs in crash logs can be turned into offsets inside dmhost.exe (compare with llvm-nm)
     { extern IMAGE_DOS_HEADER __ImageBase; LOG("映像基址 %#llx", (unsigned long long)(uintptr_t)&__ImageBase); }

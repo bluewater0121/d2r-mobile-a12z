@@ -99,6 +99,12 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 Note that the guest **samples button state once per frame**: a press and release that land in the same frame read as no press. If you script key injection, leave at least 100 ms between down and up (this repo's `dm/win/tools/keys_win.py` defaults to 140 ms for that reason).
 
+### Controllers
+
+An XInput pad (Xbox pads, and third-party pads in XInput mode on PC) works right away, with the same rules as iOS / Android: controller input switches to the controller layout, the keyboard or a click on the picture switches back, and a stick must return to center before it takes over again.
+
+Face buttons default to positions (bottom = A confirm, right = B back, left = Y, top = X), the same as the PC / Xbox version; for pads that report by Switch letters (or players used to "right A confirms"), `DM_PAD_AB=switch` swaps only A/B. Details and how to check it without hardware are in [../dm/win/README.md](../dm/win/README.md) under "Controllers".
+
 ### Environment variables
 
 | Variable | Effect |
@@ -108,6 +114,7 @@ Note that the guest **samples button state once per frame**: a press and release
 | `DM_SHADER_DIR` | shader bundle directory (default `./shaders`) |
 | `DM_TACT_PREFETCH=0` | turn tactical prefetch off (recommended on Windows) |
 | `DM_KBD=<text>` | the `swkbd` naming panel returns this text directly, skipping the host input box |
+| `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<s>` | controllers off / Switch face-button semantics / controller log / one injected A press to check the path |
 | `DM_WIN_SHOT=<first>[+<step>]:<path template>` | read back the picture right before presentation into a 32-bit BMP, e.g. `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=WxH` | window client size (default 1600x900, capped at 90% of the work area) |
 | `DM_GAME_RES=WxH` | game render resolution (default 1600x900, the original 16:9 docked size) |
