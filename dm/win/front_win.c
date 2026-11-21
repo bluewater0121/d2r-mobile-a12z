@@ -325,12 +325,38 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     return r.result;
 }
 
+// ---------- 引擎开关（与安卓同一套） ----------
+// 这批默认值在 dm/android/jni_android.c 里逐项实测过（营地 60 帧靠的就是它们）：这块 Windows ARM 显卡同属 Adreno + Vulkan，
+// 引擎又是同一份代码，所以 Windows 按同一套开。玩家自己设了同名环境变量就以他的为准（setenv overwrite=0）。
+// Engine switches, the same set as Android: dm/android/jni_android.c measured each one (they are what holds 60 fps in the camp),
+// and this Windows ARM GPU is Adreno + Vulkan on the same engine code, so Windows opens the same set. A user-set environment
+// variable of the same name wins (setenv with overwrite=0).
+static void env_default(const char *k, const char *v) { if (!getenv(k)) setenv(k, v, 0); }
+static void tuning_defaults(void) {
+    env_default("DM_3D_SCALE_DEFAULT", "0.85");   // 3D 按 0.85 渲染再上采样，界面仍按全分辨率（手机的「均衡」档） | render 3D at 0.85 and upscale; the UI stays full resolution (the phones' "balanced" level)
+    env_default("DM_GFX_NATIVE_BC", "1");          // BC 贴图按原格式采样：GPU 少约 0.5 ms，图像内存 827 → 320 MB | BC textures sampled natively: ~0.5 ms less GPU, image memory 827 -> 320 MB
+    env_default("DM_GFX_DEFER_EVENTS", "2");       // SignalEvent 不提交、留到槽退役时公布（安卓 7.7 → 19.5 帧的一条） | SignalEvents are not submitted, published when the slot retires (one of the 7.7 -> 19.5 fps steps on Android)
+    env_default("DM_GFX_READ_PREFLIGHT", "0");     // 不在每个绘制前完成全部待写回：省掉每帧 5~6 次「提交完就等」 | no full writeback resolve before every draw: removes 5-6 submit-then-wait points per frame
+    env_default("DM_GFX_XVIEW_GUARD", "1");        // 另一槽还在读的回读缓冲，改由 GPU 在它之后写 | readback buffers the other slot still reads are written by the GPU after it
+    env_default("DM_GFX_VCACHE", "1");             // 顶点 / 索引的跨帧副本（依赖 nvn_dirty 的脏页跟踪） | cross-frame vertex/index copies (through nvn_dirty's dirty pages)
+    env_default("DM_GFX_TEX_DIRTY", "1");          // 贴图内容检查走同一套脏页跟踪 | texture content checks through the same dirty-page tracking
+    env_default("DM_GFX_ASYNC_POOL_RESET", "1");   // 命令池在另一线程重置 | command pools reset on another thread
+    env_default("DM_GFX_UPLOAD_PROLOGUE", "1");    // 本提交没用过的图像整份上传排到提交前，不在帧中间打断通道 | whole uploads of unused images go ahead of the submission instead of breaking the pass mid-frame
+    env_default("DM_GFX_SHADER_REUSE", "1");       // 着色器载入直接用预热线程改写好的 SPIR-V | shader loads take the SPIR-V the warm-up already rewrote
+    env_default("DM_GFX_LDC_FOLD", "1");           // 常量缓冲下标可推出的换成常量（GPU 15.70 → 14.34 ms） | constant-buffer indexes that follow from low bits become constants (GPU 15.70 -> 14.34 ms)
+    env_default("DM_GFX_FORWARD_TEMPS", "1");      // 只写一次的临时变量直接转发 | single-store temporaries are forwarded
+    env_default("DM_GFX_NAN_MINMAX", "1");         // min / max / clamp 遇 NaN 取另一个操作数（Maxwell 规矩） | min/max/clamp take the other operand on NaN (the Maxwell rule)
+    env_default("DM_HLE_SPIN_US", "30");           // 客体主线程短等待先自旋 30 µs（每帧约 45 次） | the guest main thread spins 30 us before sleeping (~45 short waits a frame)
+    env_default("DM_GFX_PERF_SAMPLE", "0");        // 关掉逐帧分项计时：被计时的那一帧多花约 4 ms，安卓也因此关着（要看分项时 DM_GFX_PERF_SAMPLE=1 打开） | turn off the per-part frame timing: a timed frame costs about 4 ms more, which is why Android has it off too (set DM_GFX_PERF_SAMPLE=1 to look at the parts)
+}
+
 // ---------- 宿主入口 ----------
 void front_run(void (*guest)(void)) {
     // DM_WINDOW=0：不开窗口，当前线程直接跑客体（与 Mac 宿主的无窗口形态同一开关，排障用）
     // DM_WINDOW=0: no window, run the guest directly on the current thread (the same switch as the Mac host's windowless form, for debugging)
     const char *nowin = getenv("DM_WINDOW");
     if (nowin && *nowin == '0') { guest(); return; }
+    tuning_defaults();
     if (create_window()) { fprintf(stderr, "[dm] 建窗口失败 errno=%d\n", errno); guest(); return; }
     char err[512] = "";
     if (dm_win_vk_initialize(4096, err, sizeof err)) {

@@ -12,7 +12,7 @@ The Windows build works the way the Android one does: rewrite the game program f
 | Main menu → class → mode → name → into a run | Works (naming goes through the host input box or the `DM_KBD` channel) |
 | In-run picture in the Rogue Encampment | Works: HUD life 55/55, mana 10/10, minimap, NPC names all correct |
 | Walking, camera follow | Works (WASD as the left stick, left mouse button as a finger) |
-| Frame rate (encampment, 1600x900) | **about 42 fps**; 6 fps before the fence fix, see "Performance" |
+| Frame rate (encampment, 1600x900) | **about 50-55 fps** (median frame time 13-15 ms, tail spikes still there, see "Performance") |
 | Audio | WASAPI is wired up, but nobody has listened to it yet |
 | Fullscreen toggle, window resize | Not tested |
 | Cutscene movies | Not tested (the decode path has not been verified on Windows) |
@@ -83,7 +83,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 The easy way is to double-click `start-win-arm64.bat` at the checkout root: it sets all of the above (RomFS defaults to `..\Diablo\RomFS`), creates `save` / `temp`, and closes an older instance first. `--rebuild` rebuilds, `--res 1280x720` changes the render resolution.
 
-The **title bar** shows the current render resolution and the live frame rate (`1600x900 · 43 fps`, refreshed once a second, counted from the frames the presentation layer actually put on screen).
+The **title bar** shows the current render resolution and the live frame rate (`1600x900 · 52 fps`, refreshed once a second, counted from the frames the presentation layer actually put on screen).
 
 ### Keyboard and mouse
 
@@ -123,6 +123,8 @@ Face buttons default to positions (bottom = A confirm, right = B back, left = Y,
 | `DM_WIN_SIZE=WxH` | window client size (default 1600x900, capped at 90% of the work area) |
 | `DM_GAME_RES=WxH` | game render resolution (default 1600x900, the original 16:9 docked size) |
 | `DM_GFX_FENCE_SPIN=0` | go back to the blocking fence wait (spin is on by default, see below) |
+| `DM_PRESENT_MODE=fifo\|relaxed\|mailbox\|immediate` | present mode (default `relaxed`, see "Performance"; `fifo` is strict vsync) |
+| `DM_GFX_PERF_SAMPLE=1` | turn the per-part frame timing back on (off by default; it costs 1-2 fps) |
 | `DM_GFX_FENCE_LOG=1` | log `wait_ms` / `since_submit_ms` for every fence wait |
 | `DM_NVN_LOG` / `DM_FS` / `DM_IMPORTS` / `DM_FAULT_LOG` / `DM_VEH_LOG` / `DM_VEH_TRACE` | diagnostics |
 
@@ -132,10 +134,19 @@ A run used to sit at **6 fps**. `NVN PERF` showed 10-11 `vkQueueSubmit` and 11 `
 
 Each fence reported `since_submit` of **13-14 ms** against about 1.5 ms of GPU work per submission: the time was not spent computing, but in the **wake-up latency of a blocking `vkWaitForFences` on this Windows ARM driver**. Polling `vkGetFenceStatus` first (with an 8 ms spin budget, then falling back to the blocking wait) brought the wait down to about 1 ms and the encampment from 6 fps to **41-44**, with `gpu_ms` steady around 9.7 ms. The spin defaults on only on Windows (`_WIN32`); Android and iOS keep the blocking wait rather than burning phone battery.
 
+The second step is **bringing the engine switches Android measured over to Windows** (`tuning_defaults()` in `dm/win/front_win.c`; the per-switch notes are in `dm/android/jni_android.c` lines 245-337). Same Adreno + Vulkan + same engine code, so the set that holds 60 fps in the camp on phones applies here; a user-set environment variable of the same name still wins. Per frame it collapsed **10 submits with 10 fence waits** into **1 submit, fence=0**: character list 25 -> **53 fps**, class select 21.6 -> **48-52**, camp 43 -> **46**. `DM_GFX_NATIVE_BC=1` makes BC textures sample in their original format (the engine consumes BC7 directly, no RGBA decode), and `live_images` dropped from 826 MB to 311 MB.
+
+The third step is **cutting the long-frame tail**. At that point `[nvn] 计时` already reported a median frame time of **13-15 ms (about 70 fps)** while `p95 37 ms / p99 70 ms` and more than 130 of 300 frames ran past 16.7 ms, dragging the average to 46. Three changes:
+
+- Present mode from `FIFO` to `FIFO_RELAXED` (`DM_PRESENT_MODE` accepts `fifo|relaxed|mailbox|immediate`, default `relaxed`). FIFO pushes a frame that just misses one vblank period onto the next one, which in the camp test hit about 30% of frames, turning them into two periods; relaxed waits only when it can make the deadline. Camp 46 -> **50-55 fps**.
+- Swapchain changed to **3 images** (two in flight alternately plus one the presentation engine is still reading), so `vkAcquireNextImageKHR` no longer blocks on vsync.
+- `DM_GFX_PERF_SAMPLE=0` (same as Android): the per-part timing costs the timed frame about 4 ms more, so turning it off buys another 1-2 fps; `DM_GFX_PERF_SAMPLE=1` turns it back on when you want the breakdown.
+
 Room left (not done, lowest risk first):
 
-1. There are still 10 "submit and immediately wait" points per frame (6 storage writebacks, 4 counter reports), so the GPU and CPU are almost fully serialized. Going further means overlapping them, e.g. deferring writebacks to the end of the frame or allowing two frames in flight.
+1. The tail spikes are not fully identified: the `[长帧]` detail shows "new pipelines 0 / texture uploads 0", so the spikes are neither compilation nor upload but guest-side work inside the frame; `DM_3D_SCALE=0.5` and `DM_PRESENT_MODE=immediate` both leave the frame rate unchanged, so it is neither GPU-bound nor vsync-quantized.
 2. The engine's slot ring is only 2 deep (`Slot slots[2]` with `slot_index^=1` in `xbg_game.cpp`) and every `slot_index^1` use assumes that; deepening the ring is a medium-risk change.
+3. Per-frame CPU shows `descriptor` at about 1.5-2 ms (1300-1800 descriptors per frame) and `draw` at 1.2-1.7 ms; going lower means touching the translation layer.
 
 ## Screenshot colour
 
@@ -150,3 +161,4 @@ Room left (not done, lowest risk first):
 - Window resize / fullscreen toggle and native gamepads are untested.
 
 See also: [DEPENDENCIES.md](DEPENDENCIES.md), [GAME_FILES.md](GAME_FILES.md), [ANDROID.md](ANDROID.md) (the Android implementation this port follows).
+

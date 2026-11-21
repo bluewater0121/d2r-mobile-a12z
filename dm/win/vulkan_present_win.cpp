@@ -131,14 +131,33 @@ int create_swap() {
     if (!extent.width || !extent.height) return VK_NOT_READY;
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = surface;
-    ci.minImageCount = std::max(2u, cap.minImageCount);
+    ci.minImageCount = std::clamp(3u, std::max(2u, cap.minImageCount), cap.maxImageCount ? cap.maxImageCount : 3u);   // 三张图：两张交替在途 + 一张给呈现引擎读，获取图片这一步不再卡在垂直同步上 | three images: two in flight alternately plus one the presentation engine is still reading, so acquiring an image no longer blocks on vsync
     if (cap.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, cap.maxImageCount);
     ci.imageFormat = sf.format; ci.imageColorSpace = sf.colorSpace; ci.imageExtent = extent; ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = pre; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(cap.supportedCompositeAlpha & ci.compositeAlpha))
         for (uint32_t b = 1; b <= 8; b <<= 1) if (cap.supportedCompositeAlpha & b) { ci.compositeAlpha = VkCompositeAlphaFlagBitsKHR(b); break; }
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;   // 垂直同步：桌面窗口下撕裂没有意义，且 FIFO 是唯一保证支持的 | vsync: tearing is pointless in a desktop window, and FIFO is the only guaranteed mode
+    // 出图模式（DM_PRESENT_MODE=fifo|relaxed|mailbox|immediate，缺省 relaxed）：FIFO 在「差一点赶不上一个周期」时会把这一帧压到下一个垂直同步，
+    // 前三项实测里营地约三成帧就是这样被压成两个周期，平均帧率从 63 掉到 46。FIFO_RELAXED 只在赶得上时才等，赶不上就立刻出图，正是给这种
+    // 「快但不够稳」的帧时间准备的；撕裂在桌面窗口下由 DWM 合成，看不出来
+    // Present mode (DM_PRESENT_MODE=fifo|relaxed|mailbox|immediate, default relaxed): with FIFO a frame that barely misses one period is pushed to the
+    // next vsync, which in the town test compressed about 30% of frames into two periods and dragged the average from 63 down to 46. FIFO_RELAXED waits
+    // only when it can make the deadline and presents immediately otherwise, exactly right for this "fast but not steady" frame time; tearing is hidden
+    // by DWM composition in a desktop window
+    VkResult pr = vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes;
+    if (!pr && n) { modes.resize(n); pr = vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &n, modes.data()); }
+    auto has_mode = [&](VkPresentModeKHR m) { for (auto x : modes) if (x == m) return true; return false; };
+    VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    if (const char *e = getenv("DM_PRESENT_MODE")) {
+        if (!strcmp(e, "fifo")) want = VK_PRESENT_MODE_FIFO_KHR;
+        else if (!strcmp(e, "mailbox")) want = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (!strcmp(e, "immediate")) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (!strcmp(e, "relaxed")) want = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    }
+    if (!has_mode(want)) want = VK_PRESENT_MODE_FIFO_KHR;   // 不支持就退回 FIFO（唯一保证支持的）| fall back to FIFO, the only guaranteed mode
+    ci.presentMode = want;
     ci.clipped = VK_TRUE; ci.oldSwapchain = swapchain;
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
     r = vkCreateSwapchainKHR(device, &ci, nullptr, &replacement);
@@ -323,7 +342,7 @@ int present(void *, void *, VkImage source, VkFormat source_format, uint32_t wid
     if (pr == VK_ERROR_OUT_OF_DATE_KHR) { swap_dirty = true; return VK_SUCCESS; }    if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) return pr;
     if (rebuild || pr == VK_SUBOPTIMAL_KHR) swap_dirty = true;   // 下一帧重建 | rebuild on the next frame
     // 帧率统计：窗口 0.75 s 一次，取整后给标题栏 | frame rate: a 0.75 s window, rounded, handed to the title bar
-    { uint64_t now = GetTickCount64() / 2;   // 2 ms 粒度够用 | 2 ms granularity is enough
+    { uint64_t now = GetTickCount64();   // 毫秒（此前误按 2 ms 单位折算，标题栏的帧率报了实际的两倍）| milliseconds (it used to be treated as 2 ms units, which made the title show twice the real rate)
       if (!fps_window_start) fps_window_start = now;
       ++fps_window_frames;
       uint64_t span = now - fps_window_start;

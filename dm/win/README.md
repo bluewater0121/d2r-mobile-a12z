@@ -65,9 +65,9 @@ Shoulders L/R, triggers ZL/ZR (past 30/255), stick clicks LS/RS, menu -> +, view
 | `DM_PAD=0` | disable controllers |
 | `DM_PAD_AB=switch` | Switch face-button semantics (right A confirms) |
 | `DM_PAD_LOG=1` | log connections and state changes |
-| `DM_PAD_TEST=<seconds>` | without hardware, inject one 0.4 s A press N seconds after start, once |
+| `DM_PAD_TEST=<seconds>[,<seconds>...]` | without hardware, inject a 0.25 s A press at each listed second (up to 8, e.g. `52,70,88`) |
 
-No hardware needed to check the path: start with `DM_PAD_TEST=52` and the log walks through `手柄：XInput 已就绪`, the injection, and the layout switch; the picture moves from the title screen to the character list, which proves front end -> host -> game works end to end.
+No hardware needed to check the path: start with `DM_PAD_TEST=52` and the log walks through `手柄：XInput 已就绪`, the injection, and the layout switch; the picture moves from the title screen to the character list, which proves front end -> host -> game works end to end. To go further into the menus, list more moments (`DM_PAD_TEST=52,70,88`) — each is a short A press.
 
 ## Two things learned the hard way
 
@@ -78,6 +78,8 @@ The fix lives in `compat/crash_win.c`'s `widen_stack_range()`: read the two qwor
 
 **2. `vkWaitForFences` wakes 12-14 ms late on this Windows ARM driver.**
 A submission's GPU work is about 1.5 ms, but the blocking wait returns 13 ms later; with 10-11 waits per frame in a run, that meant 6 fps. The engine-side fix, in `dm/gfx/vulkan/engine/xbg_game.cpp`'s `retire_slot()`, polls `vkGetFenceStatus` first (8 ms spin budget, then falls back to the blocking wait). It is on by default on Windows only; Android and iOS keep the blocking wait (`DM_GFX_FENCE_SPIN` overrides). The encampment went from 6 fps to 42.
+
+The two steps from there to 50-55 fps live in `tuning_defaults()` in `front_win.c` (the engine switches Android measured, as defaults — per frame the submits and fence waits drop from 10/10 to 1/0) and in `vulkan_present_win.cpp` (`FIFO_RELAXED` present and a 3-image swapchain). Numbers in `docs/WINDOWS_ARM64.md` under "Performance".
 
 ## Diagnostics
 

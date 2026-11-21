@@ -12,7 +12,7 @@ English: [WINDOWS_ARM64.md](WINDOWS_ARM64.md)
 | 主菜单 → 职业 → 模式 → 起名 → 进局 | 通过（起名走宿主输入框 / `DM_KBD` 通道） |
 | 营地局内画面 | 通过：HUD 生命 55/55、法力 10/10、小地图、NPC 名字都对 |
 | 走路、镜头跟随 | 通过（WASD 当左摇杆，鼠标左键当落手指） |
-| 帧率（营地，1600x900） | **约 42 帧**；修掉栅栏等待前是 6 帧，见下面「性能」 |
+| 帧率（营地，1600x900） | **约 50~55 帧**（中位帧时间 13~15 ms，尾部尖峰仍在，见下面「性能」） |
 | 音频 | 已接 WASAPI，但没实际听过 |
 | 全屏切换、窗口拉伸 | 没实测 |
 | 过场动画（movie） | 没实测（Windows 上的解码路径没验过） |
@@ -83,7 +83,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 省事的办法是双击工程根目录的 `start-win-arm64.bat`：它把上面这些环境变量都设好（RomFS 缺省取 `..\Diablo\RomFS`），顺手建好 `save` / `temp`，并在启动前关掉旧实例。`--rebuild` 先重编译，`--res 1280x720` 换渲染分辨率。
 
-**标题栏**显示当前渲染分辨率与实时帧率（`1600x900 · 43 fps`，每秒刷新一次，数字来自呈现层真正上屏的帧数）。
+**标题栏**显示当前渲染分辨率与实时帧率（`1600x900 · 52 fps`，每秒刷新一次，数字来自呈现层真正上屏的帧数）。
 
 ### 键鼠
 
@@ -123,6 +123,8 @@ obj\dmhost.exe dmdata main sdk subsdk0
 | `DM_WIN_SIZE=宽x高` | 窗口客户区尺寸（缺省 1600x900，按屏幕工作区不超过 90%） |
 | `DM_GAME_RES=宽x高` | 游戏渲染分辨率（缺省按原版 16:9：1600x900） |
 | `DM_GFX_FENCE_SPIN=0` | 退回栅栏阻塞等待（默认开自旋，见下） |
+| `DM_PRESENT_MODE=fifo\|relaxed\|mailbox\|immediate` | 出图模式（缺省 `relaxed`，见「性能」；改回 `fifo` 就是严格的垂直同步） |
+| `DM_GFX_PERF_SAMPLE=1` | 打开逐帧分项计时（缺省关，开了会掉 1~2 帧） |
 | `DM_GFX_FENCE_LOG=1` | 每次栅栏等待打一行 `wait_ms` / `since_submit_ms` |
 | `DM_NVN_LOG` / `DM_FS` / `DM_IMPORTS` / `DM_FAULT_LOG` / `DM_VEH_LOG` / `DM_VEH_TRACE` | 排障日志开关 |
 
@@ -132,10 +134,19 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 单个栅栏的 `since_submit` 是 **13~14 ms**，但同一次提交的 GPU 工作量只有约 1.5 ms：耗掉的时间不在 GPU 干活上，而在这块 Windows ARM 驱动上 **`vkWaitForFences` 阻塞等待的唤醒延迟**。改成先轮询 `vkGetFenceStatus`（自旋预算 8 ms，用完了再退回阻塞等待）以后，等待从 13~14 ms 降到 1 ms 上下，营地帧率从 6 变成 **41~44**，`gpu_ms` 稳定在 9.7 ms 左右。默认只在 Windows 上开这个自旋（`_WIN32`），安卓 / iOS 仍是阻塞等待，别白烧手机的电。
 
-还有余量的地方（没做，按风险从低到高）：
+第二步是**把安卓那套实测过的引擎开关搬到 Windows**（`dm/win/front_win.c` 的 `tuning_defaults()`，逐项注释见 `dm/android/jni_android.c` 245-337 行）。同一套 Adreno + Vulkan + 同一份引擎，那批默认值就是手机上营地 60 帧的来源；Windows 按同一套开，玩家自己设了同名环境变量仍以他的为准。实测每帧的提交与栅栏等待从 **10 次提交 / 10 次等**塌成 **1 次提交、fence=0**：角色列表 25 → **53 帧**，职业选择页 21.6 → **48~52 帧**，营地 43 → **46 帧**。其中 `DM_GFX_NATIVE_BC=1` 让 BC 贴图按原格式采样（引擎直接吃 BC7，不解码成 RGBA），图像内存 `live_images` 从 826 MB 降到 311 MB。
 
-1. 每帧仍然有 10 次「提交完就等」的串行点（写回 6 次、计数报告 4 次），GPU 与 CPU 基本完全串起来。要再快就得让 GPU 和 CPU 重叠，比如把写回延后到帧末或允许两帧在飞。
+第三步是**把长帧的尾巴削掉**。此时 `[nvn] 计时` 显示中位帧时间已经只有 **13~15 ms（约 70 帧）**，但 `p95 37 ms / p99 70 ms`、300 帧里 130 多帧超过 16.7 ms，均值被拖到 46。三项改动：
+
+- 出图模式从 `FIFO` 换成 `FIFO_RELAXED`（`DM_PRESENT_MODE` 可选 `fifo|relaxed|mailbox|immediate`，缺省 `relaxed`）。FIFO 在「差一点赶不上一个垂直同步周期」时会把整帧压到下一个周期，实测约三成帧就是这样被压成两个周期；relaxed 只在赶得上时才等。营地 46 → **50~55 帧**。
+- 交换链改成 **3 张图**（两张交替在途 + 一张给呈现引擎读），`vkAcquireNextImageKHR` 不再卡在垂直同步上。
+- `DM_GFX_PERF_SAMPLE=0`（与安卓一致）：逐帧分项计时会让被计时的那一帧多花约 4 ms，关掉再涨 1~2 帧；要看分项时用 `DM_GFX_PERF_SAMPLE=1` 打开。
+
+剩下的余量（没做，按风险从低到高）：
+
+1. 尾部尖峰还没定位完：`[长帧]` 明细里「新建管线 0 / 上传贴图 0」，尖峰既不是编译也不是上传，落在帧内客机侧逻辑上；对照 `DM_3D_SCALE=0.5` 与 `DM_PRESENT_MODE=immediate` 都不改变帧率，说明不是 GPU 受限、也不是垂直同步压的。
 2. 引擎的 slot 环只有 2 槽（`xbg_game.cpp` 的 `Slot slots[2]` + `slot_index^=1`），所有 `slot_index^1` 的语义都建立在这个假设上，加深环是一次中等风险改动。
+3. 逐帧 CPU 里 `descriptor` 约 1.5~2 ms（每帧 1300~1800 个描述符）、`draw` 约 1.2~1.7 ms，想再往下压要动翻译层。
 
 ## 取图颜色
 
@@ -147,6 +158,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 - 音频（WASAPI）已实现但没实际听过；`hle_lifecycle.c` 的 SIGTERM/GCD、`hle_movie.c` 的解码在 Windows 上没验过。
 - 「掉落过滤」规则还没能写进 `save/Settings/*.fltr`（日志有 `规则文件没写成`）。
 - 角色列表页用键盘 A 直接「选择」在这台机器上没能触发（职业选择页和模式页没问题），自动化时走「新建角色」那条路更稳。
-- 窗口拉伸 / 全屏切换、原生手柄都没实测。
+- 营地 / 菜单的尾部尖峰（帧时间 p95 约 37 ms）还没定位完，帧率是「中位 60 出头、均值 50~55」。
+- 窗口拉伸 / 全屏切换没实测；实体手柄这台机器上没有，通路靠 `DM_PAD_TEST` 注入 A 验过。
 
 相关文档：[DEPENDENCIES.zh-CN.md](DEPENDENCIES.zh-CN.md)、[GAME_FILES.zh-CN.md](GAME_FILES.zh-CN.md)、[ANDROID.zh-CN.md](ANDROID.zh-CN.md)（安卓参照实现）。
