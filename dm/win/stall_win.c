@@ -54,6 +54,8 @@ static const char *sym_at(uint64_t pc, const char **mod, uint64_t *off) {
 #include <tlhelp32.h>
 
 #define PROBE_MAX 12
+#define RING_MAX 64
+static struct { uint64_t pc, lr; } g_ring[RING_MAX]; static unsigned g_ringn;
 static struct { uint64_t pc, lr; unsigned n; } g_hit[PROBE_MAX]; static unsigned g_nhit;
 static HANDLE g_snap;   // 系统 DLL 快照，按基址反查名字 | snapshot of system DLLs, for looking names up by base
 
@@ -106,28 +108,35 @@ static void probe_report(uint64_t stall_ns, unsigned total) {
     LOG("[卡顿] 整帧 %.1f ms，采到 %u 次，命中：%s（第 %u 次记录）", stall_ns / 1e6, total, line, ++g_reports);
 }
 
-static uint64_t g_max_age; static unsigned g_samples;
+static uint64_t g_max_age; static unsigned g_samples; static int g_stall;
 
+// 整帧采样：帧内每 1 ms 采一次（>10 ms 起采），帧结束后如果这一帧超了 22 ms，就把整帧的命中排一排——
+// 早段（CPU 突增那段）与晚段（等待）都在里面，比只看尾部更能说明时间花在哪
+// Whole-frame sampling: sample once per 1 ms during the frame (from 10 ms on); when the frame turns out to exceed 22 ms, rank all its hits --
+// both the early part (the CPU burst) and the late part (the wait) are included, which says more than looking at the tail alone
 static DWORD WINAPI sampler(LPVOID arg) { (void)arg; dm_win_tls_bind();
     while (g_on) {
         Sleep(1);
         uint64_t last = atomic_load(&g_last_present); if (!last) continue;
         uint64_t age = now_ns() - last;
-        if (age < 22000000ull) {                          // 帧已结束：清空本次卡顿 | frame finished: clear this stall
-            if (g_nhit) probe_report(g_max_age, g_samples);
-            g_nhit = 0; g_samples = 0; g_max_age = 0;
+        if (age < 10000000ull) {                          // 帧已结束：结算上一帧 | frame finished: settle the previous frame
+            if (g_stall && g_ringn) {
+                g_nhit = 0;
+                for (unsigned i = 0; i < g_ringn; i++) {
+                    unsigned k; for (k = 0; k < g_nhit; k++) if (g_hit[k].pc == g_ring[i].pc) { g_hit[k].n++; break; }
+                    if (k == g_nhit && g_nhit < PROBE_MAX) { g_hit[g_nhit].pc = g_ring[i].pc; g_hit[g_nhit].lr = g_ring[i].lr; g_hit[g_nhit].n = 1; g_nhit++; }
+                }
+                probe_report(g_max_age, g_ringn);
+            }
+            g_ringn = 0; g_samples = 0; g_max_age = 0; g_stall = 0;
             continue;
         }
         if (age > 80000000ull) continue;                  // 读取画面/换场景的长帧不采（另有 150 ms 一级的属于加载） | skip loading-screen or scene-change frames (the 150 ms tier is loading)
         if (age > g_max_age) g_max_age = age;
+        if (age > 22000000ull) g_stall = 1;
         CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
         if (SuspendThread(g_th) == (DWORD)-1) continue;
-        if (GetThreadContext(g_th, &c)) {
-            uint64_t pc = (uint64_t)c.Pc, lr = (uint64_t)c.Lr;
-            g_samples++;
-            unsigned i; for (i = 0; i < g_nhit; i++) if (g_hit[i].pc == pc) { g_hit[i].n++; break; }
-            if (i == g_nhit && g_nhit < PROBE_MAX) { g_hit[g_nhit].pc = pc; g_hit[g_nhit].lr = lr; g_hit[g_nhit].n = 1; g_nhit++; }
-        }
+        if (GetThreadContext(g_th, &c) && g_ringn < RING_MAX) { g_ring[g_ringn].pc = (uint64_t)c.Pc; g_ring[g_ringn].lr = (uint64_t)c.Lr; g_ringn++; g_samples++; }
         ResumeThread(g_th);
     }
     return 0;

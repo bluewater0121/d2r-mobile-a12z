@@ -125,6 +125,9 @@ obj\dmhost.exe dmdata main sdk subsdk0
 | `DM_GFX_FENCE_SPIN=0` | 退回栅栏阻塞等待（默认开自旋，见下） |
 | `DM_PRESENT_MODE=fifo\|relaxed\|mailbox\|immediate` | 出图模式（缺省 `relaxed`，见「性能」；改回 `fifo` 就是严格的垂直同步） |
 | `DM_GFX_PERF_SAMPLE=1` | 打开逐帧分项计时（缺省关，开了会掉 1~2 帧） |
+| `DM_PRESENT_IMAGES=N` | 交换链张数（缺省 3；4 张实测更差，排障可调） |
+| `DM_PRESENT_LEAD_MS=N` | 出图提前量（缺省 0 = 关；4 ms 实测无效，见「性能」第五步） |
+| `DM_STALL_PROBE=1` | 长帧取栈：每 1 ms 采出图线程 PC，超过 22 ms 的帧打一行命中函数（会拖慢一点，只在排障时开） |
 | `DM_GFX_FENCE_LOG=1` | 每次栅栏等待打一行 `wait_ms` / `since_submit_ms` |
 | `DM_NVN_LOG` / `DM_FS` / `DM_IMPORTS` / `DM_FAULT_LOG` / `DM_VEH_LOG` / `DM_VEH_TRACE` | 排障日志开关 |
 
@@ -149,6 +152,14 @@ obj\dmhost.exe dmdata main sdk subsdk0
 - 营地 **55~60 帧**（多数窗口 57~60，只掉一个垂直同步的那种窗口 53~55），改之前同场景 50~55、且 `掉帧 86/300` 变成 **51/300**。
 - 职业选择页 48~55 → **55~60**，角色列表同样贴着 60。
 - `submit_cpu_ms` 从 6~7 降到 **4~4.5**（等待变短，翻译线程少被掐）。
+
+第五步（进行中）是**把 9 帧一次的尖峰按住**。定时器修好之后剩下的抖动是周期性的：营地随机走动（`build\win\enter-town-v3.ps1`，W/A/S/D 各 0.3~1.2 s）里约 **9 帧（≈150 ms）出现一次 30~42 ms 的尖峰**，其余帧 16.6~16.9 ms。最近 70 s 窗口（约 3900 帧）的量法：整帧 **≥20 ms 占 9.7%、≥30 ms 占 7.5%、≥50 ms 占 0.84%**，窗口帧率 55~60（多数 58~60）。注意 `[nvn] 帧间隔 >16.7ms` 那一列在 59 Hz 节拍下几乎恒为全部，不能当长帧比例用。
+
+已经排除的方向（各自实测，数据都比基线差或不变）：出图提前量 `DM_PRESENT_LEAD_MS=4`（≥30 ms 7.5% → 9.0%）、交换链 4 张（`DM_PRESENT_IMAGES=4`，9.5%，且掉帧变多）、`DM_PRESENT_HZ=50` 锁 50 帧（10.7%，部分窗口掉到 45）、`DM_3D_SCALE=0.7`（12.1%，说明不是 GPU/填充率受限）、`DM_PRESENT_MODE=fifo` / `mailbox`、`DM_PAD=0`+`DM_AUDIO=0`（9 帧周期都不变）。
+
+`DM_STALL_PROBE=1`（`dm/win/stall_win.c`）是这一轮加的取栈器：每 1 ms 把出图线程 SuspendThread + GetThreadContext，一帧超过 22 ms 就把整帧的命中按次数排序打一行，符号用模块自带 symtab 反查，系统 DLL 里的地址换成 `dll+偏移`。它给出的结论是：尖峰帧里出图线程绝大部分采样都停在 `ntdll`/`KERNELBASE` 的等待上（条件变量/唤醒），而出图线程自己的栅栏与取图从未单次阻塞 ≥8 ms，GPU 7.8 ms、翻译+出图 4.5 ms 都不尖峰——所以尖峰不是呈现、GPU 或分辨率造成的，而是某条协作线程每 ~150 ms 多花 20~30 ms，把这一帧顶出了预算，多买一个垂直同步。
+
+`DM_PRESENT_LEAD_MS` 缺省已改回 0（开关保留），`DM_PRESENT_IMAGES` 缺省 3。
 
 游戏本身按屏幕刷新（本机上报 59 Hz，日志 `[nvn] 出图节拍 59.00 Hz`）出图，所以这套配置下 60 就是上限，再高要把显示刷新报到更高档位，没有实际意义。
 
