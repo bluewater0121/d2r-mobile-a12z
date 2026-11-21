@@ -106,11 +106,16 @@ void dm_win_pad_touch(void) {   // 玩家碰了画面 / 敲键盘：手柄布局
 // DM_PAD_TEST：没有实体手柄时注入一次 A 短按，验「宿主手柄 → 游戏」这条通路
 // DM_PAD_TEST: inject one short A press at that time, to check the host-controller -> game path without hardware
 static void maybe_test_press(double t, uint64_t *out_b) {
-    static double at; static int init, logged;
-    if (!init) { init = 1; const char *e = getenv("DM_PAD_TEST"); at = e ? atof(e) : 0; if (at <= 0) at = -1; }
-    if (at < 0 || t < at || t > at + 0.4) return;
-    *out_b |= DM_BTN_A;
-    if (!logged) { logged = 1; LOG("手柄：DM_PAD_TEST 注入 A（t=%.1fs，持续 0.4s）", at); }
+    static double times[8]; static int n = -1, logged;
+    if (n < 0) {   // "52,70,88"：每次在第 N 秒按下 0.25 s | "52,70,88": press for 0.25 s at each listed second
+        n = 0; const char *e = getenv("DM_PAD_TEST"); if (!e) return;
+        const char *c = e; while (*c && n < 8) { double v = atof(c); if (v > 0) times[n++] = v; c = strchr(c, ','); if (!c) break; ++c; }
+    }
+    for (int i = 0; i < n; i++) {
+        if (t < times[i] || t > times[i] + 0.25) continue;
+        *out_b |= DM_BTN_A;
+        if (!logged) { logged = 1; LOG("手柄：DM_PAD_TEST 注入 A（t=%.1fs~%.1fs）", times[i], times[i] + 0.25); }
+    }
 }
 
 static DWORD WINAPI poll_thread(void *p) {
