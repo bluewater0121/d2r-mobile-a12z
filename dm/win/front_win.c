@@ -349,6 +349,15 @@ static void tuning_defaults(void) {
     env_default("DM_GFX_NAN_MINMAX", "1");         // min / max / clamp 遇 NaN 取另一个操作数（Maxwell 规矩） | min/max/clamp take the other operand on NaN (the Maxwell rule)
     env_default("DM_HLE_SPIN_US", "30");           // 客体主线程短等待先自旋 30 µs（每帧约 45 次） | the guest main thread spins 30 us before sleeping (~45 short waits a frame)
     env_default("DM_GFX_PERF_SAMPLE", "0");        // 关掉逐帧分项计时：被计时的那一帧多花约 4 ms，安卓也因此关着（要看分项时 DM_GFX_PERF_SAMPLE=1 打开） | turn off the per-part frame timing: a timed frame costs about 4 ms more, which is why Android has it off too (set DM_GFX_PERF_SAMPLE=1 to look at the parts)
+    // 前端路径理顺（dm_cursor.c）那套「替玩家按键」是给触屏定的：有存档就在主菜单替按 X 打开选角页（开机第一屏成了人物列表，原版是主菜单）、
+    // 选角列表一收起又替按 X 重开（玩家在选角页按 A 选定后列表被重开，要再按一次才进得去 = 「按 A 在两个界面跳转」）。
+    // 键盘 / 手柄自己就能走原版菜单，关掉这套：开机停在主菜单，A = 进入游戏 → 选角页，选角页 A = 开始游戏
+    // The "press keys on the player's behalf" front-end path straightening (dm_cursor.c) is designed for touchscreens: with a save it presses X on the
+    // main menu to open the character select page (so the first screen was the character list instead of the original main menu), and it presses X to
+    // reopen the list as soon as it collapses (after pressing A to pick a character the list got reopened, so a second press was needed to get in —
+    // "A jumps between the two screens"). Keyboard / controller can walk the original menu by themselves, so turn it off here:
+    // boot stays on the main menu, A = Enter Game -> character select page, and A on the character select page = start the game
+    env_default("DM_FE_AUTO", "0");
 }
 
 // ---------- 计时器精度 ----------
