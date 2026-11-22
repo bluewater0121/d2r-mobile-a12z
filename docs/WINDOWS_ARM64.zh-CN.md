@@ -72,6 +72,8 @@ ninja -C build/win/obj
 
 它按 **Windows GUI 子系统**（`add_executable(dmhost WIN32 …)`）链接：双击启动不会挂一个 cmd 黑窗口，进程也不占控制台。代价是从资源管理器 / 双击启动时 `stderr` 没有去处，所以进程一进来就把日志接到文件——`DM_LOG_FILE` 指定路径，缺省是当前目录的 `dmhost.log`（每次启动覆盖）。从终端起、或用 `Start-Process -RedirectStandardError` 起的时候，日志照旧走原来的标准输出，文件不生成。
 
+exe 还带图标与版本信息（`dmhost.rc` + `dmhost.ico`，windres 构建时编成 COFF 目标文件并进链接）：图标由 `tools/make_ico.py` 从 iOS 的 `AppIcon` 转出多尺寸 .ico，任务栏 / 标题栏 / 资源管理器与安卓 / iOS / 鸿蒙是同一套 App 图标。
+
 ## 运行
 
 ```
@@ -84,6 +86,21 @@ obj\dmhost.exe dmdata main sdk subsdk0
 ```
 
 `shader_dir` 取 `DM_SHADER_DIR`，缺省是当前目录下的 `shaders`，所以工作目录放在 `build\win` 就能命中第二步的产物。
+
+### 界面覆盖层（安卓 / iOS 那套界面改动就在这里）
+
+游戏原版界面是原版；我们改过的底栏 HUD v4、面板、通知框、佣兵六格、宽储藏箱、键盘键帽都在**界面覆盖层**里，和安卓 / iOS / Mac App 用的是同一套生成脚本。Windows 上生成一次：
+
+```
+powershell -ExecutionPolicy Bypass dm\win\tools\gen_overlay_win.ps1 -RomFS C:\work\prj\Diablo\RomFS
+```
+
+产物是 `build\win\overlay`，`start-win-arm64.bat` 会自己把它接到 `DM_ROMFS_OVERLAY`。不生成也能玩，只是界面是原版。
+
+几点：
+- 脚本要 python（带 PIL / numpy / scipy）与 clang（没有系统 clang 就用 `-ToolchainBin` 指 llvm-mingw 的 `bin`）。
+- 生成时会编一个贴图转换库，必须与跑脚本的 python 同架构（x64 python 编 x86_64 版、ARM64 python 编 aarch64 版），架构不对会报 `WinError 193`，脚本自己会按 python 的架构选。
+- 覆盖层里有两套布局：触屏版（前端按钮栏交给宿主画）和原版手柄版。Windows 没有触屏那层绘制，所以走桌面形态（`DM_APP=1`，开机就锁在原版手柄版布局）——否则主菜单只剩背景、键盘按 A 不起作用。
 
 省事的办法是双击工程根目录的 `start-win-arm64.bat`：它把上面这些环境变量都设好（RomFS 缺省取 `..\Diablo\RomFS`），顺手建好 `save` / `temp`，并在启动前关掉旧实例。`--rebuild` 先重编译，`--res 1280x720` 换渲染分辨率。
 
@@ -136,6 +153,11 @@ iOS / 安卓是触屏，前端流程由宿主「替玩家按键」理顺（`dm/h
 | `DM_KBD=<文本>` | `swkbd` 起名面板直接返回这段文本，跳过宿主输入框 |
 | `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<秒>` | 手柄开关 / Switch 面键语义 / 手柄日志 / 无手柄时注入一次 A 验通路 |
 | `DM_FE_AUTO=0` | 关掉触屏那套「替玩家按键」的前端流程（Windows 缺省关，开机停在主菜单） |
+| `DM_ROMFS_OVERLAY=<目录>` | 界面覆盖层（`gen_overlay_win.ps1` 的产物；bat 会自动接 `build\win\overlay`） |
+| `DM_APP=1` | 桌面形态：锁在原版手柄版布局（Windows 缺省开；触屏版布局的前端按钮栏靠宿主绘制，桌面没有那层） |
+| `DM_WIN_MMCSS=0` | 关掉出图 / 客体主线程的 MMCSS「Games」注册（缺省开） |
+| `DM_WIN_MMCSS_PRIO=normal\|critical` | 注册后请求的线程优先级（缺省 `high`） |
+| `DM_WIN_PRIO=off\|normal\|above\|high` | 进程优先级类别（缺省 `above`） |
 | `DM_LOG_FILE=<路径>` | GUI 子系统下没有控制台时的日志文件（缺省当前目录的 `dmhost.log`；从终端起或重定向起时不生成） |
 | `DM_WIN_SHOT=<首帧>[+<步长>]:<路径模板>` | 在呈现线程把上屏前的图读回成 32 位 BMP，例如 `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=宽x高` | 窗口客户区尺寸（缺省 1600x900，按屏幕工作区不超过 90%） |

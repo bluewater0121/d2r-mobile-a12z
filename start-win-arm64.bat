@@ -72,6 +72,9 @@ set "DM_SAVE=%ROOT%\build\win\save"
 set "DM_TEMP=%ROOT%\build\win\temp"
 set "DM_WINDOW=1"
 if not defined DM_TACT_PREFETCH set "DM_TACT_PREFETCH=0"
+rem UI overlay (bottom HUD v4, panel changes, keyboard key caps). Generate it once with
+rem dm\win\tools\gen_overlay_win.ps1; without it the game runs with the original UI.
+if not defined DM_ROMFS_OVERLAY if exist "%ROOT%\build\win\overlay" set "DM_ROMFS_OVERLAY=%ROOT%\build\win\overlay"
 if defined RES set "DM_GAME_RES=%RES%"
 
 rem one instance only: the save dir has a transaction log, two processes would fight over it.

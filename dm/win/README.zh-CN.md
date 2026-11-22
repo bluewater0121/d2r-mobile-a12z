@@ -90,6 +90,12 @@ XInput 一律按键帽位置报告（下 = A、右 = B、左 = X、上 = Y），
 **5. 少了运行库 dll，`dmhost.exe` 会以 `0xC0000135` 秒退、日志一个字都没有。**
 `CMakeLists.txt` 用 `-static` 静态链 libc++ / libunwind，只有 `libwinpthread-1.dll` 还是导入项，构建完由 POST_BUILD 从工具链的 `bin` 拷到 exe 旁边。双击 `start-win-arm64.bat` 时 PATH 里没有工具链目录，少了这份 dll 就静默退出（当时误以为是新代码崩了）。
 
+**6. 覆盖层里触屏版布局把前端控件整排挪走，桌面形态切过去主菜单就只剩背景。**
+界面覆盖层（`gen_overlay_win.ps1` 的产物）带两套布局：触屏版的前端按钮栏、键位提示由宿主的触屏层另画，原版手柄版保留游戏自己的。Windows 是键盘 / 鼠标，没有触屏那层绘制，一旦触发「敲键盘 / 碰画面 → 切触屏版」（`pad_win.c` 的 `dm_win_pad_touch`）就变成主菜单空屏、按 A 没反应。现在 `tuning_defaults()` 设 `DM_APP=1` 走桌面形态：开机锁在原版手柄版布局，`dm_padmode_request` 里的 `g_lock` 也把它锁死，不再切触屏版。
+
+**7. 截图取证别用 `PrintWindow`，用 `DM_WIN_SHOT`。**
+Vulkan 交换链上屏的窗口，`PrintWindow` + `PW_RENDERFULLCONTENT` 抓到的不是完整画面：局内会抓成放大的世界画面、把底栏 HUD 整条漏掉（一度以为 HUD 没出来，`DM_WIN_SHOT` 的读回里 HUD 好好的）。前端（主菜单 / 选角页）反而是准的。
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。

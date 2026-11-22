@@ -90,6 +90,12 @@ The "front-end path straightening" in `dm/host/dm_cursor.c` is written for iOS /
 **5. Without the runtime dll, `dmhost.exe` exits at once with `0xC0000135` and writes nothing to the log.**
 `CMakeLists.txt` links libc++ / libunwind statically (`-static`); only `libwinpthread-1.dll` remains an import, and a POST_BUILD step copies it from the toolchain's `bin` next to the exe. A double-clicked `start-win-arm64.bat` has no toolchain directory on PATH, so without that copy the process exits silently (which looked like a crash in the new code at first).
 
+**6. The overlay's touch layouts move the front-end widgets off screen as a block, so switching to them leaves a desktop build with a bare main menu.**
+The UI overlay (`gen_overlay_win.ps1` output) carries two layout sets: in the touch version the front-end button ribbon and key hints are drawn by the host's touch layer, while the original controller version keeps the game's own. Windows is keyboard / mouse and has no such drawing layer, so the moment "key typed / picture touched -> switch to the touch version" fires (`dm_win_pad_touch` in `pad_win.c`) the main menu becomes an empty background that ignores A. `tuning_defaults()` now sets `DM_APP=1` for the desktop form: boot straight into the original controller layouts, and `g_lock` inside `dm_padmode_request` keeps it there.
+
+**7. Do not use `PrintWindow` for screenshots; use `DM_WIN_SHOT`.**
+For a window presenting from a Vulkan swapchain, `PrintWindow` + `PW_RENDERFULLCONTENT` does not capture the complete picture: in game it grabs a zoomed-in world view with the whole bottom HUD missing (which briefly looked like the HUD was not drawn at all, while the `DM_WIN_SHOT` readback showed it fine). The front end (main menu / character select) is accurate though.
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.
