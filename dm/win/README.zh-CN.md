@@ -108,6 +108,12 @@ mingw 的 `gdiplus/gdiplusimaging.h` 用了 `PROPID` 却没带 `ole2.h`，所以
 **10. 重链接 `Permission denied` = 旧 `dmhost.exe` 还在跑。**
 `ld.lld: error: failed to write output 'dmhost.exe': Permission denied` 不是权限问题，是上一次的进程没退。先 `Get-Process dmhost | Stop-Process -Force`（等 2~3 s 释放映像）再 ninja。
 
+**11. 浮层「贴图成功、`IsWindowVisible`=1、屏幕上却什么都没有」= z-order，不是分层窗口的问题。**
+`front_win.c` 建游戏窗口时带了 `WS_EX_TOPMOST`，而浮层当初只是个普通 owned popup：`UpdateLayeredWindow` 每次都返回成功、`GetWindowRect` / 可见性也都对，但窗口被 topmost 的游戏窗口整块压在下面。修法：浮层自己也加 `WS_EX_TOPMOST`，并在每次贴图时 `SetWindowPos(g_ov, g_game, …)` 把顺序钉成「浮层紧跟游戏窗口之上」。日志现在会打 `触屏浮层：贴图成功，窗口 <x>,<y> <w>x<h>（可见 1）`，坐标一开始是 `2099521032` 这种垃圾值——那是 `POINT dst` 没初始化 + `ClientToScreen` 走了失败分支，已置 `{0,0}` 并在失败时回退 `GetWindowRect`。
+
+**12. 技能图标：GDI+ 的 `SetClip` 在这条路径上不生效，得自己按像素裁圆。**
+原版图集每格是一块**方角**技能牌，iOS 靠 `CGContextAddEllipseInRect(...); CGContextClip(...)` 把它裁成圆的。照搬到 GDI+（`GraphicsPath::AddEllipse` + `SetClip(&path)` + `DrawImage`）之后，图还是方的、四角铆钉一个不少——裁切完全没起作用。现在做法是：先把这一格按目标尺寸画进一张临时 `Bitmap`，`LockBits` 后逐像素按圆半径（按钮的 .82，即 iOS 的「外接矩形内缩 9%」）乘 alpha，再画这张已经裁好的图，按 `(图集, 帧, 宽, 高)` 缓存。另外图集索引要 `clang` 在 PATH + **ARM64 的 python** 才能生成（x64 python 起子进程直接 `WinError 2`），缺产物 CMake 会 `FATAL_ERROR`。
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。

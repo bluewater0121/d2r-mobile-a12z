@@ -57,6 +57,14 @@ python dm/gfx/tools/dmsh_vk.py build\win\switch-pkg build\win\shaders
 
 ## 第三步：构建 `dmhost.exe`
 
+技能钮的图标要先用游戏文件生成一份图集索引（和安卓 / iOS 同一套 `native_art`）：
+
+```
+python dm/ios/tools/native_art/generate.py <你的游戏 RomFS 目录> --output-dir build/win/touchart
+```
+
+要 `clang` 在 PATH（`romfs_art.py` 用它编 deswizzle），而且要 **ARM64 的 python**：x64 的 python 起子进程会 `WinError 2`。产出 12 张 PNG 与 `dm_touch_native_art.c`（429 条技能索引），实测约一两分钟。
+
 ```
 cmake -G Ninja ^
   -DCMAKE_TOOLCHAIN_FILE=dm/win/toolchain-aarch64-w64-mingw32.cmake ^
@@ -107,7 +115,10 @@ powershell -ExecutionPolicy Bypass dm\win\tools\gen_overlay_win.ps1 -RomFS C:\wo
 安卓 / iOS 的虚拟摇杆、技能圆钮、换组、回城、地图这些**不是游戏画的**，是宿主在游戏画面上面另铺一层。Windows 这一层是 `dm/win/touch_win.cpp`：拿**同一份**触屏状态机（`dm/ios/Sources/dm_touch_controls.c`，和安卓 / iOS 逐字相同）算手指、按钮、摇杆和布局，再用 GDI+ 画到一个分层窗口上。
 
 - 位置与尺寸跟 iOS / 安卓一个坐标系（点 = iPhone 横屏 667×375 基准，按屏高换算），所以三家看起来是同一套位置。
-- 外观走 iOS 的矢量配方（`dm/ios/Sources/DmTouchControlArt.h`）：铁边圆钮 + 暗灰内槽、主钮多一道环、按住提亮、底盘渐隐 + 四段方向刻纹、摇杆头弧形高光。本机没有 `sil_*` 银色剪影与技能图集切片，技能钮按 iOS 的兜底画键位字母。
+- 外观走 iOS 的矢量配方（`dm/ios/Sources/DmTouchControlArt.h`）：铁边圆钮 + 暗灰内槽、主钮多一道环、按住提亮、底盘渐隐 + 四段方向刻纹、摇杆头弧形高光。
+- 技能钮画**原版的技能图标**（和 iOS 同一套）：图集索引由 `dm/ios/tools/native_art/generate.py` 从玩家自己的游戏文件生成，`dm_touch_game_state.c` / `dm_touch_game_bridge.c` 在运行时认出当前绑定是哪张技能牌，再按 iOS 的裁圆（.76 / .68 直径、外接圆内缩 9%）、柔光阴影、按住换 pressed 帧画。空槽画十字，回城用原版 359 号技能图，地图用 `dm_native_map`。取不到图标（不在局内、共享表还没认全 HUD）才回退成键位字母。副手组技能画右上「Ⅱ」角标，充能技能画右下剩余次数（`dm_swapskill_slot`）。
+- 图集不存在时构建会直接报错：先跑一遍 `generate.py`（要 `clang` 在 PATH，且用 ARM64 的 python，x64 的跑不起来），产物落在 `build\win\touchart`，用 `DM_WIN_TOUCHART` 指过去。
+- 浮层是 `WS_EX_TOPMOST` 且 `SetWindowPos` 贴在游戏窗口之上的：游戏窗口自己就是 topmost（`front_win.c` 的 `CreateWindowExA`），普通 owned popup 会被它压在下面——`UpdateLayeredWindow` 返回成功、`IsWindowVisible` 也是 1，但屏幕上什么都看不见。
 - 输入不走浮层：浮层是 `WS_EX_TRANSPARENT`，鼠标事件都落在游戏窗口上（`wnd_proc` → `dm_win_touch_pointer`），再由状态机发布成按键 / 摇杆，走的是和手柄同一条 `dm_pad_hook`。
 - 底栏六格（难度数字、四列腰带、功能入口）、生命法力数字、经验条是底栏 HUD v4 自己画的，浮层只保留命中区（和 iOS 一致）。
 
@@ -119,6 +130,7 @@ powershell -ExecutionPolicy Bypass dm\win\tools\gen_overlay_win.ps1 -RomFS C:\wo
 | `DM_WIN_TOUCH=1` | 总开关（`dm_padmode.c` 在它面前不锁手柄版布局） |
 | `DM_WIN_TOUCH_ALWAYS=1` | 前端页面也用触屏布局（前端按钮栏还没画，会看到空菜单，仅供调试） |
 | `DM_WIN_TOUCH_DUMP=<路径带 %d>` | 每次重画把浮层自己的位图存成 32 位 BMP（第 1 次 + 每 5 次），用来验收 |
+| `DM_WIN_TOUCH_ART=<目录>` | 技能图集 PNG 目录（缺省 `touchart\TouchArt`） |
 
 本机桌面截屏是全黑的（`CopyFromScreen` 与 `PrintWindow` 都拿不到画面），`DM_WIN_SHOT` 走 Vulkan 读回又不含分层窗口，所以**浮层的唯一取证手段是 `DM_WIN_TOUCH_DUMP`**。看位图时注意两点：BMP 是自下而上的，PIL 读 32 位 BMP 会丢掉 alpha——按原始 BGRA 读、再翻一次行，合成到深色底就能看到透明区。
 

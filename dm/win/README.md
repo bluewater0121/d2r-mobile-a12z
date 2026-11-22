@@ -107,6 +107,12 @@ mingw's `gdiplus/gdiplusimaging.h` uses `PROPID` without pulling in `ole2.h`, so
 **10. A relink that fails with `Permission denied` means the old `dmhost.exe` is still running.**
 `ld.lld: error: failed to write output 'dmhost.exe': Permission denied` is not a permission problem: the previous process has not exited yet. Stop it first (`Get-Process dmhost | Stop-Process -Force`), give it 2-3 s to release the image, then run ninja.
 
+**11. "Blit succeeded, `IsWindowVisible` says 1, yet nothing is on screen" is z-order, not the layered window.**
+`front_win.c` creates the game window with `WS_EX_TOPMOST`, while the overlay started life as an ordinary owned popup: `UpdateLayeredWindow` returned success every time, the rect and the visibility flag looked right, but the window sat entirely underneath the topmost game window. The fix is to give the overlay `WS_EX_TOPMOST` as well and `SetWindowPos(g_ov, g_game, …)` on every blit, pinning it directly above the game window. The log now reads `触屏浮层：贴图成功，窗口 <x>,<y> <w>x<h>（可见 1）`; the coordinates were garbage like `2099521032` at first because `POINT dst` was uninitialised and `ClientToScreen` took a failure path — it is now zero-initialised with a `GetWindowRect` fallback.
+
+**12. Skill icons: GDI+ `SetClip` does nothing on this path, so the circle is cut per pixel.**
+Each frame of the original atlas is a **square-cornered** skill tile and iOS makes it round with `CGContextAddEllipseInRect(...); CGContextClip(...)`. Porting that verbatim to GDI+ (`GraphicsPath::AddEllipse` + `SetClip(&path)` + `DrawImage`) left the tile square with every corner rivet intact — the clip simply never took effect. What works: draw the frame into a temporary `Bitmap` at the target size, `LockBits`, multiply alpha by the circle coverage (radius .82 of the button, i.e. iOS's "button rect inset by 9%"), then draw that already-clipped bitmap, cached by `(atlas, frame, width, height)`. Note also that the atlas index only builds with `clang` on PATH and an **ARM64** python (an x64 one dies with `WinError 2`); CMake raises `FATAL_ERROR` when the artefact is missing.
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.

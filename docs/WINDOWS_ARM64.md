@@ -57,6 +57,14 @@ The first pulls the 162 shader packages (`.bin`) out of the static CASC under `R
 
 ## Step 3: build `dmhost.exe`
 
+The skill-button icons need an atlas index generated from the game files first (the same `native_art` pipeline Android / iOS use):
+
+```
+python dm/ios/tools/native_art/generate.py <your game RomFS folder> --output-dir build/win/touchart
+```
+
+`clang` has to be on PATH (`romfs_art.py` uses it to compile deswizzle), and it has to be an **ARM64** python: an x64 one fails with `WinError 2` when spawning that helper. The run prints 12 PNGs and `dm_touch_native_art.c` (429 skill index entries) and takes a minute or two.
+
 ```
 cmake -G Ninja ^
   -DCMAKE_TOOLCHAIN_FILE=dm/win/toolchain-aarch64-w64-mingw32.cmake ^
@@ -107,7 +115,10 @@ A few notes:
 The virtual stick, the skill buttons, the skill-set switch, town portal and map are not drawn by the game: on Android / iOS the host lays a separate layer over the picture. On Windows that layer is `dm/win/touch_win.cpp`: it runs the **same** touch state machine as the mobile ports (`dm/ios/Sources/dm_touch_controls.c`), feeds the mouse in as a finger, publishes the result as buttons / stick through the same `dm_pad_hook` the controller uses, and paints the result onto a layered window with GDI+.
 
 - Geometry is in the same point space as iOS / Android (points on the 667×375 landscape base, scaled by screen height), so all three look like the same layout.
-- The look follows iOS's vector recipe (`dm/ios/Sources/DmTouchControlArt.h`): iron-rimmed sockets with a charcoal well, an extra ring on the primary button, a silver lift while held, a feathered stick base with four directional etchings, and a matte thumb with a curved highlight. The machine has neither the `sil_*` silver cut-outs nor the skill-atlas slices, so skill buttons carry key letters, the same fallback iOS uses.
+- The look follows iOS's vector recipe (`dm/ios/Sources/DmTouchControlArt.h`): iron-rimmed sockets with a charcoal well, an extra ring on the primary button, a silver lift while held, a feathered stick base with four directional etchings, and a matte thumb with a curved highlight.
+- Skill buttons carry the **original skill icons**, the same set iOS uses: `dm/ios/tools/native_art/generate.py` builds the atlas index from the player's own game files, `dm_touch_game_state.c` / `dm_touch_game_bridge.c` work out which skill tile the current binding points at at runtime, and the icon is drawn the iOS way (clip radius inset 9% of the button rect, diameter .76 / .68, soft shadow, the pressed frame while held). An empty slot draws a cross, town portal uses original skill 359, map uses `dm_native_map`. Key letters remain only as the fallback when no icon can be had (outside a run, or the shared table has not identified the HUD yet). Off-hand-set skills get the "II" badge top right, charged skills the remaining count bottom right (`dm_swapskill_slot`).
+- Without the atlas the build fails up front: run `generate.py` once (needs `clang` on PATH and an **ARM64** python — an x64 one dies with `WinError 2`), point `DM_WIN_TOUCHART` at `build\win\touchart`.
+- The overlay is `WS_EX_TOPMOST` and `SetWindowPos`-ed directly above the game window: the game window is topmost itself (`CreateWindowExA` in `front_win.c`), so a plain owned popup ends up underneath it — `UpdateLayeredWindow` returns success and `IsWindowVisible` reads 1, yet nothing appears on screen.
 - Input never goes through the overlay: it is `WS_EX_TRANSPARENT` and every mouse event lands on the game window (`wnd_proc` → `dm_win_touch_pointer`), so a transparent area stays clickable.
 - The six bottom-bar cells (difficulty number, four belt columns, the function entry), the life / mana numbers and the experience bar are drawn by bottom-bar HUD v4 itself; the overlay keeps only their hit areas, exactly as on iOS.
 
@@ -119,6 +130,7 @@ Switches:
 | `DM_WIN_TOUCH=1` | master switch (also stops `dm_padmode.c` from locking the controller layout) |
 | `DM_WIN_TOUCH_ALWAYS=1` | use the touch layout on the front-end pages too (their button ribbon is not drawn yet, so the menu comes up bare; debugging only) |
 | `DM_WIN_TOUCH_DUMP=<path with %d>` | save the overlay's own bitmap as a 32-bit BMP on every repaint (first one, then every 5th) for review |
+| `DM_WIN_TOUCH_ART=<dir>` | folder holding the skill-atlas PNGs (default `touchart\TouchArt`) |
 
 Screen capture on this machine comes back black (`CopyFromScreen` and `PrintWindow` alike) and the `DM_WIN_SHOT` readback never contains a layered window, so **`DM_WIN_TOUCH_DUMP` is the only way to see the overlay**. Two gotchas when reading that BMP: its rows are bottom-up, and Pillow drops the alpha of a 32-bit BMP — read the raw BGRA and flip the rows to see the transparent background.
 
