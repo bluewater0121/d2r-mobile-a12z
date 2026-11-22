@@ -228,7 +228,13 @@ void dm_host_preload_start(int argc, char **argv) {
 }
 #include <TargetConditionals.h>
 int dm_app_bootstrap(int *argc, char ***argv);   // app_mac.m：包成 .app 双击起时备好环境与参数；命令行起原样 | app_mac.m: when packaged as an .app and started by double-click, prepare the environment and arguments; command-line starts are unchanged
+#if DM_WIN
+int dm_win_stdio_to_log(void);   // front_win.c：GUI 子系统没有控制台时把日志落到文件（双击启动也不丢日志） | front_win.c: no console under the GUI subsystem, so the log goes to a file (double-click starts keep theirs too)
+#endif
 int main(int argc, char **argv) {
+#if DM_WIN
+    dm_win_stdio_to_log();
+#endif
 #if TARGET_OS_OSX   // iOS 包也编这个文件（入口由外壳调），那边没有 app_mac.m | The iOS package compiles this file too (the entry is called by the shell); there is no app_mac.m on that side
     if (dm_app_bootstrap(&argc, &argv)) { void dm_cloud_boot(void); dm_cloud_boot(); }   // App 形态：挂存档之前先做一次 iCloud 同步（同 iOS 壳的启动次序）；取不到容器 / 测试存档时它自己记一行就返回 | App form: do one iCloud sync before mounting the save (same startup order as the iOS shell); when the container cannot be obtained / with a test save it logs one line and returns
 #endif

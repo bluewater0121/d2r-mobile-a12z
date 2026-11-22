@@ -92,10 +92,10 @@ echo The previous instance did not save and quit in 8s - killing it.
 
 cd /d "%ROOT%\build\win"
 echo Launching %BIN%
-"%BIN%" dmdata main sdk subsdk0
-set "RC=%ERRORLEVEL%"
-cd /d "%ROOT%"
-echo Exit code %RC%
+rem dmhost.exe is a GUI-subsystem program: start it detached so this console window closes at once
+rem instead of sitting there behind the game. Diagnostics go to build\win\dmhost.log (DM_LOG_FILE overrides it).
+start "" "%BIN%" dmdata main sdk subsdk0
+echo Started - log: %CD%\dmhost.log
 goto end
 
 :usage

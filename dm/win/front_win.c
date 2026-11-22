@@ -381,6 +381,27 @@ static void raise_timer_resolution(void) {
     if (begin) begin(1);
 }
 
+// ---------- GUI 子系统：没有控制台时把日志落到文件 ----------
+// 双击 bat / 从资源管理器直接启动时，GUI 子系统进程没有控制台，stderr 无处可去，排障日志会全丢（上一版双击起就是这个问题：
+// 进程秒退、日志零字节，完全看不出原因）。所以：既没有控制台窗口、STD_ERROR 也不是有效的重定向句柄时，把 stdout / stderr
+// 都接到 DM_LOG_FILE（缺省当前目录的 dmhost.log）。从终端起、或用 Start-Process -RedirectStandardError 起的时候照旧走原输出。
+// GUI subsystem: with no console the log has nowhere to go
+// Started by double-clicking the bat or from Explorer, a GUI-subsystem process has no console and stderr lands nowhere, so every
+// diagnostic line is lost (exactly what the last round hit: an instant exit with a zero-byte log and no clue why). So: when there is no
+// console window and STD_ERROR_HANDLE is not a valid redirected handle, point stdout / stderr at DM_LOG_FILE (default dmhost.log in the
+// current directory). Started from a terminal, or with Start-Process -RedirectStandardError, output stays where it was.
+int dm_win_stdio_to_log(void) {
+    if (GetConsoleWindow()) return 0;
+    HANDLE e = GetStdHandle(STD_ERROR_HANDLE);
+    if (e && e != INVALID_HANDLE_VALUE) return 0;
+    const char *p = getenv("DM_LOG_FILE");
+    if (!p || !*p) p = "dmhost.log";
+    if (!freopen(p, "w", stderr)) return -1;
+    freopen(p, "a", stdout);
+    LOG("日志落到 %s（没有控制台：GUI 子系统启动）", p);
+    return 0;
+}
+
 // ---------- 宿主入口 ----------
 void front_run(void (*guest)(void)) {
     // DM_WINDOW=0：不开窗口，当前线程直接跑客体（与 Mac 宿主的无窗口形态同一开关，排障用）

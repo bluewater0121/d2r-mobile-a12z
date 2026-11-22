@@ -70,6 +70,8 @@ ninja -C build/win/obj
 
 产物 `build/win/obj/dmhost.exe` 是自带的：C++ 运行库静态链进来（`-static`），只剩 `libwinpthread-1.dll` 是导入项，构建时从工具链的 `bin` 拷到 exe 旁边（`CMakeLists.txt` 的 POST_BUILD）。少这一步时双击 `start-win-arm64.bat` 会以 `0xC0000135`（找不到 DLL）秒退、日志一个字都没有。
 
+它按 **Windows GUI 子系统**（`add_executable(dmhost WIN32 …)`）链接：双击启动不会挂一个 cmd 黑窗口，进程也不占控制台。代价是从资源管理器 / 双击启动时 `stderr` 没有去处，所以进程一进来就把日志接到文件——`DM_LOG_FILE` 指定路径，缺省是当前目录的 `dmhost.log`（每次启动覆盖）。从终端起、或用 `Start-Process -RedirectStandardError` 起的时候，日志照旧走原来的标准输出，文件不生成。
+
 ## 运行
 
 ```
@@ -134,6 +136,7 @@ iOS / 安卓是触屏，前端流程由宿主「替玩家按键」理顺（`dm/h
 | `DM_KBD=<文本>` | `swkbd` 起名面板直接返回这段文本，跳过宿主输入框 |
 | `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<秒>` | 手柄开关 / Switch 面键语义 / 手柄日志 / 无手柄时注入一次 A 验通路 |
 | `DM_FE_AUTO=0` | 关掉触屏那套「替玩家按键」的前端流程（Windows 缺省关，开机停在主菜单） |
+| `DM_LOG_FILE=<路径>` | GUI 子系统下没有控制台时的日志文件（缺省当前目录的 `dmhost.log`；从终端起或重定向起时不生成） |
 | `DM_WIN_SHOT=<首帧>[+<步长>]:<路径模板>` | 在呈现线程把上屏前的图读回成 32 位 BMP，例如 `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=宽x高` | 窗口客户区尺寸（缺省 1600x900，按屏幕工作区不超过 90%） |
 | `DM_GAME_RES=宽x高` | 游戏渲染分辨率（缺省按原版 16:9：1600x900） |

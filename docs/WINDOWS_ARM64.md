@@ -68,6 +68,10 @@ ninja -C build/win/obj
 
 `-DDM_GEN_DIR` points at the host tables generated from the game files (`dm_vault_tab.h` / `dm_hud_exp.h` / `dm_bright_levels.inc`). There is no ARM64 Vulkan import library, so the link goes straight to `C:\Windows\System32\vulkan-1.dll` (override with `-DDM_VULKAN_DLL`); headers come from `-DDM_VULKAN_INCLUDE`.
 
+The build output `build/win/obj/dmhost.exe` is self-contained: the C++ runtime is linked statically (`-static`) and only `libwinpthread-1.dll` remains an import, which the POST_BUILD step in `CMakeLists.txt` copies next to the exe from the toolchain's `bin`. Without that step, double-clicking `start-win-arm64.bat` exits at once with `0xC0000135` (missing DLL) and not one line of log.
+
+It is linked as a **Windows GUI subsystem** program (`add_executable(dmhost WIN32 …)`): no cmd window hangs around behind the game and the process takes no console. The price is that `stderr` has nowhere to go when it is started from Explorer or by a double-click, so the process points its own log at a file as soon as it enters — `DM_LOG_FILE` sets the path, the default is `dmhost.log` in the current directory (truncated on each start). Started from a terminal or with `Start-Process -RedirectStandardError`, the log goes to the usual standard handles and no file is created.
+
 ## Running
 
 ```
@@ -132,6 +136,7 @@ The game's own autosave runs about once every 5 minutes, so closing the window s
 | `DM_KBD=<text>` | the `swkbd` naming panel returns this text directly, skipping the host input box |
 | `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<s>` | controllers off / Switch face-button semantics / controller log / one injected A press to check the path |
 | `DM_FE_AUTO=0` | turn the touch-only "press keys for the player" front-end flow off (the Windows default: boot stays on the main menu) |
+| `DM_LOG_FILE=<path>` | log file used when there is no console under the GUI subsystem (default `dmhost.log` in the current directory; not created when started from a terminal or with redirection) |
 | `DM_WIN_SHOT=<first>[+<step>]:<path template>` | read back the picture right before presentation into a 32-bit BMP, e.g. `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=WxH` | window client size (default 1600x900, capped at 90% of the work area) |
 | `DM_GAME_RES=WxH` | game render resolution (default 1600x900, the original 16:9 docked size) |

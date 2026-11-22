@@ -112,7 +112,7 @@ target_compile_options(dmcore PUBLIC $<$<COMPILE_LANGUAGE:CXX>:${DM_CFLAGS} -std
 # 引擎原样复用：POSITION_INDEPENDENT_CODE 在 Windows 上无意义但无害；它自带的 -O2 覆盖在上面
 target_link_libraries(dmcore PUBLIC dm_vulkan_engine pthread bcrypt)
 
-add_executable(dmhost ${HOST}/main.c)
+add_executable(dmhost WIN32 ${HOST}/main.c)
 target_link_libraries(dmhost PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-archive)
 # 导出符号：崩溃回溯里 dladdr 能认出宿主函数（mingw 的 dladdr 走 PE 导出表）
 # Export symbols so dladdr in crash backtraces can name host functions (mingw's dladdr uses the PE export table)
