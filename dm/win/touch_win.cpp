@@ -123,7 +123,12 @@ static void layout_make(void) {
 
 // ---------- 取手柄那一拍：推进状态机并发布 ----------
 static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
-    if (!g_on || !g_in_run.load() || g_pad_in.load()) return;   // 浮层没开 / 不在局内 / 手柄接管中：照旧让手柄与键盘的输入走 | overlay off / not in a run / controller owns it: leave pad and keyboard input alone
+    // 手柄接管时也要照常推进 / 合并：浮层此刻是收着的，可鼠标仍然可以点它藏着的那颗钮（点下去前端会先调 dm_win_touch_screen_input 把输入源交回触屏，
+    // 但那一拍游戏正在重建布局，光靠那一次切换这一下就丢了）。这里不按输入源早退，只有「浮层没开 / 不在局内」才让开。
+    // Keep ticking and merging while the controller owns the input too: the overlay is hidden then, but the mouse can still hit one of its
+    // invisible buttons (the front end does call dm_win_touch_screen_input first, but the layout is being rebuilt in that frame and the press is
+    // lost to it). So this no longer bails out on the input source -- only "overlay off / not in a run" stands down.
+    if (!g_on || !g_in_run.load()) return;   // 浮层没开 / 不在局内：照旧让手柄与键盘的输入走 | overlay off / not in a run: leave pad and keyboard input alone
     std::lock_guard<std::mutex> lk(g_mx);
     dm_tc_tick(&g_tc, (double)now / 1e9);
     // 取证：按键组合变化打一行（无桌面截屏权限时，这是「点圆钮真的变成按键」的直接证据）| evidence: log each button-set change (the direct proof
@@ -486,6 +491,85 @@ static void stick_thumb_draw(Graphics &g, float cx, float cy, float r, int activ
     g.DrawArc(&lo, a2, 201.6f, 43.5f);
 }
 
+// ---------- 圆钮图标：一处解析，paint 与「收起时的预热」共用 ----------
+// Round-button glyphs: resolved in one place and shared by paint and the "warm while hidden" pass.
+//
+// 这里踩过的一个坑：图标原先只在 paint 里解析，而手柄接管期间浮层是收起的、根本没人 paint；于是从手柄版切回触屏版露出的第一张
+// 全是键位字母，还要等桥把六槽重新拼成一组才恢复——这正是「绑定的技能很容易丢失」的观感。现在收起时也每 4 拍解析一遍
+// （只读共享表、不绘制），露出第一张就直接有图标。
+// The trap here: glyphs used to be resolved only inside paint, and while the controller owns the input the overlay is hidden, so nothing
+// painted at all. The first frame after switching back then showed key letters everywhere until the bridge re-assembled a six-slot group --
+// exactly the "the bound skills keep disappearing" feeling. The cache is now refreshed every 4 ticks even while hidden (a read of the
+// shared table only, no drawing), so the first revealed frame already has the icons.
+struct glyph_slot { dm_ta_glyph g; int has; };
+static glyph_slot g_glyph[DM_TC_COUNT];
+static uint32_t g_glyph_last_id[DM_TC_SKILL4 + 1];
+static int g_glyph_last_st[DM_TC_SKILL4 + 1], g_glyph_last_init[DM_TC_SKILL4 + 1];
+static uint64_t g_glyph_unk_since[DM_TC_SKILL4 + 1];
+
+// 第 i 个圆钮这一拍该画什么图标：读到什么用什么；读不到（快照一时无 / 布局刚重建）用上一次的有效图标，不退回键位字母
+// What icon button i should draw this beat: whatever the snapshot says; when it says nothing (momentarily empty / right after a layout
+// rebuild) the last valid icon is kept instead of falling back to the key letter
+static void glyph_resolve(const dm_tc_state &s, const dm_tg_snapshot &snap, uint64_t now, int i, dm_ta_glyph *out, int *empty_out) {
+    dm_ta_glyph glg; memset(&glg, 0, sizeof glg); glg.status = DM_TA_UNKNOWN;
+    uint64_t b = s.layout.target[i].button;
+    if (i <= DM_TC_SKILL4 && b) {
+        // 快照年龄：桥里六槽「一组」要等整帧的六次调用才拼齐（实测约 4 次/秒），iOS 的 250 ms 门会把两组之间的空档全判过期、
+        // 图标退回键位字母。图标是纯装饰、换技能一秒内看出来就够了，所以这里拿快照自己的采集时刻当查询时刻（只放宽这一步的年龄判定）
+        // Snapshot age: a six-slot "group" needs the whole frame's six calls (about 4 per second in practice), so iOS's 250 ms gate would
+        // call every gap between groups expired and the icons would fall back to key letters. Query as of the snapshot's own capture time
+        // (only this age check is relaxed).
+        uint64_t q = now;
+        if (snap.captured_ns && (snap.captured_ns > q || q - snap.captured_ns > DM_TG_MAX_AGE_NS)) q = snap.captured_ns + 1;
+        glg = dm_ta_current_set(&snap, b, q, (int)s.skill_set);
+    } else if (i == DM_TC_PORTAL) {
+        glg = dm_ta_skill(359);   // 回城：原版通用的那张技能图（iOS 同一张）| town portal: the game's shared skill image (same as iOS)
+    } else {
+        if (empty_out) *empty_out = 0;
+        *out = glg;
+        return;
+    }
+    if (i <= DM_TC_SKILL4 && b) {
+        // 日志只记「真断档」和「真换技能」：桥的快照在 Windows 上每两拍抖一次 UNKNOWN（六槽一组要整帧六次调用才拼齐，
+        // 拼不齐就整组作废），逐拍照抄会刷屏，而玩家真正看得见的是断档超过 0.5 s 和技能换掉
+        // Only real dropouts and real rebinds are logged: on Windows the bridge's snapshot flips to UNKNOWN every other beat (a six-slot group
+        // needs the whole frame's six calls, and an incomplete group is discarded), so logging every transition would flood the log. What the
+        // player actually notices is a dropout longer than 0.5 s, and a skill that changed.
+        if (glg.status == DM_TA_UNKNOWN) {
+            if (!g_glyph_unk_since[i]) g_glyph_unk_since[i] = now;
+        } else if (g_glyph_unk_since[i]) {
+            uint64_t d = now > g_glyph_unk_since[i] ? now - g_glyph_unk_since[i] : 0;
+            g_glyph_unk_since[i] = 0;
+            if (d > 500000000ull && g_in_run.load()) LOG("触屏浮层：技能钮 %d 的绑定读不到，持续了 %llu ms（技能 %u 还在，图标用上一次的）", i, (unsigned long long)(d / 1000000ull), g_glyph_last_id[i]);
+        }
+        if (g_glyph_last_init[i] && g_glyph_last_st[i] == DM_TA_GLYPH && glg.status == DM_TA_GLYPH
+            && g_glyph_last_id[i] != (uint32_t)glg.raw_skill_id)
+            LOG("触屏浮层：技能钮 %d 换了技能（%u → %u）", i, g_glyph_last_id[i], glg.raw_skill_id);
+        else if (g_glyph_last_init[i] && g_glyph_last_st[i] == DM_TA_GLYPH && glg.status == DM_TA_EMPTY)
+            LOG("触屏浮层：技能钮 %d 的槽空了（原技能 %u，游戏那边清掉了）", i, g_glyph_last_id[i]);
+        g_glyph_last_init[i] = 1;
+        if (glg.status != DM_TA_UNKNOWN) { g_glyph_last_st[i] = glg.status; g_glyph_last_id[i] = (uint32_t)glg.raw_skill_id; }
+        if (glg.status == DM_TA_UNKNOWN && g_glyph[i].has) glg = g_glyph[i].g;      // 这一拍没读到：用上一次的
+        else if (glg.status != DM_TA_UNKNOWN) g_glyph[i].g = glg, g_glyph[i].has = 1;
+    }
+    if (empty_out) *empty_out = (glg.status == DM_TA_EMPTY);
+    *out = glg;
+}
+
+// 收起时也把图标缓存刷新一遍（只读共享表、不绘制），露出第一张就有图标
+// Refresh the icon cache while hidden as well (a read of the shared table only, no drawing), so the first revealed frame has the icons
+static void glyph_warm(void) {
+    if (!g_on || !g_in_run.load()) return;
+    dm_tc_state s;
+    { std::lock_guard<std::mutex> lk(g_mx); s = g_tc; }
+    int any = 0;
+    for (int i = 0; i <= DM_TC_SKILL4; ++i) if ((s.enabled_targets & (1u << i)) && s.layout.target[i].button) any = 1;
+    if (!any) return;
+    dm_tg_snapshot snap; memset(&snap, 0, sizeof snap); dm_touch_game_snapshot(&snap);
+    uint64_t now = now_ns();
+    for (int i = 0; i <= DM_TC_SKILL4; ++i) { dm_ta_glyph g; int e; glyph_resolve(s, snap, now, i, &g, &e); }
+}
+
 static void paint(void) {
     if (!g_ov || g_vw <= 0 || g_vh <= 0) { static int once; if (!once++) LOG("触屏浮层：paint 跳过（窗口 %p 视图 %dx%d）", (void *)g_ov, g_vw, g_vh); return; }
     if (surface_make(g_vw, g_vh) != 0) { static int once; if (!once++) LOG("触屏浮层：paint 跳过（surface_make 失败 %dx%d）", g_vw, g_vh); return; }
@@ -533,26 +617,11 @@ static void paint(void) {
             for (int f = 0; f < DM_TC_MAX_TOUCH && !held; ++f)
                 if (s.finger[f].active && !s.finger[f].aim_cancelled && s.finger[f].target == i) held = 1;
             float cx = t.x * px, cy = t.y * px, r = t.r * px;
-            // 技能钮：先问当前绑定取到哪张图标；取不到（不在局内 / 共享表还没认全 HUD）才回退成键位字母，空槽画十字
-            // Skill buttons: ask the current binding which icon it maps to; only when that is unavailable (not in a run, or the shared table has
-            // not fully identified the HUD yet) fall back to the key letter, and an empty slot draws a cross
+            // 技能钮：问共用解析（读不到就用上一次的有效图标，空槽画十字）
+            // Skill buttons: go through the shared resolver (keeps the last valid icon when the snapshot says nothing, cross for an empty slot)
             int empty = 0, charges = 0;
             dm_ta_glyph glg; memset(&glg, 0, sizeof glg); glg.status = DM_TA_UNKNOWN;
-            if (i <= DM_TC_SKILL4 && b) {
-                // 快照年龄：桥里六槽「一组」要等整帧的六次调用才拼齐（实测约 4 次/秒），iOS 的 250 ms 门在这里会把两组之间
-                // 的空档全判过期、图标退回键位字母。图标是纯装饰、换技能一秒内看出来就够了，所以这里拿快照自己的采集时刻当查询
-                // 时刻（只放宽这一步的年龄判定，快照本身仍按它自己的规则失效）。
-                // Snapshot age: in the bridge a six-slot "group" needs the whole frame's six calls (about 4 groups a second in practice),
-                // so iOS's 250 ms gate would call every gap between groups expired and the icons would fall back to key letters. The icon is
-                // decoration and one second of lag is plenty to notice a rebind, so query as of the snapshot's own capture time (only this
-                // age check is relaxed; the snapshot itself still expires by its own rules).
-                uint64_t q = now;
-                if (snap.captured_ns && (snap.captured_ns > q || q - snap.captured_ns > DM_TG_MAX_AGE_NS)) q = snap.captured_ns + 1;
-                glg = dm_ta_current_set(&snap, b, q, (int)s.skill_set);
-                if (glg.status == DM_TA_EMPTY) empty = 1;
-            } else if (i == DM_TC_PORTAL) {
-                glg = dm_ta_skill(359);   // 回城：原版通用的那张技能图（iOS 同一张）| town portal: the original game's shared skill image (the same one iOS uses)
-            }
+            glyph_resolve(s, snap, now, i, &glg, &empty);
             button_draw(g, cx, cy, r, held, empty, i == DM_TC_MAIN);
             if (glg.status == DM_TA_GLYPH && !g_noart) {
                 skill_icon_draw(g, glg, held, cx, cy, r, !empty && i == DM_TC_MAIN);
@@ -708,6 +777,10 @@ void dm_win_touch_tick(void) {
         if (rb != prev_rebuilds) { prev_rebuilds = rb; ++world_epoch; }   // 布局重建 = HUD 控件全换，技能钮要重新认 | a layout rebuild replaced every HUD widget, so the buttons have to re-identify
         dm_touch_game_set_scene(run, scene_epoch, world_epoch);
     }
+    // 收起期间也每 4 拍（64 ms）解析一遍图标：手柄接管与布局切换时没人 paint，露出第一张才不会全是键位字母
+    // While hidden, resolve the glyphs every 4 ticks (64 ms) as well: nothing paints during controller takeover or a layout switch, and this is
+    // what lets the first revealed frame show icons instead of key letters
+    { static int gbeat; if (++gbeat >= 4) { gbeat = 0; glyph_warm(); } }
     // 布局切换事务进行中也收起：整块界面正在重建成另一版，浮层压在上面会盖住重建中的界面（iOS 的 front_ios.m:497 每帧把 dm_padmode_busy() 也算进 hide）
     // Also hidden while a layout switch transaction runs: the whole UI is being rebuilt into the other version, and an overlay on top would cover the
     // half-built screens (iOS front_ios.m:497 folds dm_padmode_busy() into hide every frame)
