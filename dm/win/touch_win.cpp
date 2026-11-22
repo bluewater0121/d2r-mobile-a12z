@@ -737,17 +737,24 @@ static void paint(void) {
     POINT src = {0, 0};
     SIZE sz = {g_vw, g_vh};
     BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    // 位置：顶层窗口用屏幕坐标交给 UpdateLayeredWindow；子窗口的位置由 dm_win_touch_layout 用父客户区坐标摆好，
-    // 但 ULW 的 pptDst 还是按屏幕坐标解释（实测传 NULL 会 ERROR_INVALID_PARAMETER 87），所以这里给它的屏幕坐标
-    // Position: the top-level case hands screen coordinates to UpdateLayeredWindow; a child is placed by dm_win_touch_layout in the parent's
-    // client coordinates, but ULW still interprets pptDst as screen coordinates (passing NULL gave ERROR_INVALID_PARAMETER 87), so give it those.
+    // 位置：顶层弹窗认屏幕坐标；子窗口认**父客户区坐标**——Windows 会把 pptDst 再叠加到已经 SetWindowPos 好的子窗口位置上，
+    // 这里要是给屏幕坐标（游戏客户区原点，比如 480,254），整张浮层就被再往右下推 480,254，左下角的摇杆直接被裁掉、
+    // 右下角的技能钮跑到窗口右下角，只有窗口最大化（客户区原点≈0,0）时才看着正常。
+    // Position: a top-level popup takes screen coordinates; a child takes **parent-client coordinates** -- Windows applies pptDst on top of the child
+    // position already set by SetWindowPos, so handing it screen coordinates (the game's client origin, say 480,254) shifts the whole overlay
+    // another 480,254 down-right: the joystick in the lower-left gets clipped away and the skill buttons land in the window's bottom-right corner;
+    // it only looks right with the window maximized, where the client origin is about 0,0.
     POINT dst = {0, 0};
-    if (!ClientToScreen(g_game, &dst)) {
-        static int once;
-        if (!once++) LOG("触屏浮层：ClientToScreen 失败（游戏窗口 %p，IsWindow=%d，错误 %lu）", (void *)g_game, IsWindow(g_game), GetLastError());
-        RECT rc; GetWindowRect(g_game, &rc); dst.x = rc.left; dst.y = rc.top;
+    if (g_child) {
+        dst.x = g_vx; dst.y = g_vy;
+    } else {
+        if (!ClientToScreen(g_game, &dst)) {
+            static int once;
+            if (!once++) LOG("触屏浮层：ClientToScreen 失败（游戏窗口 %p，IsWindow=%d，错误 %lu）", (void *)g_game, IsWindow(g_game), GetLastError());
+            RECT rc; GetWindowRect(g_game, &rc); dst.x = rc.left; dst.y = rc.top;
+        }
+        dst.x += g_vx; dst.y += g_vy;
     }
-    dst.x += g_vx; dst.y += g_vy;
     BOOL ok = UpdateLayeredWindow(g_ov, NULL, &dst, &sz, g_mdc, &src, 0, &bf, ULW_ALPHA);
     // 分层窗口贴图是否真的成功：失败时桌面截屏又拿不到证据，只能靠返回值和 GetLastError 说话
     // Whether the layered blit actually succeeded: with no usable screen capture, the return value and GetLastError are the only evidence
@@ -755,8 +762,11 @@ static void paint(void) {
     int now = ok ? 1 : 2;
     if (now != said) {
         said = now;
-        if (ok) LOG("触屏浮层：贴图成功，子窗口 %ldx%ld（可见 %d）", (long)sz.cx, (long)sz.cy, IsWindowVisible(g_ov));
-        else LOG("触屏浮层：贴图失败，GetLastError=%lu", GetLastError());
+        if (ok) {
+            RECT rr; GetWindowRect(g_ov, &rr);
+            LOG("触屏浮层：贴图成功，子窗口 %ldx%ld 屏幕矩形 %ld,%ld（可见 %d）", (long)sz.cx, (long)sz.cy,
+                (long)rr.left, (long)rr.top, IsWindowVisible(g_ov));
+        } else LOG("触屏浮层：贴图失败，GetLastError=%lu", GetLastError());
     }
     dump_bmp();
 }
