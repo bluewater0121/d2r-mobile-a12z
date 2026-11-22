@@ -78,16 +78,17 @@ static int stick_on(int was, int32_t x, int32_t y) {
 
 static void set_mode(int pad) {
     if (g_mode == pad) return;
-    // 桌面形态（DM_APP，见 front_win.c 的 tuning_defaults）：布局锁在手柄版，碰画面 / 敲键盘不切触屏版——
-    // 触屏版布局把前端按钮栏整排挪到屏幕外、由触屏层另画，Windows 没有那一层，切过去主菜单就只剩背景
-    // Desktop form (DM_APP, see tuning_defaults in front_win.c): the layout is locked to the controller version, so touching the picture / typing does not switch to the touch
-    // version -- the touch layouts move the front-end button ribbon off screen and the touch layer draws it instead, which Windows does not have, so the main menu would be bare background
-    if (!pad && getenv("DM_APP")) { g_need_center = 1; return; }
+    // 这里的 g_mode 只表示「输入现在归谁」，不表示「布局长什么样」。桌面形态（DM_APP）把布局锁在手柄版那件事由
+    // dm_padmode_request 自己处理（它手里有真正的 g_lock，而且 DM_WIN_TOUCH=1 时是放开的）。原先这里也照着 DM_APP 早退，
+    // 结果在桌面形态下 g_mode 永远是 1：碰画面能露出浮层（那是另一条调用），但手柄一按下 set_mode(1) 直接 early-return，
+    // 浮层的「手柄接管」通知压根没被调到 —— 实测症状就是「手柄按键下去浮层还是一直在」。
+    // g_mode here means "who owns the input now", not "what the layout looks like". The desktop lock to the controller layout
+    // (DM_APP) is dm_padmode_request's business -- it holds the real g_lock, and it is lifted when DM_WIN_TOUCH=1. This function
+    // used to bail out on DM_APP as well, so under the desktop lock g_mode was stuck at 1: a mouse press still showed the overlay
+    // (a different call), but the next controller press hit `g_mode == pad` and returned, so the overlay was never told the
+    // controller had taken over -- exactly the reported symptom "controller key pressed, overlay still there".
     g_mode = pad;
     dm_padmode_request(pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | host dm_padmode.c: switch to the original controller / touch layout
-    // 浮层跟着输入来源走（iOS 的 onMode 回调 → front_ios 的 padMode）：手柄模式收起浮层，触屏模式露出浮层
-    // The overlay follows the input source (iOS's onMode callback -> padMode in front_ios): controller mode hides it, touch mode shows it
-    if (pad) dm_win_touch_pad_input(); else dm_win_touch_screen_input();
     LOG("手柄：%s", pad ? "有明确输入 → 手柄布局" : "碰了画面 / 敲键盘 → 触屏布局");
 }
 
@@ -118,6 +119,12 @@ static void publish(uint64_t b, int32_t ax[4]) {
     uint64_t edge = b & ~g_prev_b;
     if (edge || ((g_on[0] || g_on[1]) && !g_need_center)) {
         dm_padmode_request_glyph(DM_GLYPH_XBOX);   // 先报键帽样式，同一次切换里就换成本套 | report the glyph style first so the same switch uses it
+        // 浮层收起只要「手柄有明确输入」这一个事实，与布局换没换无关：布局可能被桌面形态锁死（dm_padmode_request 里 g_lock），
+        // 那样 set_mode 不会变、也就永远不会通知浮层。iOS 是 dm_gamepad.m 的 onMode 回调每次都调，这里照办。
+        // Hiding the overlay depends only on "the controller gave clear input", not on whether the layout changed: the layout can be
+        // locked to the controller version (g_lock inside dm_padmode_request), in which case set_mode does not change and would never
+        // tell the overlay. iOS calls its onMode callback on every change; this does the same, unconditionally.
+        dm_win_touch_pad_input();
         int was = g_mode;
         set_mode(1);
         // 这一次是「切过去的那一下」：把它记下来，事务完成后补发 | This is the press that switched: remember it and re-send it once the transaction is over
@@ -130,6 +137,9 @@ static void publish(uint64_t b, int32_t ax[4]) {
 }
 
 void dm_win_pad_touch(void) {   // 玩家碰了画面 / 敲键盘：手柄布局 → 触屏布局，摇杆要先回中 | player touched the picture / typed: back to touch, stick must recenter first
+    // 露出浮层只看「碰了触屏侧」这一个事实，与布局换没换无关（同上：布局可能被桌面形态锁死）
+    // Showing the overlay again depends only on "the touch side was used", not on whether the layout changed (same reason as above)
+    dm_win_touch_screen_input();
     if (!g_mode) return;
     g_need_center = 1;
     set_mode(0);
@@ -183,6 +193,9 @@ static DWORD WINAPI poll_thread(void *p) {
             if (ml > best[0]) { best[0] = ml; ax[0] = lx; ax[1] = ly; }
             if (mr > best[1]) { best[1] = mr; ax[2] = rx; ax[3] = ry; }
         }
+        static uint32_t was_conn;
+        if (!connected && was_conn) { dm_win_pad_touch(); LOG("手柄：一个都不剩，交回触屏侧"); }   // iOS 的 drop()：最后一个手柄断开 → 回触屏模式 | iOS drop(): the last controller is gone -> back to touch
+        was_conn = connected;
         int holder = 0;
         maybe_test_press((double)GetTickCount64() / 1000.0 - t0, &b);
         publish(b, ax);

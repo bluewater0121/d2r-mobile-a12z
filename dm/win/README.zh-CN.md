@@ -159,6 +159,30 @@ iOS 的判据（`dm_gamepad.m` `apply` / `front_ios.m` `padMode:`）只有两条
 
 同一处还有个自己挖的坑：圆钮「差一点没点到就吸附」最初写成 `cancel_finger` 后在同一 slot 再 `begin_at` 钮心，实测按下那一拍发布的是 `瞄准 -32767,32767`（旧日志全是 `0,0`）。`dm_tc_begin_at` 自带早退、`cancel_finger` 会 `++gesture_epoch` 并 `update` 一次，两次状态迁移把瞄准轴带偏了。改成**落点先吸附再单次 `begin_at`**（`dm_tc_hit == NONE` 时找 ≤1.25r 的圆钮、改写 x/y、摇杆不吸），aim 回到 `0,0`。触控灵敏度另外两项：tick 30 ms → **16 ms**（发布延迟 ≤1 帧），圆钮命中放宽到 1.25r。
 
+**18. 「手柄按下去浮层还在」：浮层通知被塞在 `set_mode()` 里，而 `set_mode` 被桌面锁卡死在 1。**
+`pad_win.c` 原先在 `set_mode()` 里调 `dm_win_touch_pad_input()`，但 `set_mode` 开头有两道早退：
+```c
+if (g_mode == pad) return;
+if (!pad && getenv("DM_APP")) { g_need_center = 1; return; }   // ← 只在 DM_APP 下
+```
+`DM_APP`（Windows 桌面形态，探测脚本也带）配合第二道早退，`set_mode(0)` 直接 return、**不改 `g_mode`**，于是 `g_mode` 永远是 1；之后手柄一按下走 `set_mode(1)`，第一道早退又把它挡掉——**浮层的「手柄接管」通知压根没被调到**。碰画面能露浮层是因为那条走 `dm_win_touch_screen_input()`（另一个调用），所以症状恰好是「鼠标点了浮层回来了，手柄一按却不收回去」。注入 A 的探针之所以测得通，是因为那次运行全程只有键盘（`on_key_msg` → `dm_win_pad_touch`），`g_mode` 还是 0，第一次 `set_mode(1)` 真的发生了——真机手柄在菜单里就用过，`g_mode` 早就是 1 了，撞不上这条。
+
+修法是把「布局换没换」和「输入源归谁」彻底拆开：
+- `set_mode()` 只改 `g_mode` + `dm_padmode_request()`；桌面布局锁交给 `dm_padmode_request()` 里的 `g_lock`（`DM_WIN_TOUCH=1` 时它是放开的），不在这里再判一次 `DM_APP`。
+- 浮层通知挪到**语义源头**，与模式变没变无关：`publish()` 里「手柄有明确输入」分支调 `dm_win_touch_pad_input()`；`dm_win_pad_touch()` 一进来就调 `dm_win_touch_screen_input()`。
+- 顺带补 iOS `drop()` 的语义：最后一个手柄断开 → 交回触屏侧。
+- `dm_win_touch_tick()` 显隐变化时打一行 `触屏浮层：露出/收起（运行 d 手柄接管 d 切换中 d）`，真机再出问题能直接看出是哪个判据没成立。
+
+实测（本机接着一支 XInput 手柄，`DM_PAD_TEST=62,81` + 80 s 鼠标点画面）：
+```
+触屏浮层：露出（运行 1 手柄接管 0 切换中 0）
+触屏浮层：手柄有输入 → 收起浮层（手柄布局）
+触屏浮层：收起（运行 1 手柄接管 1 切换中 1）
+触屏浮层：碰了画面 / 敲键盘 → 露出浮层（触屏布局）
+触屏浮层：露出（运行 1 手柄接管 0 切换中 0）
+```
+一趟里 3 次布局切换、0 次超时；`fps` 均值 54.5（这趟有实体手柄 125 Hz 轮询 + 3 次重建）。
+
 
 ## 排障
 

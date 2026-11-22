@@ -702,9 +702,15 @@ void dm_win_touch_tick(void) {
     // 布局切换事务进行中也收起：整块界面正在重建成另一版，浮层压在上面会盖住重建中的界面（iOS 的 front_ios.m:497 每帧把 dm_padmode_busy() 也算进 hide）
     // Also hidden while a layout switch transaction runs: the whole UI is being rebuilt into the other version, and an overlay on top would cover the
     // half-built screens (iOS front_ios.m:497 folds dm_padmode_busy() into hide every frame)
-    if (!g_in_run.load() || g_pad_in.load() || dm_padmode_busy()) {
-        if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE);
-        return;
+    {
+        int run = g_in_run.load(), pad = g_pad_in.load(), busy = dm_padmode_busy() ? 1 : 0;
+        int want = (run && !pad && !busy) ? 1 : 0;
+        // 显隐变化时打一行（三个判据都打出来）：真机上「按了手柄浮层还在」时，一眼能看出是哪个判据没成立
+        // Log one line per visibility change with all three conditions: when the overlay stays up on a real controller press, this shows
+        // immediately which condition did not hold
+        static int want_prev = -1;
+        if (want != want_prev) { want_prev = want; LOG("触屏浮层：%s（运行 %d 手柄接管 %d 切换中 %d）", want ? "露出" : "收起", run, pad, busy); }
+        if (!want) { if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE); return; }
     }
     if (!IsWindowVisible(g_ov)) {
         ShowWindow(g_ov, SW_SHOWNA);
