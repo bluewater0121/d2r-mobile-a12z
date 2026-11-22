@@ -109,7 +109,17 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
 // finger table handed to the game must be submitted **all at once** (dm_touch_set(t, n)); replacing one finger at a time wipes out the finger
 // holding the stick — which is exactly "pressing a skill while holding a direction does nothing".
 #define DM_TU_MAX 16
+static int g_touch_ok;   // RegisterTouchWindow 成功过：触点那条路是活的，下面才敢把「触点合成出来的鼠标消息」丢掉
 static struct { uint32_t id; int slot; int claim; int front; float nx, ny; int used; } g_tu[DM_TU_MAX];
+
+// 触点被系统「顺手」合成出来的那条鼠标消息：GetMessageExtraInfo 里带 0xFF515700 签名（触屏 / 笔），真鼠标没有它。
+// iOS / 安卓都只有真触点这一路；Windows 上同一根手指会同时给出 WM_TOUCH 和这条合成鼠标，
+// 两边都处理就会把同一根手指登记成两根（一根占着摇杆槽、又一根去抢同一个槽），所以合成的那条直接丢。
+// The mouse message the system "helpfully" synthesizes from a contact carries the 0xFF515700 signature in GetMessageExtraInfo (touch / pen);
+// a real mouse does not. iOS and Android only ever have real contacts, while on Windows the same finger produces both a WM_TOUCH and this
+// synthesized mouse message -- handling both registers one finger twice (one takes the stick slot while the other fights for it), so the
+// synthesized one is dropped.
+static int mouse_from_touch(void) { return ((uintptr_t)GetMessageExtraInfo() & 0xFFFFFF00u) == 0xFF515700u; }
 
 static int tu_find(uint32_t id) { for (int i = 0; i < DM_TU_MAX; ++i) if (g_tu[i].used && g_tu[i].id == id) return i; return -1; }
 static int tu_alloc(uint32_t id) { for (int i = 0; i < DM_TU_MAX; ++i) if (!g_tu[i].used) {
@@ -137,8 +147,7 @@ static void set_finger(int down) {    if (down && !g_mouse_down) {
 }
 
 // 触点分发：WM_TOUCH 与触摸模拟（DM_TOUCH_SIM）共用同一条路 | contact dispatch shared by WM_TOUCH and the touch simulation (DM_TOUCH_SIM)
-static void touch_dispatch(HWND h, UINT cnt, TOUCHINPUT *ti) {
-    for (UINT k = 0; k < cnt; ++k) {
+static void touch_dispatch(HWND h, UINT cnt, TOUCHINPUT *ti) {    for (UINT k = 0; k < cnt; ++k) {
         // TOUCHINPUT 的坐标是「1/100 像素」的屏幕坐标 | TOUCHINPUT coordinates are screen coordinates in hundredths of a pixel
         POINT pt = { ti[k].x / 100, ti[k].y / 100 };
         ScreenToClient(h, &pt);
@@ -148,6 +157,7 @@ static void touch_dispatch(HWND h, UINT cnt, TOUCHINPUT *ti) {
         if (down && idx < 0) {
             idx = tu_alloc(ti[k].dwID);
             if (idx < 0) continue;
+            dm_win_touch_free_slot(g_tu[idx].slot);   // 上一根手指没抬起就占着这个槽：先清掉，否则这次按下被 begin_at 挡掉 | an earlier finger never lifted and still holds this slot: clear it, or begin_at refuses this press
             g_tu[idx].nx = nx; g_tu[idx].ny = ny;
             dm_win_pad_touch(); dm_win_touch_screen_input();   // 碰画面 = 触屏侧 | the picture was touched = touch side
             if (dm_win_touch_enabled() && dm_win_touch_pointer(0, nx, ny, g_tu[idx].slot)) g_tu[idx].claim = 1;
@@ -182,6 +192,26 @@ void dm_win_front_touch_sim(int count, const int *cxys, int phase) {
     }
     LOG("输入：触摸模拟 phase=%d 根数=%d（第 %d 根 客户区 %d,%d）", phase, count, 0, count > 0 ? cxys[0] : 0, count > 0 ? cxys[1] : 0);
     touch_dispatch(g_hwnd, (UINT)count, ti);
+}
+
+// 触屏消息入口：触点发给「手指下面那个窗口」，而浮层是压在游戏客户区上的子窗口，所以两根窗口都可能收到，
+// 两边注册了 WM_TOUCH 后都转到这里；target = 换算坐标用的窗口（游戏窗口，mouse_to_pic 用的是它的客户区）。
+// Touch message entry: a contact is delivered to the window under the finger, and the overlay is a child window lying over the game's client
+// area, so either window can receive it; both register WM_TOUCH and forward here. target = the window the coordinates are mapped into (the
+// game window, whose client area mouse_to_pic measures against).
+int dm_win_front_touch_msg(HWND target, WPARAM wp, LPARAM lp) {
+    UINT cnt = LOWORD(wp);
+    TOUCHINPUT ti[DM_TU_MAX];
+    if (cnt > DM_TU_MAX) cnt = DM_TU_MAX;
+    if (!cnt) { CloseTouchInputHandle((HANDLE)lp); return 0; }
+    if (!GetTouchInputInfo((HANDLE)lp, cnt, ti, sizeof(TOUCHINPUT))) { CloseTouchInputHandle((HANDLE)lp); return 0; }
+    if (getenv("DM_TOUCH_LOG"))
+        for (UINT k = 0; k < cnt; ++k)
+            LOG("输入：触点 %u/%u id=%u flags=%#x 屏幕 %ld,%ld", k + 1, cnt, (unsigned)ti[k].dwID, (unsigned)ti[k].dwFlags,
+                (long)(ti[k].x / 100), (long)(ti[k].y / 100));
+    touch_dispatch(target ? target : g_hwnd, cnt, ti);
+    CloseTouchInputHandle((HANDLE)lp);
+    return 1;
 }
 
 // ---------- 窗口过程 ----------
@@ -230,6 +260,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSKEYUP:
         on_key_msg((int)wp, 0); return 0;
     case WM_MOUSEMOVE: {
+        if (g_touch_ok && mouse_from_touch()) return 0;   // 触点自己那条 WM_TOUCH 已经在处理它了 | the contact's own WM_TOUCH already handles it
         int cx = (int)(short)LOWORD(lp), cy = (int)(short)HIWORD(lp);
         mouse_to_pic(cx, cy, &g_mouse_x, &g_mouse_y);
         if (g_front_click) { dm_ui_touch(1, g_mouse_x, g_mouse_y); return 0; }
@@ -240,6 +271,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_mouse_down) set_finger(1);   // 拖动 = 手指移动 | drag = finger move
         return 0; }
     case WM_LBUTTONDOWN:
+        if (g_touch_ok && mouse_from_touch()) return 0;
         SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y);
         dm_win_touch_screen_input();   // 点画面（含点到圆钮）= 触屏侧接管，浮层重新露出来 | a press on the picture (round buttons included) = touch side takes over, the overlay comes back
         if (dm_win_touch_enabled() && dm_win_touch_pointer(0, g_mouse_x, g_mouse_y, 0)) { g_mouse_down = 1; return 0; }
@@ -252,6 +284,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             LOG("前端：界面点击 (%.3f,%.3f)（前端页面走 dm_ui_touch，不当触点）", g_mouse_x, g_mouse_y); return 0; }
         set_finger(1); return 0;
     case WM_LBUTTONUP:
+        if (g_touch_ok && mouse_from_touch()) return 0;
         if (g_front_click) { g_front_click = 0; g_mouse_down = 0; dm_ui_touch(2, g_mouse_x, g_mouse_y); ReleaseCapture(); return 0; }
         if (g_mouse_down && dm_win_touch_enabled() && dm_win_touch_pointer(2, g_mouse_x, g_mouse_y, 0)) { ReleaseCapture(); g_mouse_down = 0; return 0; }
         ReleaseCapture(); set_finger(0); return 0;
@@ -272,17 +305,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == 2) update_title();
         else if (wp == 3) dm_win_touch_tick();   // 触屏浮层：30 ms 一拍，按需重画 / 进局切布局 | overlay: 30 ms tick, repaint on demand, switch layout on entering a run
         return 0;
-    case WM_TOUCH: {
-        // 一根触点一根手指：命中圆钮 / 摇杆 → 归浮层；否则（界面点击或画面触点）当普通触点喂给游戏
-        // One finger per contact: a hit on a round button / the stick belongs to the overlay; anything else is a plain contact for the game
-        UINT cnt = LOWORD(wp);
-        TOUCHINPUT ti[DM_TU_MAX];
-        if (cnt > DM_TU_MAX) cnt = DM_TU_MAX;
-        if (!cnt) { CloseTouchInputHandle((HANDLE)lp); return 0; }
-        if (!GetTouchInputInfo((HANDLE)lp, cnt, ti, sizeof(TOUCHINPUT))) { CloseTouchInputHandle((HANDLE)lp); return 0; }
-        touch_dispatch(h, cnt, ti);
-        CloseTouchInputHandle((HANDLE)lp);
-        return 0; }
+    case WM_TOUCH:
+        dm_win_front_touch_msg(h, wp, lp);
+        return 0;
     case WM_MOVE:
         // 浮层是独立的窗口，跟着游戏窗口走 | the overlay is a separate window; keep it on top of the game window
         { RECT rc; GetClientRect(h, &rc); int vr[4]; view_rect(rc.right, rc.bottom, vr); dm_win_touch_layout(vr[0], vr[1], vr[2], vr[3]); }
@@ -321,7 +346,12 @@ static int create_window(void) {
     // 注册触屏消息：不注册的话 Windows 只把第一根手指合成成鼠标，浮层就做不出「按住摇杆的同时点技能」
     // Register for touch messages: without it Windows promotes only the first contact into mouse messages, and the overlay could never do
     // "hold the stick while tapping a skill"
-    { BOOL ok_tu = RegisterTouchWindow(g_hwnd, 0); LOG("输入：触屏消息注册 %s", ok_tu ? "成功（可多点）" : "失败（只剩单指 / 鼠标）"); }
+    { BOOL ok_tu = RegisterTouchWindow(g_hwnd, 0); g_touch_ok = ok_tu ? 1 : 0;
+      // 数字化仪能力：0 根触点 = 这个会话根本没有触摸（远程桌面会话就是这样），多点那条路没法在这台机器上验证
+      // Digitizer capability: 0 contacts = this session has no touch at all (exactly what a Remote Desktop session looks like), so the
+      // multi-touch path cannot be verified on this machine
+      LOG("输入：触屏消息注册 %s（数字化仪 %d，触点上限 %d）", ok_tu ? "成功（可多点）" : "失败（只剩单指 / 鼠标）",
+          (int)GetSystemMetrics(94) /* SM_DIGITIZER */, (int)GetSystemMetrics(95) /* SM_MAXIMUMTOUCHES */); }
     // 类图标只管标题栏，任务栏 / Alt+Tab 用窗口图标：两处都显式再设一次（窗口图标优先于类图标）
     // The class icon covers the title bar; the taskbar and Alt+Tab use the window icon: set both explicitly (the window icon wins over the class icon)
     SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)LoadIconA(hi, MAKEINTRESOURCEA(1)));

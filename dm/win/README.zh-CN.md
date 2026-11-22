@@ -283,6 +283,22 @@ z 序里 `hWndInsertAfter = g_game` 是**放到它后面**（below），所以�
 ```
 即：两根手指同时被浮层各自认领、摇杆与技能键在同一拍上发布，且互不打断。`pad_step` 里顺手加了「摇杆出零 / 回零」一行，就是这条链路的直接证据。
 
+**24. 多点还是不行（真机双指）——触点发给「手指下面那个窗口」，而浮层是压在客户区上的子窗口；另外同一根手指会同时给出 WM_TOUCH 和一条合成鼠标。**
+
+对照移动端可以看清 Windows 独有的一段：iOS 把 `UITouch` 按对象存进 `_slot[16]`（按下取最小空槽，`dm_tc_begin_at/move_at/end_at` 按槽走，`pushFrom` 每次把 16 个槽里**全部**手指一次性 `dm_touch_set`，按键另走 `dm_input_set`）；安卓是 `pointerIds[16]` 把 `MotionEvent` 的 pointerId 映射成槽（`ACTION_DOWN/POINTER_DOWN` 取最小空槽、`ACTION_MOVE` 遍历全部 pointer 更新、`UP/POINTER_UP` 释放槽、`CANCEL` 全抬），`publishRaw()` 同样一次提交全部手指。**两边都没有「窗口」这一层**：触点只属于视图，不存在「这根手指落到哪个窗口去」的问题。Windows 上多出来的就是这个：WM_TOUCH 发给**手指正下方那个窗口**，而浮层正压在游戏客户区上；第一根手指又被系统顺手合成成鼠标消息（走 `HTTRANSPARENT` 穿透回游戏窗口），于是「单指能用、第二根没反应」看起来完全合理。
+
+改法：
+
+- 触屏消息抽成统一入口 `dm_win_front_touch_msg(HWND target, WPARAM, LPARAM)`（`front_win.c`）：`GetTouchInputInfo` → `touch_dispatch`，`target` 是要换算坐标的那个窗口（游戏窗口，`mouse_to_pic` 用它客户区）；
+- **浮层子窗口也 `RegisterTouchWindow`**，`ov_proc` 收到 `WM_TOUCH` 就转给上面那个入口（日志 `触屏浮层：覆盖层触屏注册 成功`）——这样无论触点落在哪个窗口都进同一条路；
+- **丢掉系统从触点合成出来的鼠标消息**：`GetMessageExtraInfo()` 带 `0xFF515700` 签名就是触点 / 笔合成的（真鼠标没有）。不丢的话同一根手指会被登记两次（一根当鼠标占槽、一根当触点另占一个槽）。只在 `RegisterTouchWindow` 成功后才启用这条过滤，免得万一注册失败就整机没输入；
+- 新触点落进一个还挂着上次没抬起手指的槽时先 `dm_win_touch_free_slot()`：否则 `dm_tc_begin_at` 见 `finger[slot].active` 直接早退，按下去什么都不发生；
+- 开机日志补数字化仪能力：`输入：触屏消息注册 成功（可多点）（数字化仪 197，触点上限 10）`。`触点上限 0` = 这个会话根本没有触摸。
+
+排障开关：`DM_TOUCH_LOG=1` 会把每条 WM_TOUCH 的触点打出来（`输入：触点 1/2 id=3 flags=... 屏幕 x,y`），真机上「第二根手指到底有没有进来」一眼就能看出来。
+
+进程内触摸模拟（`DM_TOUCH_SIM`）走的是同一条 `touch_dispatch`，所以它验证的是状态机与发布这一半；「触点能不能到窗口」这一半只能在真机上验（本机 RDP 会话注入恒 87，见坑 23）。
+
 
 ## 排障
 

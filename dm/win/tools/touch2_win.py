@@ -13,6 +13,13 @@ import ctypes, sys, time
 from ctypes import wintypes as W
 
 u = ctypes.WinDLL("user32", use_last_error=True)
+# 先声明 DPI 感知（不声明的话 ClientToScreen 给的是被系统虚拟化过的逻辑坐标，和注入要的物理像素对不上）
+# Declare DPI awareness first: without it ClientToScreen returns virtualized logical coordinates, which do not match the physical pixels injection wants
+try:
+    u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))   # PER_MONITOR_AWARE_V2
+except Exception:
+    pass
+
 
 PT_TOUCH = 2
 POINTER_FLAG_INRANGE = 0x00000002

@@ -29,6 +29,7 @@ int dm_win_touch_pointer(int op, float nx, float ny, int slot);
 // 窗口尺寸或视图矩形变了：vx / vy / vw / vh = 视图矩形（客户区像素）| window size or view rectangle changed
 void dm_win_touch_layout(int vx, int vy, int vw, int vh);
 void dm_win_touch_cancel(void);            // 失焦：所有手指抬起 | focus lost: lift every finger
+void dm_win_touch_free_slot(int slot);     // 新触点落进一个还挂着上次没抬起手指的槽：先清掉 | a new contact lands in a slot still holding an un-lifted finger: clear it first
 void dm_win_touch_tick(void);              // 主线程定时（16 ms）：按需重画、按出局 / 进局切布局 | main-thread timer (16 ms): repaint when dirty, switch layout on entering / leaving a run
 // 输入来源切换（照 iOS：实体手柄有明确输入 = padMode，碰画面 / 敲键盘 = 触屏）——手柄模式收起浮层，
 // 触屏模式露出浮层并切回触屏布局。两边都由输入事件驱动，谁刚有输入就归谁。

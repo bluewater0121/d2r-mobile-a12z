@@ -266,6 +266,19 @@ void dm_win_touch_cancel(void) {
     g_dirty.store(1);
 }
 
+// 某个槽还挂着上一次没抬起的手指（触点被系统吞掉 / 窗口失焦时漏了 UP）：新触点要落进这个槽前先清掉，
+// 否则 dm_tc_begin_at 见到 finger[slot].active 会直接早退，这一下按下去什么都不发生
+// A slot still holds a finger from last time that never lifted (the contact was swallowed by the system, or an UP was missed on focus loss):
+// clear it before a new contact lands in that slot, or dm_tc_begin_at sees finger[slot].active and bails out -- the press then does nothing
+void dm_win_touch_free_slot(int slot) {
+    if (!g_on || slot < 0 || slot >= DM_TC_MAX_TOUCH) return;
+    if (!g_claim[slot]) return;
+    std::lock_guard<std::mutex> lk(g_mx);
+    dm_tc_cancel_finger(&g_tc, slot);
+    g_claim[slot] = 0;
+    LOG("触屏浮层：槽 %d 还挂着一根没抬起的手指，先清掉", slot);
+}
+
 // ---------- 绘制 ----------
 static HDC g_mdc; static HBITMAP g_dib; static void *g_bits; static int g_bw, g_bh;
 static ULONG_PTR g_gdip;
@@ -813,8 +826,13 @@ static void dump_bmp(void) {
 }
 
 // ---------- 窗口 ----------
+// 触屏消息统一入口（front_win.c 实现）：浮层子窗口收到的触点也要转过去，按游戏窗口客户区换算坐标
+// Unified touch entry (implemented in front_win.c): contacts delivered to the overlay child window are forwarded there too, mapped against
+// the game window's client area
+extern "C" int dm_win_front_touch_msg(HWND target, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCHITTEST) return HTTRANSPARENT;   // 点击穿透到游戏窗口 | clicks fall through to the game window
+    if (m == WM_TOUCH) { dm_win_front_touch_msg(g_game, w, l); return 0; }   // 触点落在浮层上：照样算游戏窗口的触点 | a contact landed on the overlay: treat it as the game window's
     return DefWindowProcA(h, m, w, l);
 }
 
@@ -1046,6 +1064,10 @@ void dm_win_touch_start(void *game_hwnd) {
         g_child = (GetParent(g_ov) == g_game) ? 1 : 0;   // 认亲成功才算子窗口 | only a child if the reparenting took
         SetWindowPos(g_ov, HWND_TOP, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         LOG("触屏浮层：覆盖层挂成子窗口（父=游戏窗口 %d）", g_child);
+        // 浮层压在客户区上，触点可能先落到它身上；不注册的话第二根手指（技能）会整个丢掉——只有第一根被系统合成成鼠标，所以单指看着正常
+        // The overlay lies over the client area, so a contact may land on it first; without registering, the second finger (the skill) is lost
+        // outright -- only the first contact is promoted to mouse, which is why a single finger looks fine
+        { BOOL ok = RegisterTouchWindow(g_ov, 0); LOG("触屏浮层：覆盖层触屏注册 %s", ok ? "成功" : "失败"); }
     }
     if (!g_ov) { LOG("触屏浮层：覆盖层窗口建不出来（%lu）", GetLastError()); return; }
 
