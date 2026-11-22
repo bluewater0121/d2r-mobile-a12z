@@ -139,6 +139,17 @@ mingw 的 `gdiplus/gdiplusimaging.h` 用了 `PROPID` 却没带 `ole2.h`，所以
 
 **注意**：`regs[30]` 不能当「返回地址」用——进了回调它已经被门桩改写，拿它做筛会把所有调用筛光（试过，`成功 0`）。
 
+**15. 图标退回键位字母，跟节流没关系——是「六槽一组」拼不齐 + 快照被半成品覆盖。**
+`latest` 只在 `dm_tg_group_observe` 把**整帧六次** getter 调用凑成一组后才算齐（实测也就 4 组/秒）。所以：
+- 任何把慢路径压到「每帧 1~2 次」的节流（100 ms、16 ms 按时间掐都算）都会让 group 永远差几位，`latest` 被 `ready=0` 的半成品覆盖，图标退回键位字母——先前的结论「节流太稀导致快照过期」只对了一半。
+- 现在确认后改成**按帧预算**：每 16 ms 窗口最多放 16 次慢路径（`DM_BINDING_CONF_BUDGET`，0 = 关），够六槽（含副手组）拼齐，又比不节流省两个数量级的进门次数。
+- 图标侧再放宽一步（`touch_win.cpp`）：查询用快照**自己的采集时刻`，组与组之间 200~400 ms 的空档不再被判过期（iOS 的 250 ms 门只适合它那边的刷新节奏）。
+- 诊断：`DM_BINDING_DIAG=1` 现在多两行——`绑定快照：valid/ready/portal/group_seen/age_ms`、`绑定槽过：0..5 各通过几次`，一眼看出 group 拼到第几位、哪个槽没过。
+
+**16. 剩下的那 2 帧不在浮层里，在客体主线程的等锁唤醒上。**
+`DM_STALL_PROBE=1` 取栈（营地静置、浮层开着、`DM_LONGFRAME=0`）：长帧命中的是 `ntdll!NtWaitForAlertByThreadId <- ntdll`（`WaitOnAddress` 那类 futex 等待）和少量 `NtWriteFile <- WriteFile`，`host+0xd3xxx` 是我们的 `hle_thread.c`。也就是客体主线程每 9 帧左右等一次客体锁 / 条件变量，唤醒晚 12~15 ms。这条与浮层无关（不挂桥、无浮层同样存在），`DM_HLE_SPIN_US=800` 对它无效。现状：带浮层 avg 57.5 / 末 20 窗口 58.2 / 峰值 60.8；不挂浮层 56.5~57.6。
+
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。
