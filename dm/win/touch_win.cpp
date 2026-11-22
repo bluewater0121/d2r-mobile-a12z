@@ -121,6 +121,53 @@ static void layout_make(void) {
     dm_tc_resize(&g_tc, g_dpw, g_dph);
 }
 
+// ---------- 松手施放脉冲的收回（Windows 侧原先没人收） ----------
+// 有几条路不在松手时直接发键，而是把键落进一个「脉冲」，等前端自己收回：
+//   · 按下不足 2 帧的短按（快速点一下圆钮，游戏可能读不到）
+//   · 第二组技能，ZL 还没领先够（延后到领先够了再发）
+//   · 界面类的点按（技能绑定框、腰带格、拖拽的拿起 / 放下）
+// iOS 由 front_ios.m 的 pulseTick 收（判据：「游戏已取到这一次 + 送达后再按 0.12 s」+ 2 秒兜底）；
+// Windows 这边一直没有对应的人，脉冲一落地就永远按着——表现就是「技能点一下之后一直放」，因为每帧 update() 都把 pulse_button 并进按键。
+// 判据照 iOS，但「游戏取到了没有」用 pad_step 被调的次数（那就是游戏读输入的采样）来数。
+// Some paths do not send the key on release but drop it into a "pulse" that the front end has to withdraw: a press shorter than 2 frames (a quick
+// tap the game may miss), a skill of the second set before ZL has led long enough, and UI-style taps (binding box, belt cell, drag pick-up /
+// put-down). iOS withdraws those in front_ios.m's pulseTick; on Windows nobody ever did, so a pulse once landed stayed pressed forever -- which
+// reads as "tap a skill once and it keeps casting", because every update() folds pulse_button back into the buttons. The criteria follow iOS,
+// with "has the game taken it yet" counted by how often pad_step (the game's input sampling) ran.
+static uint64_t g_pad_polls;               // pad_step 被游戏取了几次 | how many times the game polled pad_step
+static uint64_t g_pulse_epoch_seen;        // 正在收的那个脉冲 | the pulse being withdrawn
+static uint64_t g_pulse_poll0;             // 这个脉冲落地 / 上一次收回时的采样数 | sample count when it landed / at the last withdrawal
+static double g_pulse_t0, g_pulse_seen_s, g_pulse_free_s;
+
+static void pulse_pump(dm_tc_state *s, double now) {
+    if (s->pulse_button) {
+        if (g_pulse_epoch_seen != s->pulse_epoch) {
+            g_pulse_epoch_seen = s->pulse_epoch;
+            g_pulse_poll0 = g_pad_polls; g_pulse_t0 = now; g_pulse_seen_s = g_pulse_free_s = 0;
+        }
+        if (!g_pulse_seen_s && g_pad_polls > g_pulse_poll0) g_pulse_seen_s = now;   // 游戏第一次取到 | the game polled it for the first time
+        if (g_pulse_seen_s && !g_pulse_free_s) g_pulse_free_s = now;               // 取到即送达（Windows 没有「扣着 A」那条路）| polled = delivered
+        double hold = s->pulse_hold_s;
+        int taken = g_pulse_seen_s && now - g_pulse_seen_s >= 0.12 && g_pad_polls - g_pulse_poll0 >= 3
+                    && (hold <= 0 || now - g_pulse_free_s >= hold);
+        if (taken || now - g_pulse_t0 > 2.0 + hold) {
+            if (!taken) LOG("触屏浮层：脉冲 2 秒内没被取走（取了 %llu 次），强制收回",
+                            (unsigned long long)(g_pad_polls - g_pulse_poll0));
+            else LOG("触屏浮层：脉冲收回 %#llx（取了 %llu 次，按住 %.0f ms）", (unsigned long long)s->pulse_button,
+                     (unsigned long long)(g_pad_polls - g_pulse_poll0), (now - g_pulse_t0) * 1000.0);
+            dm_tc_pulse_end(s, s->pulse_epoch);
+            g_pulse_epoch_seen = 0; g_pulse_poll0 = g_pad_polls; g_pulse_t0 = now;
+        }
+    } else if (dm_tc_pulse_pending(s)) {
+        // 排着的下一个脉冲（拖拽的「放下」比「拿起」的收回先到）：等游戏看过一次松开再起，否则两下并成一下
+        // The queued next pulse (the drag "put down" arrives before the "pick up" is withdrawn): start only after the game has seen a release once,
+        // otherwise the two presses merge into one
+        if (g_pad_polls - g_pulse_poll0 >= 2 || now - g_pulse_t0 > 0.5) {
+            if (dm_tc_pulse_resume(s)) { g_pulse_poll0 = g_pad_polls; g_pulse_t0 = now; }
+        }
+    }
+}
+
 // ---------- 取手柄那一拍：推进状态机并发布 ----------
 static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     // 手柄接管时也要照常推进 / 合并：浮层此刻是收着的，可鼠标仍然可以点它藏着的那颗钮（点下去前端会先调 dm_win_touch_screen_input 把输入源交回触屏，
@@ -130,7 +177,9 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
     // lost to it). So this no longer bails out on the input source -- only "overlay off / not in a run" stands down.
     if (!g_on || !g_in_run.load()) return;   // 浮层没开 / 不在局内：照旧让手柄与键盘的输入走 | overlay off / not in a run: leave pad and keyboard input alone
     std::lock_guard<std::mutex> lk(g_mx);
+    ++g_pad_polls;
     dm_tc_tick(&g_tc, (double)now / 1e9);
+    pulse_pump(&g_tc, (double)now / 1e9);
     // 取证：按键组合变化打一行（无桌面截屏权限时，这是「点圆钮真的变成按键」的直接证据）| evidence: log each button-set change (the direct proof
     // that tapping a round button becomes a key press when the desktop cannot be captured)
     static uint64_t last_btn;
