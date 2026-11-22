@@ -131,8 +131,16 @@ powershell -ExecutionPolicy Bypass dm\win\tools\gen_overlay_win.ps1 -RomFS C:\wo
 | `DM_WIN_TOUCH_ALWAYS=1` | 前端页面也用触屏布局（前端按钮栏还没画，会看到空菜单，仅供调试） |
 | `DM_WIN_TOUCH_DUMP=<路径带 %d>` | 每次重画把浮层自己的位图存成 32 位 BMP（第 1 次 + 每 5 次），用来验收 |
 | `DM_WIN_TOUCH_ART=<目录>` | 技能图集 PNG 目录（缺省 `touchart\TouchArt`） |
+| `DM_WIN_TOUCH_NOBIND=1` | 不挂技能绑定观测门（只画浮层、不取图标；排查掉帧用） |
+| `DM_WIN_TOUCH_NOICON=1` | 挂桥但不画技能图标（排查掉帧用） |
+| `DM_BINDING_NOOP=1` | 观测门回调立刻 return（只留门本身的开销） |
+| `DM_BINDING_THROTTLE_MS=<ms>` | 按槽位节流（缺省 0 = 不节流；15 能多约 1 帧，但身份学习会时好时坏） |
+| `DM_BINDING_DIAG=1` | 每 3 s 打调用量、各返回点计数、负缓存命中 |
+| `DM_BINDING_STAGE=1..6` | 分级早退，走到第 n 段就 return（定位是哪一段花钱） |
 
 本机桌面截屏是全黑的（`CopyFromScreen` 与 `PrintWindow` 都拿不到画面），`DM_WIN_SHOT` 走 Vulkan 读回又不含分层窗口，所以**浮层的唯一取证手段是 `DM_WIN_TOUCH_DUMP`**。看位图时注意两点：BMP 是自下而上的，PIL 读 32 位 BMP 会丢掉 alpha——按原始 BGRA 读、再翻一次行，合成到深色底就能看到透明区。
+
+**鼠标点击的归宿**：浮层开着时，按下先交给触屏状态机，只有**真正命中控件**的那一下才被浮层认领；没命中的是界面点击，走 `dm_ui_touch`（`dm/host/dm_cursor.c`，和 iOS 前端页同一条通道）——前端的主菜单 / 选角页和局内的物品栏 / 技能树 / 选项面板都靠这一条，日志是 `前端：界面点击 (%.3f,%.3f)`。
 
 键位点一下到底有没有送进游戏，看日志里的 `触屏浮层：按键 0 → 0x1`：这就是状态机发布出去的按键组合（`0x1` = A）。
 
@@ -242,6 +250,19 @@ iOS / 安卓是触屏，前端流程由宿主「替玩家按键」理顺（`dm/h
 `DM_STALL_PROBE=1`（`dm/win/stall_win.c`）是这一轮加的取栈器：每 1 ms 把出图线程 SuspendThread + GetThreadContext，一帧超过 22 ms 就把整帧的命中按次数排序打一行，符号用模块自带 symtab 反查，系统 DLL 里的地址换成 `dll+偏移`。它给出的结论是：尖峰帧里出图线程绝大部分采样都停在 `ntdll`/`KERNELBASE` 的等待上（条件变量/唤醒），而出图线程自己的栅栏与取图从未单次阻塞 ≥8 ms，GPU 7.8 ms、翻译+出图 4.5 ms 都不尖峰——所以尖峰不是呈现、GPU 或分辨率造成的，而是某条协作线程每 ~150 ms 多花 20~30 ms，把这一帧顶出了预算，多买一个垂直同步。
 
 `DM_PRESENT_LEAD_MS` 缺省已改回 0（开关保留），`DM_PRESENT_IMAGES` 缺省 3。
+
+**触屏浮层带来的一轮掉帧（已修）**：触屏浮层挂上之后，营地静置从 **56.5 掉到 31.7 帧**。逐项对照（`NVN PERF` 均值，营地静置、`-NoClick`）
+
+| 配置 | 均值 fps |
+|---|---|
+| 不挂桥（`DM_WIN_TOUCH_NOBIND=1`） | 56.6 |
+| 挂桥 + 回调立刻 return（`DM_BINDING_NOOP=1`） | 55.9 |
+| 挂桥 + 完整回调（原状） | 31.7 |
+| 只把前置筛移到取锁之前 | 41.0 |
+| 前置筛 + 栈读页缓存 + 按 fp 负缓存（现在） | **52.4** |
+| 再加 15 ms 按槽位节流（`DM_BINDING_THROTTLE_MS=15`） | 54.1（六槽身份学习会时好时坏，图标退回键位字母，故缺省关） |
+
+结论：门本身（客体 → 宿主的跳转）很便宜（`NOOP` 55.9 就证明这一点），贵的是回调体里读原版 getter 栈帧那 3 个字——原先每次调用都先 `VirtualQuery` 查一遍这段内存可读。修法是**按页缓存已验证区间**（读不出来的页也照记，客体里大半 `fp` 都指向没提交的内存）+ **按 `fp` 的负缓存**（同一 `fp` 的 `savedLR` 结构上相同，「不是 HUD updater」可以记住）。细节与开关见 `dm/win/README.zh-CN.md` 的坑 14。
 
 游戏本身按屏幕刷新（本机上报 59 Hz，日志 `[nvn] 出图节拍 59.00 Hz`）出图，所以这套配置下 60 就是上限，再高要把显示刷新报到更高档位，没有实际意义。
 

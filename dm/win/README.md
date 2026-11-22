@@ -113,6 +113,31 @@ mingw's `gdiplus/gdiplusimaging.h` uses `PROPID` without pulling in `ole2.h`, so
 **12. Skill icons: GDI+ `SetClip` does nothing on this path, so the circle is cut per pixel.**
 Each frame of the original atlas is a **square-cornered** skill tile and iOS makes it round with `CGContextAddEllipseInRect(...); CGContextClip(...)`. Porting that verbatim to GDI+ (`GraphicsPath::AddEllipse` + `SetClip(&path)` + `DrawImage`) left the tile square with every corner rivet intact — the clip simply never took effect. What works: draw the frame into a temporary `Bitmap` at the target size, `LockBits`, multiply alpha by the circle coverage (radius .82 of the button, i.e. iOS's "button rect inset by 9%"), then draw that already-clipped bitmap, cached by `(atlas, frame, width, height)`. Note also that the atlas index only builds with `clang` on PATH and an **ARM64** python (an x64 one dies with `WinError 2`); CMake raises `FATAL_ERROR` when the artefact is missing.
 
+**13. With the touch overlay on, no UI button responds: the overlay swallowed every mouse click.**
+While the overlay is active `front_win.c` fed `WM_LBUTTONDOWN/UP/MOUSEMOVE` to `dm_win_touch_pointer` first, and that function simply `return`ed (i.e. swallowed the event), so the original UI never saw a click — main-menu PLAY / OPTIONS and the in-run inventory / skill-tree / options tabs were all dead. Now in two steps:
+- `dm_win_touch_pointer` returns **int**: on a press it only claims the event when a control is really hit (`finger[slot].target != DM_TC_NONE || pointer_slot == slot || joy_slot == slot`), otherwise it calls `dm_tc_cancel_finger` and returns 0; move/release use a `g_claim[]` table to remember ownership and return 0 when unowned (a lost release leaves a finger stuck down).
+- A press the overlay did not claim is a **UI click** routed through `dm_ui_touch` (`dm/host/dm_cursor.c`, the same channel iOS front-end pages use) — for **both front-end pages and in-run panels**: the inventory / skill-tree / options panels are original UI on the same channel (verified: tapping the skill-tree tab switches pages). Log line: `前端：界面点击 (%.3f,%.3f)`.
+
+**14. 60 fps at boot, 30 fps once in a run: the cost sits in the skill-binding observation gate.**
+`binding_getter` in `dm_touch_game_bridge.c` is the observation gate patched onto the original getter; on Windows the game calls it **3-6k times a second**, each call leaving the guest for a host function. Measured in camp, idle, `-NoClick`, `NVN PERF` average:
+
+| configuration | mean fps |
+|---|---|
+| bridge not attached (`DM_WIN_TOUCH_NOBIND=1`) | 56.6 |
+| attached, callback returns immediately (`DM_BINDING_NOOP=1`) | 55.9 |
+| attached, full callback (original) | 31.7 |
+| pre-filter moved ahead of the lock only | 41.0 |
+| pre-filter + stack-read page cache + per-fp negative cache (current) | **52.4** |
+| plus a 15 ms per-slot throttle (`DM_BINDING_THROTTLE_MS=15`) | 54.1 (icon learning turns flaky, so it is off by default) |
+
+The `NOOP` row shows the gate itself is cheap; the cost is the stack read inside the callback, which fetches the three words the original getter's prologue has just written (`fp-8`/`fp`/`fp+8`) and used to run a `VirtualQuery` on **every** call to check that the span is committed and readable (`dm_tg_vm_read` in `dm_touch_game_identity.c`). Two caches now:
+- a **page cache** of validated spans (`{page,end,ok,seen}`, 4096 entries, 200 ms expiry); unreadable pages are remembered too, since in the guest most `fp` values point at uncommitted or guarded memory and re-checking that batch would save nothing;
+- a **negative cache keyed on `fp`**: the same `fp` holds the same `savedLR`, so "this frame is not the HUD updater" is a structural verdict and can be remembered without reading the stack at all;
+- the `regs[23] != regs[19]` pre-filter moved ahead of `pthread_mutex_lock` (it used to run after it);
+- debug switches: `DM_BINDING_STAGE=1..6` (return at stage n, to find which stage costs), `DM_BINDING_DIAG=1` (per-3 s call and per-return-point counters plus negative-cache hits).
+
+**Note**: `regs[30]` cannot be used as "the return address" — the gate stub has already rewritten it, and filtering on it drops every call (tried, `成功 0`).
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.

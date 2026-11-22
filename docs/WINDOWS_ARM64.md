@@ -227,6 +227,19 @@ The real cause is **Windows' timer granularity**: the default is 15.6 ms, and ev
 
 The game presents at the screen refresh (this machine reports 59 Hz; the log says `[nvn] 出图节拍 59.00 Hz`), so 60 is the ceiling for this configuration; going higher would mean reporting a higher refresh, which has no real benefit.
 
+**The frame loss the touch overlay caused (fixed)**: with the overlay attached, idle camp dropped from **56.5 to 31.7 fps**. Measured per configuration (`NVN PERF` mean, idle camp, `-NoClick`):
+
+| configuration | mean fps |
+|---|---|
+| bridge not attached (`DM_WIN_TOUCH_NOBIND=1`) | 56.6 |
+| attached, callback returns immediately (`DM_BINDING_NOOP=1`) | 55.9 |
+| attached, full callback (original) | 31.7 |
+| pre-filter moved ahead of the lock only | 41.0 |
+| pre-filter + stack-read page cache + per-fp negative cache (current) | **52.4** |
+| plus a 15 ms per-slot throttle (`DM_BINDING_THROTTLE_MS=15`) | 54.1 (six-slot identity learning turns flaky and the icons fall back to key letters, so it is off by default) |
+
+The gate itself (the guest → host jump) is cheap — the `NOOP` row proves it. The cost is the three words of the original getter's stack frame, which used to be preceded by a `VirtualQuery` on **every** call. The fix is a **page cache of validated spans** (unreadable pages are remembered too, since most `fp` values in the guest point at uncommitted memory) plus a **negative cache keyed on `fp`** (the `savedLR` stored at the same `fp` is structurally the same, so "not the HUD updater" can be remembered). Details and switches are in pitfall 14 of `dm/win/README.md`.
+
 Room left (not done, lowest risk first):
 
 1. The tail spikes are not fully identified: the `[长帧]` detail shows "new pipelines 0 / texture uploads 0", so the spikes are neither compilation nor upload but guest-side work inside the frame; `DM_3D_SCALE=0.5` and `DM_PRESENT_MODE=immediate` both leave the frame rate unchanged, so it is neither GPU-bound nor vsync-quantized.

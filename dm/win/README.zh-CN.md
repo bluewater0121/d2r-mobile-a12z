@@ -114,6 +114,31 @@ mingw 的 `gdiplus/gdiplusimaging.h` 用了 `PROPID` 却没带 `ole2.h`，所以
 **12. 技能图标：GDI+ 的 `SetClip` 在这条路径上不生效，得自己按像素裁圆。**
 原版图集每格是一块**方角**技能牌，iOS 靠 `CGContextAddEllipseInRect(...); CGContextClip(...)` 把它裁成圆的。照搬到 GDI+（`GraphicsPath::AddEllipse` + `SetClip(&path)` + `DrawImage`）之后，图还是方的、四角铆钉一个不少——裁切完全没起作用。现在做法是：先把这一格按目标尺寸画进一张临时 `Bitmap`，`LockBits` 后逐像素按圆半径（按钮的 .82，即 iOS 的「外接矩形内缩 9%」）乘 alpha，再画这张已经裁好的图，按 `(图集, 帧, 宽, 高)` 缓存。另外图集索引要 `clang` 在 PATH + **ARM64 的 python** 才能生成（x64 python 起子进程直接 `WinError 2`），缺产物 CMake 会 `FATAL_ERROR`。
 
+**13. 触屏浮层一开，界面按钮全点不动：鼠标点击被浮层「吞掉」了。**
+浮层开着时 `front_win.c` 把 `WM_LBUTTONDOWN/UP/MOUSEMOVE` 一律先喂给 `dm_win_touch_pointer`，而它当时无条件 `return`（等于吞掉），于是原版 UI 收不到任何点击——主菜单「进入游戏 / 选项」、局内的物品栏 / 技能树 / 选项这些页签全部失灵。现在分两步：
+- `dm_win_touch_pointer` 改成**返回 int**：按下时只有真命中控件（`finger[slot].target != DM_TC_NONE || pointer_slot == slot || joy_slot == slot`）才算它处理，否则 `dm_tc_cancel_finger` 并返回 0；移动 / 抬起靠 `g_claim[]` 记住归属，未归属也返回 0（漏掉抬起会留下「一直按着」的手指）。
+- 没被浮层认领的点击 = **界面点击**，走 `dm_ui_touch`（`dm/host/dm_cursor.c`，和 iOS 前端页同一条通道），**前端页和局内面板都走这条**：局内的物品栏 / 技能树 / 选项也是原版 UI，同样靠它按得动（实测「技能树」页签能切过去）。日志是 `前端：界面点击 (%.3f,%.3f)`。
+
+**14. 开局 60 帧、进局掉到 30 帧：开销全在技能绑定的观测门回调里。**
+`dm_touch_game_bridge.c` 的 `binding_getter` 是打在原版 getter 上的观测门回调，Windows 上被游戏叫到 **3~6 千次/秒**，每次都要离开客体进宿主函数。逐项对照（营地静置、`-NoClick`、`NVN PERF` 均值）：
+
+| 配置 | 均值 fps |
+|---|---|
+| 不挂桥（`DM_WIN_TOUCH_NOBIND=1`） | 56.6 |
+| 挂桥 + 回调立刻 return（`DM_BINDING_NOOP=1`） | 55.9 |
+| 挂桥 + 完整回调（原状） | 31.7 |
+| 只加「前置筛前移」 | 41.0 |
+| 前置筛 + 栈读页缓存 + 按 fp 负缓存（现在） | **52.4** |
+| 再加 15 ms 按槽位节流（`DM_BINDING_THROTTLE_MS=15`） | 54.1（但图标会时好时坏，故缺省关） |
+
+`NOOP` 那条证明门本身很便宜，贵的是回调体里的栈读：它要读原版 getter 序言刚写下的 3 个字（`fp-8`/`fp`/`fp+8`），原先**每次**都先 `VirtualQuery` 查这段是不是已提交可读（`dm_touch_game_identity.c` 的 `dm_tg_vm_read`）。现在两处缓存：
+- **按页缓存**已验证区间（`{page,end,ok,seen}`，4096 项，200 ms 过期）；读不出来的页也照记——客体里大半 `fp` 都指向没提交 / 带守卫的内存，那批要是每次重查等于没省。
+- 按 `fp` 的**负缓存**：同一个 `fp` 存着的 `savedLR` 也是同一个，所以「这一帧不是 HUD updater」是结构性结论，记下来连栈都不用读。
+- 前置筛 `regs[23] != regs[19]` 移到取锁之前（它原先在 `pthread_mutex_lock` 之后）。
+- 排查开关：`DM_BINDING_STAGE=1..6`（走到第 n 段就 return，用来定位是哪一段花钱）、`DM_BINDING_DIAG=1`（每 3 s 打调用 / 各返回点计数 / 负缓存命中）。
+
+**注意**：`regs[30]` 不能当「返回地址」用——进了回调它已经被门桩改写，拿它做筛会把所有调用筛光（试过，`成功 0`）。
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。
