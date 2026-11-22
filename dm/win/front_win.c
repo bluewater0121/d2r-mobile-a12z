@@ -14,6 +14,7 @@
 #include "../host/dm_input.h"
 #include "../host/dm_uiscreen.h"
 #include "vulkan_present_win.h"
+#include "sched_win.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -183,6 +184,10 @@ static int create_window(void) {
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof wc; wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC; wc.lpfnWndProc = wnd_proc;
     wc.hInstance = hi; wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW); wc.hbrBackground = NULL;
+    // 图标来自 dmhost.rc（1 号图标组，tools/make_ico.py 从 iOS 的 AppIcon 生成）：标题栏取小图、Alt+Tab 取大图
+    // Icons come from dmhost.rc (icon group 1, tools/make_ico.py from the iOS AppIcon): small one in the title bar, large one in Alt+Tab
+    wc.hIcon = LoadIconA(hi, MAKEINTRESOURCEA(1));
+    wc.hIconSm = LoadIconA(hi, MAKEINTRESOURCEA(1));
     wc.lpszClassName = "dmhost_win";
     if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return -1;
     int cw, ch; client_size(&cw, &ch);
@@ -193,6 +198,10 @@ static int create_window(void) {
     g_hwnd = CreateWindowExA(0, wc.lpszClassName, "D2R Mobile（Windows ARM64）", WS_OVERLAPPEDWINDOW,
                              wx, wy, ww, wh, NULL, NULL, hi, NULL);
     if (!g_hwnd) return -1;
+    // 类图标只管标题栏，任务栏 / Alt+Tab 用窗口图标：两处都显式再设一次（窗口图标优先于类图标）
+    // The class icon covers the title bar; the taskbar and Alt+Tab use the window icon: set both explicitly (the window icon wins over the class icon)
+    SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)LoadIconA(hi, MAKEINTRESOURCEA(1)));
+    SendMessageA(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)LoadIconA(hi, MAKEINTRESOURCEA(1)));
     ShowWindow(g_hwnd, SW_SHOW); UpdateWindow(g_hwnd); SetForegroundWindow(g_hwnd); SetFocus(g_hwnd);
     SetTimer(g_hwnd, 2, 1000, NULL);   // 标题栏每秒刷一次分辨率与帧率 | refresh resolution and frame rate in the title bar once a second
     update_title();
@@ -203,6 +212,9 @@ static int create_window(void) {
 static void *guest_main_tramp(void *p) {
     (void)p;
     atomic_store(&g_guest_running, 1);
+    // 客体主线程就是提交与出图那条线程（长帧都落在它身上），MMCSS 必须在它自己的上下文里注册
+    // The guest main thread is the one that submits and presents (all long frames land there), so MMCSS has to be registered in its own context
+    dm_win_sched_thread("客体主线程");
     { void dm_stall_probe_begin(void); dm_stall_probe_begin(); }   // DM_STALL_PROBE：在这条客体主线程上起 PC 采样 | DM_STALL_PROBE: start PC sampling on this guest main thread
     g_guest();
     atomic_store(&g_guest_running, 0);
@@ -358,6 +370,12 @@ static void tuning_defaults(void) {
     // "A jumps between the two screens"). Keyboard / controller can walk the original menu by themselves, so turn it off here:
     // boot stays on the main menu, A = Enter Game -> character select page, and A on the character select page = start the game
     env_default("DM_FE_AUTO", "0");
+    // 桌面形态：布局按 Mac App 那套走原版手柄版（DM_APP），不切触屏版。触屏版有整套宿主自画的圆钮 / 底栏 / 按钮栏，Windows 没有那一层绘制；
+    // 界面覆盖层里触屏版布局把这些控件整排挪到屏幕外，一旦切过去主菜单就只剩背景、键盘按 A 不响应（实测）
+    // Desktop form: use the original controller layouts the way the Mac App does (DM_APP) and never switch to the touch layouts. The touch version has a whole host-drawn
+    // layer of round buttons / bottom bar / button ribbon that Windows does not draw, and the UI overlay's touch layouts move those widgets off screen as a block: switching
+    // there leaves the main menu as bare background and the keyboard's A does nothing (measured)
+    env_default("DM_APP", "1");
 }
 
 // ---------- 计时器精度 ----------
@@ -410,6 +428,7 @@ void front_run(void (*guest)(void)) {
     if (nowin && *nowin == '0') { guest(); return; }
     raise_timer_resolution();
     tuning_defaults();
+    dm_win_sched_init();
     if (create_window()) { fprintf(stderr, "[dm] 建窗口失败 errno=%d\n", errno); guest(); return; }
     char err[512] = "";
     if (dm_win_vk_initialize(4096, err, sizeof err)) {

@@ -89,6 +89,7 @@ set(WIN_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/front_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/pad_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/stall_win.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/sched_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_win.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/tls_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/misc_win.c
@@ -131,3 +132,17 @@ foreach(dll libwinpthread-1.dll libc++.dll libunwind.dll)
     add_custom_command(TARGET dmhost POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DM_MINGW_BIN}/${dll} $<TARGET_FILE_DIR:dmhost>)
   endif()
 endforeach()
+
+# 资源：图标 + 版本信息。windres 编出 COFF 目标文件，直接并进链接（EXTERNAL_OBJECT：CMake 别当源码去编）。
+# 图标 dmhost.ico 由 tools/make_ico.py 从 iOS 的 AppIcon 生成，与安卓 / iOS / 鸿蒙同一套 App 图标。
+# Resources: icon + version info. windres produces a COFF object that goes straight into the link
+# (EXTERNAL_OBJECT keeps CMake from trying to compile it as source). dmhost.ico comes from tools/make_ico.py,
+# generated from the iOS AppIcon, the same app icon Android / iOS / HarmonyOS use.
+get_filename_component(DM_MINGW_ROOT ${DM_MINGW_BIN} DIRECTORY)
+set(DM_RC_OBJ ${CMAKE_CURRENT_BINARY_DIR}/dmhost_res.o)
+add_custom_command(OUTPUT ${DM_RC_OBJ}
+  COMMAND ${DM_MINGW_BIN}/aarch64-w64-mingw32-windres.exe -I ${DM_MINGW_ROOT}/include
+          -i ${CMAKE_CURRENT_SOURCE_DIR}/dmhost.rc -o ${DM_RC_OBJ} --output-format=coff
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/dmhost.rc ${CMAKE_CURRENT_SOURCE_DIR}/dmhost.ico VERBATIM)
+set_source_files_properties(${DM_RC_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(dmhost PRIVATE ${DM_RC_OBJ})

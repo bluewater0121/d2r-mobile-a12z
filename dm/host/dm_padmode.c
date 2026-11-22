@@ -58,6 +58,7 @@ static const struct { uint32_t off; const char *pad, *touch; } k_pfx[] = {
 };
 enum { BOUNCE_FRAMES = 60 };   // 测试开关读串的等待帧数（切换本身不数帧，见 dm_modetx.h） | Number of frames to wait when the test switch reads its sequence (the switch itself does not count frames, see dm_modetx.h)
 static int g_have;                  // 有触屏覆盖层、前缀可改 | A touch overlay is present and the prefixes can be rewritten
+static int g_lock;                  // 布局锁在手柄版（Mac App / Windows 桌面，见 dm_padmode_request）| Layout locked to the controller version (Mac App / Windows desktop, see dm_padmode_request)
 static _Atomic int g_want = -1;     // 前端要的模式：0 触屏 1 手柄（-1 没要求） | Mode requested by the front end: 0 touch, 1 controller (-1 no request)
 static int g_cur;                   // 当前前缀所指：0 触屏 1 手柄 | What the prefixes currently point to: 0 touch, 1 controller
 static dm_modetx g_tx;              // 切换事务（dm_modetx.h）；游戏主线程 | Switch transaction (dm_modetx.h); game main thread
@@ -166,12 +167,18 @@ void dm_padmode_boot(void) {   // 开机：游戏建面板之前（main.c，nnMa
     g_glyph = g_glyph_next = g_glyph_have[DM_GLYPH_KBD] ? DM_GLYPH_KBD : DM_GLYPH_PAD; atomic_store(&g_glyph_want, g_glyph);   // Mac App 开机先用键盘键帽（多数人没接手柄）；实体手柄一有输入就按它的类型换 | The Mac App starts with keyboard glyphs (most people have no controller connected); as soon as a physical controller gives input, switch by its type
     g_glyph_have[DM_GLYPH_PS] = dm_overlay_file(k_glyph_mark[DM_GLYPH_PS], mk, sizeof mk);
     LOG("手柄 / 触屏布局：键帽 键盘 %d、Xbox %d、PlayStation %d", g_glyph_have[DM_GLYPH_KBD], g_glyph_have[DM_GLYPH_XBOX], g_glyph_have[DM_GLYPH_PS]);
-    if (pfx_write((uint8_t *)m->base, pad)) { g_have = 1; g_cur = pad; atomic_store(&g_want, pad); g_b = (uint8_t *)m->base; str_load(); LOG("手柄 / 触屏布局：开机用%s", pad ? "原版手柄版（Mac App）" : "触屏版（layouts/xtouch_lay 等三个目录）"); }
+    if (pfx_write((uint8_t *)m->base, pad)) { g_have = 1; g_cur = pad; g_lock = pad; atomic_store(&g_want, pad); g_b = (uint8_t *)m->base; str_load(); LOG("手柄 / 触屏布局：开机用%s", pad ? "原版手柄版（Mac App）" : "触屏版（layouts/xtouch_lay 等三个目录）"); }
 }
 void dm_padmode_request(int pad) { pad = pad ? 1 : 0;
 #if TARGET_OS_OSX
     if (g_app) pad = 1;   // Mac App 没有触屏圆钮与底栏的绘制层：手柄断开也留在手柄版，不切触屏版 | the Mac App has no drawing layer for the touch round buttons and bottom bar: stay in the gamepad layout even when the gamepad disconnects, do not switch to the touch layout
 #endif
+    // 布局锁在手柄版（DM_APP，Mac App 与 Windows 桌面都设）：触屏版布局把前端的按钮栏与键位提示整排挪到屏幕外、由宿主的触屏层另画，
+    // 桌面形态没有那一层，一切到触屏版主菜单就只剩背景（实测：覆盖层 + 键盘就是「主菜单空屏、按 A 不响应」）
+    // The layout is locked to the controller version (DM_APP, set by the Mac App and by the Windows desktop build): the touch layouts move the front end's button ribbon and
+    // key hints off screen as a block and the host's touch layer draws them instead; a desktop build has no such layer, so switching to the touch layouts leaves the main menu
+    // as bare background (measured: overlay + keyboard = an empty main menu that ignores A)
+    if (g_lock) pad = 1;
     atomic_store(&g_want, pad); if (g_have && pad != g_cur) atomic_store(&g_freeze, 1); }   // 前端（任意线程）：从这一刻起输入就不再交给游戏 | Front end (any thread): from this moment on input is no longer handed to the game
 int dm_padmode_current(void) { return g_cur; }
 int dm_padmode_busy(void) { return atomic_load(&g_freeze); }   // 切换事务进行中（含请求已到、事务还没起的那一小段） | Switch transaction in progress (including the short span where the request has arrived but the transaction has not started yet)

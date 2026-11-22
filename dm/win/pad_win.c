@@ -75,6 +75,11 @@ static int stick_on(int was, int32_t x, int32_t y) {
 
 static void set_mode(int pad) {
     if (g_mode == pad) return;
+    // 桌面形态（DM_APP，见 front_win.c 的 tuning_defaults）：布局锁在手柄版，碰画面 / 敲键盘不切触屏版——
+    // 触屏版布局把前端按钮栏整排挪到屏幕外、由触屏层另画，Windows 没有那一层，切过去主菜单就只剩背景
+    // Desktop form (DM_APP, see tuning_defaults in front_win.c): the layout is locked to the controller version, so touching the picture / typing does not switch to the touch
+    // version -- the touch layouts move the front-end button ribbon off screen and the touch layer draws it instead, which Windows does not have, so the main menu would be bare background
+    if (!pad && getenv("DM_APP")) { g_need_center = 1; return; }
     g_mode = pad;
     dm_padmode_request(pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | host dm_padmode.c: switch to the original controller / touch layout
     LOG("手柄：%s", pad ? "有明确输入 → 手柄布局" : "碰了画面 / 敲键盘 → 触屏布局");

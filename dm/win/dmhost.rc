@@ -1,0 +1,39 @@
+// dmhost.exe 的资源：图标 + 版本信息。图标由 dm/win/tools/make_ico.py 从 iOS 的 AppIcon 生成（各平台同一套）。
+// 编译：aarch64-w64-mingw32-windres -I <工具链>/include -i dmhost.rc -o dmhost_res.o --output-format=coff（见 CMakeLists.txt）
+// Resources for dmhost.exe: icon + version info. The icon is produced by dm/win/tools/make_ico.py from the iOS AppIcon
+// (one icon set for every platform).
+// Compile: aarch64-w64-mingw32-windres -I <toolchain>/include -i dmhost.rc -o dmhost_res.o --output-format=coff (see CMakeLists.txt)
+#pragma code_page(65001)
+#include <windows.h>
+
+// 图标组：任务栏 / 标题栏 / 资源管理器都取这一组（多尺寸在 .ico 里，系统按 DPI 自己挑）
+// Icon group: taskbar / title bar / Explorer all use this one (the sizes live in the .ico; Windows picks by DPI)
+1 ICON "dmhost.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x4L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "d2r-mobile"
+            VALUE "FileDescription", "D2R Mobile (Windows ARM64)"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "dmhost"
+            VALUE "OriginalFilename", "dmhost.exe"
+            VALUE "ProductName", "D2R Mobile"
+            VALUE "ProductVersion", "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
