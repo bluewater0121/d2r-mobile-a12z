@@ -54,14 +54,24 @@ static _Atomic uint64_t g_press_latch;
 // Controller (dm_input.h dm_pad_set): buttons and the four axes are packed into two atomics, and press edges are likewise latched until the game's next
 // read (short controller presses are not lost)
 static _Atomic uint64_t g_pad_btn, g_pad_axes, g_pad_latch;
+// 临时取证开关 DM_HID_LOG=1：两份通道的按键变化各打一行（带调用者地址），用来抓「谁在开机时按了 A」
+// Temporary probe switch DM_HID_LOG=1: print one line per button change on both channels with the caller address, to catch "who pressed A at boot"
+static int g_hid_log = -1;
+static void hid_trace(const char *ch, uint64_t now, uint64_t old) {
+    if (g_hid_log < 0) { const char *e = getenv("DM_HID_LOG"); g_hid_log = e && *e == '1'; }
+    if (!g_hid_log || now == old) return;
+    LOG("HID [%s] %#llx → %#llx（调用者 %p <- %p <- %p）", ch, (unsigned long long)old, (unsigned long long)now,
+        __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2));
+}
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
-    uint64_t old = atomic_exchange(&g_pad_btn, buttons); atomic_fetch_or(&g_pad_latch, buttons & ~old);
+    uint64_t old = atomic_exchange(&g_pad_btn, buttons); atomic_fetch_or(&g_pad_latch, buttons & ~old); hid_trace("pad", buttons, old);
     atomic_store(&g_pad_axes, (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48);
 }
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     if (g_stall_ms < 0) { const char *e = getenv("DM_TEST_HID_STALL_MS"); g_stall_ms = e ? atoi(e) : 0; if (g_stall_ms) LOG("DM_TEST_HID_STALL_MS：A 每次按下沿后游戏取手柄先睡 %d ms", g_stall_ms); }
     if (g_stall_ms > 0 && (buttons & DM_BTN_A) && !(g_in.buttons & DM_BTN_A)) atomic_store(&g_stall_due, 1);
     atomic_fetch_or(&g_press_latch, buttons & ~g_in.buttons);   // 新按下的键记下来，保证游戏至少取到一次（见 fill） | record newly pressed keys, guaranteeing the game reads them at least once (see fill)
+    hid_trace("host", buttons, g_in.buttons);
     g_in.buttons = buttons; g_in.lx = lx; g_in.ly = ly; g_in.rx = rx; g_in.ry = ry;
 }
 // 测试开关 DM_UI_TAPS="帧:x,y[:动作];…"（x / y = 画面千分比）。动作缺省 = 点一下（走 dm_ui_touch：按下、隔 6 帧抬起）；其余走 dm_ui_ptr（探查 / 界面用例用）：
