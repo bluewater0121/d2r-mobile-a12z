@@ -84,6 +84,12 @@ XInput 一律按键帽位置报告（下 = A、右 = B、左 = X、上 = Y），
 **3. Windows 的定时器粒度是 15.6 ms，客体的每一次超时都被按它取整。**
 帧时间中位数明明 13~15 ms，均值却只有 50 出头、`p95` 37 ms：`[长帧]` 明细里既没有新建管线也没有上传贴图，尖峰整块多出的正好是 15~16 ms，也就是一个系统定时器粒度——`pthread_cond_timedwait` / `nanosleep` 的超时全被它取整。安卓 / iOS 的定时器是 µs 级，所以手机上没这个坑。`front_run()` 里调 `raise_timer_resolution()`：先 `NtSetTimerResolution(5000, ...)` 要 0.5 ms（日志 `计时器精度：请求 0.5 ms，系统给的是 0.50 ms`），失败再退 winmm 的 `timeBeginPeriod(1)`。营地因此从 50 出头到 **55~60 帧**，`掉帧` 从 86/300 降到 51/300。
 
+**4. 触屏那套「替玩家按键」的前端流程会把键盘 / 手柄玩家卡在选角页。**
+`dm/host/dm_cursor.c` 的「前端路径理顺」是给 iOS / 安卓定的：有存档就在主菜单替按 X 开选角页（开机第一屏成了人物列表）、列表一收起又替按 X 重开（选了角色后又被重开，按一次 A 进不去）。键盘自带原版流程，`tuning_defaults()` 因此把 `DM_FE_AUTO` 设成 `0`：开机停在主菜单，A 进选角页，再按 A 开始游戏。
+
+**5. 少了运行库 dll，`dmhost.exe` 会以 `0xC0000135` 秒退、日志一个字都没有。**
+`CMakeLists.txt` 用 `-static` 静态链 libc++ / libunwind，只有 `libwinpthread-1.dll` 还是导入项，构建完由 POST_BUILD 从工具链的 `bin` 拷到 exe 旁边。双击 `start-win-arm64.bat` 时 PATH 里没有工具链目录，少了这份 dll 就静默退出（当时误以为是新代码崩了）。
+
 ## 排障
 
 - 崩溃看 `dm/host/crash.c` 的 `FAULT` 行（`pcmod=` 会给客体模块归属）；`DM_VEH_LOG=1` / `DM_VEH_TRACE=1` 才打 VEH 阶段标记，平时不打（缺页每帧几十次会把 stderr 冲烂）。

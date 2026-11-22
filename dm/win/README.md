@@ -84,6 +84,12 @@ The two steps from there to 50-55 fps live in `tuning_defaults()` in `front_win.
 **3. Windows' timer granularity is 15.6 ms, and every guest timeout is rounded up to it.**
 The median frame time was 13-15 ms but the average stayed in the low 50s with `p95` at 37 ms: the `[长帧]` entries showed no new pipelines and no texture uploads, and the extra block on each spike was 15-16 ms — exactly one system timer quantum, which every `pthread_cond_timedwait` / `nanosleep` timeout is rounded to. Android / iOS timers are microsecond-grade, so phones never saw it. `raise_timer_resolution()`, called from `front_run()`, asks `NtSetTimerResolution(5000, ...)` for 0.5 ms (the log prints `计时器精度：请求 0.5 ms，系统给的是 0.50 ms`), falling back to winmm's `timeBeginPeriod(1)`. The camp went from the low 50s to **55-60 fps**, and `掉帧` from 86/300 down to 51/300.
 
+**4. The touch "press keys for the player" front-end flow traps keyboard / controller players on the character select page.**
+The "front-end path straightening" in `dm/host/dm_cursor.c` is written for iOS / Android: with a save it presses X on the main menu to open the character select page (so the first screen became the character list) and presses X again whenever the list collapses (so after picking a character the list was reopened and one A press could not get in). A keyboard walks the original flow by itself, so `tuning_defaults()` sets `DM_FE_AUTO` to `0`: boot on the main menu, A opens the character select page, another A starts the game.
+
+**5. Without the runtime dll, `dmhost.exe` exits at once with `0xC0000135` and writes nothing to the log.**
+`CMakeLists.txt` links libc++ / libunwind statically (`-static`); only `libwinpthread-1.dll` remains an import, and a POST_BUILD step copies it from the toolchain's `bin` next to the exe. A double-clicked `start-win-arm64.bat` has no toolchain directory on PATH, so without that copy the process exits silently (which looked like a crash in the new code at first).
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.

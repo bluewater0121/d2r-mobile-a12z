@@ -109,6 +109,18 @@ An XInput pad (Xbox pads, and third-party pads in XInput mode on PC) works right
 
 Face buttons default to positions (bottom = A confirm, right = B back, left = Y, top = X), the same as the PC / Xbox version; for pads that report by Switch letters (or players used to "right A confirms"), `DM_PAD_AB=switch` swaps only A/B. Details and how to check it without hardware are in [../dm/win/README.md](../dm/win/README.md) under "Controllers".
 
+### Front end: booting on the main menu
+
+iOS / Android are touchscreens, so the host "presses keys on the player's behalf" to straighten the front-end flow (the "front-end path straightening" in `dm/host/dm_cursor.c`): with a save it presses X on the main menu to open the character select page, and presses X again as soon as the list collapses. A keyboard or controller can walk the original menu by itself and those presses fight the player: the first screen became the character list, and after pressing A to pick a character the list was reopened for the player so a second press was needed to get in.
+
+So on Windows `tuning_defaults()` sets `DM_FE_AUTO` to `0` and the original flow is used: **main menu on boot → A opens the character select page → A starts the game**, exactly as on the original Switch. Set `DM_FE_AUTO=1` to get the touch behaviour back (e.g. once a real touchscreen is wired up).
+
+### Saves: the game is asked to save before the window closes
+
+The game's own autosave runs about once every 5 minutes, so closing the window straight away throws away everything since the last one. On close (the × button, Alt+F4, `taskkill /im dmhost.exe`) the front end does what the Mac shell's `app_quit` does: `dm_save_wait(3, …)` asks the game for one of its own saves and waits for the `存档提交 #N … 原子换入` commit to land before shutting down, logging `窗口：退出前等游戏存盘 388 ms，期间存档提交 2 次`; if nothing commits within 3 seconds it logs `【红】窗口：未存盘退出` as is.
+
+`start-win-arm64.bat` closes an old instance politely first (WM_CLOSE) and waits up to 8 seconds before falling back to `taskkill /f`.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -119,12 +131,14 @@ Face buttons default to positions (bottom = A confirm, right = B back, left = Y,
 | `DM_TACT_PREFETCH=0` | turn tactical prefetch off (recommended on Windows) |
 | `DM_KBD=<text>` | the `swkbd` naming panel returns this text directly, skipping the host input box |
 | `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<s>` | controllers off / Switch face-button semantics / controller log / one injected A press to check the path |
+| `DM_FE_AUTO=0` | turn the touch-only "press keys for the player" front-end flow off (the Windows default: boot stays on the main menu) |
 | `DM_WIN_SHOT=<first>[+<step>]:<path template>` | read back the picture right before presentation into a 32-bit BMP, e.g. `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=WxH` | window client size (default 1600x900, capped at 90% of the work area) |
 | `DM_GAME_RES=WxH` | game render resolution (default 1600x900, the original 16:9 docked size) |
 | `DM_GFX_FENCE_SPIN=0` | go back to the blocking fence wait (spin is on by default, see below) |
 | `DM_PRESENT_MODE=fifo\|relaxed\|mailbox\|immediate` | present mode (default `relaxed`, see "Performance"; `fifo` is strict vsync) |
 | `DM_GFX_PERF_SAMPLE=1` | turn the per-part frame timing back on (off by default; it costs 1-2 fps) |
+| `DM_HID_LOG=1` | log every button change on both input channels (host keyboard `dm_input_set` / controller `dm_pad_set`) with the caller address |
 | `DM_GFX_FENCE_LOG=1` | log `wait_ms` / `since_submit_ms` for every fence wait |
 | `DM_NVN_LOG` / `DM_FS` / `DM_IMPORTS` / `DM_FAULT_LOG` / `DM_VEH_LOG` / `DM_VEH_TRACE` | diagnostics |
 
