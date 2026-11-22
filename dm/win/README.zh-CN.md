@@ -257,6 +257,32 @@ z 序里 `hWndInsertAfter = g_game` 是**放到它后面**（below），所以�
 
 改法：`paint()` 里分两条路给 `pptDst`——`g_child` 时给 `(g_vx, g_vy)`（父客户区坐标），顶层弹窗时才 `ClientToScreen(g_game) + 视图偏移`。贴图成功后顺手打一行 `屏幕矩形`，实测子窗口落在 `480,254`（= 游戏客户区原点），`tap-seq` 十下点击目标全对。
 
+**23. 「按住方向键的同时按技能键没反应」——前端窗口原先根本没有触屏处理，只有一个鼠标。**
+`front_win.c` 的 `wnd_proc` 里只有 `WM_MOUSEMOVE / WM_LBUTTONDOWN / WM_LBUTTONUP`。Windows 默认只把**第一根**手指合成成鼠标，第二根落下来时系统既不给第二条鼠标消息、也不给任何触点消息，于是「摇杆那根按住时再点技能」这条路上第二根手指直接不存在。浮层这边（`dm_win_touch_pointer` 的 `slot`、`g_claim[]`）本来就是一槽一根手指，缺的只是多点入口。
+
+改法：
+
+- `create_window` 里 `RegisterTouchWindow(g_hwnd, 0)`，日志 `输入：触屏消息注册 成功（可多点）`；
+- 新增 `WM_TOUCH` 分支：`GetTouchInputInfo` 取触点数组（`TOUCHINPUT.x/y` 是 1/100 像素的屏幕坐标，`/100` 后 `ScreenToClient` → `mouse_to_pic`），逐根处理；
+- 触点表 `g_tu[16]`（`id / slot / claim / front / nx,ny`），`tu_find` / `tu_alloc`：`slot` 就是浮层那根手指的槽位，`claim` = 归浮层、`front` = 前端页面、都不占 = 游戏触点；
+- **关键一点**：喂给游戏的那一份手指表必须**一次提交全部手指**（`touch_publish()` 里凑齐再 `dm_touch_set(t, n)`）。原先 `set_finger` 是一根一根覆盖写，按住摇杆那根会被后按下去的那根冲掉，即使多点消息进来了也一样没方向；
+- `WM_KILLFOCUS` 里把 `g_tu[]` 一起清掉（否则还原后按着的那根没人收）。
+
+**取证的坑：本机是远程桌面会话，系统级触摸注入不可用。** 写了 `dm/win/tools/touch2_win.py`（`InitializeTouchInjection` + `InjectTouchInput`）想造两根手指，`InitializeTouchInjection` 返回成功、`InjectTouchInput` 无论怎么填（只剩 `DOWN|INRANGE|INCONTACT|PRIMARY` 一个字段集合）都恒返回 **`ERROR_INVALID_PARAMETER (87)`**；`touch_min.py` 逐步削减字段逐条试也全是 87。这台机器 `whoami /groups` 里有 `BUILTIN\Remote Desktop Users` + `NTLM Authentication`，是 RDP 会话——注入需要真正接了数字化仪的本地输入桌面，所以这条路在本机不可用（不是结构体写错：`POINTER_INFO` 96 / `POINTER_TOUCH_INFO` 144 字节都和 x64 的 ABI 对得上）。真机（本地控制台会话）上 `touch2_win.py` 仍可直接用。
+
+因此补了一个**进程内的触摸模拟**：`DM_TOUCH_SIM="秒@相位:x,y[:x,y]|秒@相位:…"`（相位 0=按下 1=移动 2=抬起，段之间用 `|` 分隔——用 `;` 会被 `touch-probe.ps1` 的 `-Extra` 拆成两个环境变量），在 `touch_win.cpp` 的 tick 里按脚本造 `TOUCHINPUT`，走 `front_win.c` 的 `touch_dispatch()`——和 `WM_TOUCH` 完全同一条分发路径。摇杆是「浮动底盘」（圆心 = 落点），所以脚本要先用 0 相位把手指按在底盘上、再用 1 相位拖出去，才看得到方向。
+
+实测（`DM_TOUCH_SIM="58@0:264,612:1221,547|58.3@1:170,430:1221,547|58.6@1:150,400:1221,547|60@2:264,612:1221,547"`，两根手指：左边摇杆 + 右边技能 X）：
+```
+输入：触屏消息注册 成功（可多点）
+手指按下 点(110,255) 目标 -2 → 触屏控件        ← 摇杆
+手指按下 点(508.75,227.917) 目标 2 → 触屏控件   ← 技能 X，同时按着
+按键 0 → 0x4（摇杆 0,0 瞄准 0,0）
+摇杆 0,0 → -8193,31726（同时按键 0x4）          ← 方向推出来了，技能还按着
+按键 0x4 → 0（摇杆 0,0 瞄准 0,0）               ← 松手干净
+```
+即：两根手指同时被浮层各自认领、摇杆与技能键在同一拍上发布，且互不打断。`pad_step` 里顺手加了「摇杆出零 / 回零」一行，就是这条链路的直接证据。
+
 
 ## 排障
 

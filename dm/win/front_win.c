@@ -99,16 +99,89 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
     (void)cx; (void)cy;
     *nx = x; *ny = y;
 }
+// ---------- 多点触控：一根触点一根手指 ----------
+// 浮层的圆钮是按「一根手指一个槽」做的（dm_win_touch_pointer 的 slot），所以这里把每个 Windows 触点（TOUCHINPUT.dwID）
+// 分别登记，命中了浮层控件就把它交给触屏状态机，没命中才当游戏的触点喂下去。
+// 关键点：喂给游戏的那一份手指表必须**一次提交全部手指**（dm_touch_set(t, n)），不能一根一根覆盖，
+// 否则按住摇杆的那根手指会被后按下去的那根冲掉——就是「按住方向键时点技能没反应」。
+// The overlay's round buttons work with one finger per slot (dm_win_touch_pointer's slot), so each Windows contact (TOUCHINPUT.dwID) is registered
+// separately: a contact that lands on an overlay control goes to the touch state machine, everything else is handed to the game. Key point: the
+// finger table handed to the game must be submitted **all at once** (dm_touch_set(t, n)); replacing one finger at a time wipes out the finger
+// holding the stick — which is exactly "pressing a skill while holding a direction does nothing".
+#define DM_TU_MAX 16
+static struct { uint32_t id; int slot; int claim; int front; float nx, ny; int used; } g_tu[DM_TU_MAX];
+
+static int tu_find(uint32_t id) { for (int i = 0; i < DM_TU_MAX; ++i) if (g_tu[i].used && g_tu[i].id == id) return i; return -1; }
+static int tu_alloc(uint32_t id) { for (int i = 0; i < DM_TU_MAX; ++i) if (!g_tu[i].used) {
+        g_tu[i].id = id; g_tu[i].slot = i; g_tu[i].claim = 0; g_tu[i].front = 0; g_tu[i].nx = g_tu[i].ny = 0; g_tu[i].used = 1; return i; } return -1; }
+
+// 把所有「不归浮层」的触点 + 鼠标那根手指一次性交给游戏｜hand every contact that is not the overlay's (plus the mouse finger) to the game at once
+static void touch_publish(void) {
+    dm_touch arr[DM_TU_MAX + 2]; int n = 0;
+    for (int i = 0; i < DM_TU_MAX; ++i)
+        if (g_tu[i].used && !g_tu[i].claim && !g_tu[i].front) { arr[n].id = (uint32_t)(10 + i); arr[n].x = g_tu[i].nx; arr[n].y = g_tu[i].ny; ++n; }
+    if (g_mouse_down && g_finger) { arr[n].id = (uint32_t)g_finger; arr[n].x = g_mouse_x; arr[n].y = g_mouse_y; ++n; }
+    dm_touch_set(n ? arr : NULL, n);
+}
+
 static void set_finger(int down) {    if (down && !g_mouse_down) {
         g_mouse_down = 1; g_finger = 1;
         dm_win_pad_touch();
         dm_win_touch_screen_input();   // 碰画面 = 触屏侧：手柄模式交回触屏（iOS 的 dm_gamepad_touched）| the picture was touched = touch side: hand back from controller mode
     } else if (!down && g_mouse_down) {
         g_mouse_down = 0; g_finger = 0;
-        dm_touch_set(NULL, 0);
+        touch_publish();   // 抬起鼠标这根，别把还按着的触点一起清掉 | lift the mouse finger without dropping the contacts still down
         return;
     }
-    if (g_mouse_down) { dm_touch t = {(uint32_t)g_finger, g_mouse_x, g_mouse_y}; dm_touch_set(&t, 1); }
+    if (g_mouse_down) touch_publish();
+}
+
+// 触点分发：WM_TOUCH 与触摸模拟（DM_TOUCH_SIM）共用同一条路 | contact dispatch shared by WM_TOUCH and the touch simulation (DM_TOUCH_SIM)
+static void touch_dispatch(HWND h, UINT cnt, TOUCHINPUT *ti) {
+    for (UINT k = 0; k < cnt; ++k) {
+        // TOUCHINPUT 的坐标是「1/100 像素」的屏幕坐标 | TOUCHINPUT coordinates are screen coordinates in hundredths of a pixel
+        POINT pt = { ti[k].x / 100, ti[k].y / 100 };
+        ScreenToClient(h, &pt);
+        float nx, ny; mouse_to_pic(pt.x, pt.y, &nx, &ny);
+        int down = (ti[k].dwFlags & TOUCHEVENTF_DOWN) != 0, up = (ti[k].dwFlags & TOUCHEVENTF_UP) != 0;
+        int idx = tu_find(ti[k].dwID);
+        if (down && idx < 0) {
+            idx = tu_alloc(ti[k].dwID);
+            if (idx < 0) continue;
+            g_tu[idx].nx = nx; g_tu[idx].ny = ny;
+            dm_win_pad_touch(); dm_win_touch_screen_input();   // 碰画面 = 触屏侧 | the picture was touched = touch side
+            if (dm_win_touch_enabled() && dm_win_touch_pointer(0, nx, ny, g_tu[idx].slot)) g_tu[idx].claim = 1;
+            else if (dm_win_touch_on()) { g_tu[idx].front = 1; dm_ui_touch(0, nx, ny); }
+            else touch_publish();
+        } else if (idx >= 0) {
+            g_tu[idx].nx = nx; g_tu[idx].ny = ny;
+            if (g_tu[idx].claim) dm_win_touch_pointer(up ? 2 : 1, nx, ny, g_tu[idx].slot);
+            else if (g_tu[idx].front) dm_ui_touch(up ? 2 : 1, nx, ny);
+            else touch_publish();
+            if (up) g_tu[idx].used = 0;
+        }
+    }
+}
+
+// 触摸模拟：本机跑在远程桌面会话里，系统级的 Touch Injection 不可用（InjectTouchInput 恒 ERROR_INVALID_PARAMETER 87），
+// 于是把「几根手指按在客户区哪个像素」直接造成 TOUCHINPUT 交给上面那条分发路径，验证多点本身对不对。
+// Touch simulation: this machine runs in a Remote Desktop session where system-level Touch Injection is unavailable (InjectTouchInput
+// always returns ERROR_INVALID_PARAMETER 87), so "which fingers press which client pixels" is turned into TOUCHINPUT records and fed into
+// the very same dispatch path above, which is what actually validates the multi-touch handling.
+void dm_win_front_touch_sim(int count, const int *cxys, int phase) {
+    if (!g_hwnd || count <= 0 || count > DM_TU_MAX) return;
+    TOUCHINPUT ti[DM_TU_MAX]; memset(ti, 0, sizeof ti);
+    for (int k = 0; k < count; ++k) {
+        POINT pt = { cxys[2 * k], cxys[2 * k + 1] };
+        ClientToScreen(g_hwnd, &pt);
+        ti[k].x = pt.x * 100; ti[k].y = pt.y * 100;
+        ti[k].dwID = (DWORD)(901 + k);
+        ti[k].dwFlags = phase == 0 ? (TOUCHEVENTF_DOWN | TOUCHEVENTF_INRANGE | (k == 0 ? TOUCHEVENTF_PRIMARY : 0))
+                     : phase == 2 ? (TOUCHEVENTF_UP | TOUCHEVENTF_INRANGE)
+                     : (TOUCHEVENTF_MOVE | TOUCHEVENTF_INRANGE);
+    }
+    LOG("输入：触摸模拟 phase=%d 根数=%d（第 %d 根 客户区 %d,%d）", phase, count, 0, count > 0 ? cxys[0] : 0, count > 0 ? cxys[1] : 0);
+    touch_dispatch(g_hwnd, (UINT)count, ti);
 }
 
 // ---------- 窗口过程 ----------
@@ -199,6 +272,17 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == 2) update_title();
         else if (wp == 3) dm_win_touch_tick();   // 触屏浮层：30 ms 一拍，按需重画 / 进局切布局 | overlay: 30 ms tick, repaint on demand, switch layout on entering a run
         return 0;
+    case WM_TOUCH: {
+        // 一根触点一根手指：命中圆钮 / 摇杆 → 归浮层；否则（界面点击或画面触点）当普通触点喂给游戏
+        // One finger per contact: a hit on a round button / the stick belongs to the overlay; anything else is a plain contact for the game
+        UINT cnt = LOWORD(wp);
+        TOUCHINPUT ti[DM_TU_MAX];
+        if (cnt > DM_TU_MAX) cnt = DM_TU_MAX;
+        if (!cnt) { CloseTouchInputHandle((HANDLE)lp); return 0; }
+        if (!GetTouchInputInfo((HANDLE)lp, cnt, ti, sizeof(TOUCHINPUT))) { CloseTouchInputHandle((HANDLE)lp); return 0; }
+        touch_dispatch(h, cnt, ti);
+        CloseTouchInputHandle((HANDLE)lp);
+        return 0; }
     case WM_MOVE:
         // 浮层是独立的窗口，跟着游戏窗口走 | the overlay is a separate window; keep it on top of the game window
         { RECT rc; GetClientRect(h, &rc); int vr[4]; view_rect(rc.right, rc.bottom, vr); dm_win_touch_layout(vr[0], vr[1], vr[2], vr[3]); }
@@ -208,6 +292,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // 失焦时全抬起，避免「按住状态」卡在游戏里 | Release everything on focus loss so a held state does not stick in the game
         g_kw = g_ka = g_ks = g_kd = 0; g_btn = 0; g_stick_rx = 0; push_input(); if (g_mouse_down) set_finger(0);
         dm_win_touch_cancel();   // 触屏浮层：手指全部抬起 | overlay: lift every finger
+        for (int i = 0; i < DM_TU_MAX; ++i) g_tu[i].used = 0;   // 触点也一起清（否则还原后按着的那根没人收）| clear the contacts too, or a held one is never lifted
         g_mouse_down = 0;
         return 0;
     }
@@ -233,6 +318,10 @@ static int create_window(void) {
     g_hwnd = CreateWindowExA(0, wc.lpszClassName, "D2R Mobile（Windows ARM64）", WS_OVERLAPPEDWINDOW,
                              wx, wy, ww, wh, NULL, NULL, hi, NULL);
     if (!g_hwnd) return -1;
+    // 注册触屏消息：不注册的话 Windows 只把第一根手指合成成鼠标，浮层就做不出「按住摇杆的同时点技能」
+    // Register for touch messages: without it Windows promotes only the first contact into mouse messages, and the overlay could never do
+    // "hold the stick while tapping a skill"
+    { BOOL ok_tu = RegisterTouchWindow(g_hwnd, 0); LOG("输入：触屏消息注册 %s", ok_tu ? "成功（可多点）" : "失败（只剩单指 / 鼠标）"); }
     // 类图标只管标题栏，任务栏 / Alt+Tab 用窗口图标：两处都显式再设一次（窗口图标优先于类图标）
     // The class icon covers the title bar; the taskbar and Alt+Tab use the window icon: set both explicitly (the window icon wins over the class icon)
     SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)LoadIconA(hi, MAKEINTRESOURCEA(1)));

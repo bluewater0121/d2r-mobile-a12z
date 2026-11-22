@@ -187,6 +187,14 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
     static uint64_t last_btn;
     uint64_t out = g_tc.buttons | g_latch;
     if (out != last_btn) { LOG("触屏浮层：按键 %#llx → %#llx（摇杆 %d,%d 瞄准 %d,%d）", (unsigned long long)last_btn, (unsigned long long)out, g_tc.lx, g_tc.ly, g_tc.rx, g_tc.ry); last_btn = out; g_dirty.store(1); g_dump_req.store(1); }
+    // 摇杆「出零 / 回零」也打一行：多点那条路上，这就是「按住方向键的同时技能键还在」的直接证据
+    // Log the stick leaving / returning to zero too: on the multi-touch path this is the direct proof that "the skill key is still held while the stick is pushed"
+    {
+        static int32_t last_lx, last_ly;
+        int on_now = (g_tc.lx != 0 || g_tc.ly != 0), was_on = (last_lx != 0 || last_ly != 0);
+        if (on_now != was_on) LOG("触屏浮层：摇杆 %d,%d → %d,%d（同时按键 %#llx）", last_lx, last_ly, g_tc.lx, g_tc.ly, (unsigned long long)out);
+        last_lx = g_tc.lx; last_ly = g_tc.ly;
+    }
     *buttons |= out;
     g_latch = 0;
     if (!*lx && !*ly) { *lx = g_tc.lx; *ly = g_tc.ly; }
@@ -837,8 +845,55 @@ void dm_win_touch_layout(int vx, int vy, int vw, int vh) {    if (!g_on) return;
     g_dirty.store(1);
 }
 
+// 触摸模拟（实测用）：本机跑在远程桌面会话里，系统级触摸注入恒返回 87，所以用
+// DM_TOUCH_SIM="秒@相位:x,y[:x,y]|秒@相位:x,y…"（相位 0=按下 1=移动 2=抬起）按脚本喂触点，
+// 走 front_win.c 里和 WM_TOUCH 完全同一条分发路径。摇杆是「浮动底盘」（圆心 = 落点），
+// 所以要有 0 相位落在底盘上、再 1 相位拖出去，才看得到方向。
+// Touch simulation (for testing): this box runs in a Remote Desktop session where system-level touch injection always returns 87, so
+// DM_TOUCH_SIM="sec@phase:x,y[:x,y]|sec@phase:..." (phase 0=down 1=move 2=up) feeds contacts from a script through the very same
+// dispatch path WM_TOUCH uses in front_win.c. The stick uses a "floating base" (base centre = the touch point), so a phase-0 contact
+// has to land on the base and a phase-1 contact drag away from it before any direction shows.
+extern "C" void dm_win_front_touch_sim(int count, const int *cxys, int phase);
+#define DM_SIM_MAX 8
+static void touch_sim_step(void) {
+    static int nseg = -1;
+    static struct { double t; int phase; int n; int pts[2 * 8]; int fired; } seg[DM_SIM_MAX];
+    static uint64_t t0;
+    if (nseg < 0) {
+        nseg = 0;
+        const char *e = getenv("DM_TOUCH_SIM");
+        if (e && *e) {
+            char buf[512]; snprintf(buf, sizeof buf, "%s", e);
+            char *ssave = nullptr;
+            for (char *s = strtok_r(buf, "|", &ssave); s && nseg < DM_SIM_MAX; s = strtok_r(nullptr, "|", &ssave)) {
+                char *save = nullptr;
+                char *head = strtok_r(s, ":", &save);
+                if (!head) continue;
+                double t = 0.0; int ph = 0;
+                if (sscanf(head, "%lf@%d", &t, &ph) != 2) { ph = 0; t = atof(head); }
+                auto &g = seg[nseg];
+                g.t = t; g.phase = ph; g.n = 0; g.fired = 0;
+                char *tok;
+                while ((tok = strtok_r(nullptr, ":", &save)) != nullptr && g.n < 8) {
+                    int x = 0, y = 0;
+                    if (sscanf(tok, "%d,%d", &x, &y) == 2) { g.pts[2 * g.n] = x; g.pts[2 * g.n + 1] = y; ++g.n; }
+                }
+                if (g.n) ++nseg;
+            }
+        }
+        t0 = now_ns();
+        for (int i = 0; i < nseg; ++i)
+            LOG("触屏浮层：触摸模拟段 %d（%.2f 秒 相位 %d 根数 %d 首点 %d,%d）", i, seg[i].t, seg[i].phase, seg[i].n, seg[i].pts[0], seg[i].pts[1]);
+    }
+    if (!nseg) return;
+    double el = (double)(now_ns() - t0) / 1e9;
+    for (int i = 0; i < nseg; ++i)
+        if (!seg[i].fired && el >= seg[i].t) { seg[i].fired = 1; dm_win_front_touch_sim(seg[i].n, seg[i].pts, seg[i].phase); }
+}
+
 void dm_win_touch_tick(void) {
     if (!g_on) return;
+    touch_sim_step();
     scene_apply();
     {
         // 告诉共享桥「在不在局内 / 场景与 HUD 换过没有」：桥只在 scene_game 且 world_epoch 非零时才认那几次 getter 调用
