@@ -20,6 +20,7 @@
 #include <ole2.h>      // mingw 的 gdiplus 头要用 ole2 里的 PROPID | mingw's gdiplus header needs PROPID out of ole2
 #include <gdiplus.h>
 
+#include <string>
 #include <atomic>
 #include <math.h>
 #include <mutex>
@@ -30,6 +31,10 @@
 extern "C" {
 #include "../host/dm.h"
 #include "../host/dm_hud.h"
+#include "../host/dm_actions.h"
+#include "../ios/Sources/dm_touch_game_state.h"
+#include "../ios/Sources/dm_touch_native_art.h"
+uint32_t dm_padmode_rebuilds(void);   // dm/host/dm_padmode.c：布局重建次数（变化 = HUD 控件全换，技能钮要重新认）| layout rebuild count (a change means the HUD widgets were all replaced)
 #include "../host/dm_i18n.h"
 #include "../host/dm_input.h"
 #include "../ios/Sources/dm_touch_controls.h"
@@ -169,6 +174,112 @@ static void wide(const char *s, wchar_t *out, int n) {
 
 static Color col(int r, int g, int b, int a) { return Color(a, r, g, b); }
 
+// ---------- 技能图集（native_art 产物，安卓同一个生成器）| skill atlas (native_art output, the same generator Android uses) ----------
+static Bitmap *g_atlas[DM_TA_ATLASES];
+static int g_atlas_dir_said;
+
+// 图集文件：<DM_WIN_TOUCH_ART 或 cwd\touchart\TouchArt>\dm_native_skill_<i>.png
+// Atlas file: <DM_WIN_TOUCH_ART or cwd\touchart\TouchArt>\dm_native_skill_<i>.png
+static Bitmap *atlas_image(int i) {
+    if (i < 0 || i >= DM_TA_ATLASES) return NULL;
+    if (g_atlas[i]) return g_atlas[i];
+    const char *dir = getenv("DM_WIN_TOUCH_ART");
+    if (!dir || !*dir) dir = "touchart\\TouchArt";
+    char path[512];
+    snprintf(path, sizeof path, "%s\\%s.png", dir, dm_ta_atlases[i].asset);
+    wchar_t wp[600]; wide(path, wp, 600);
+    Bitmap *b = new Bitmap(wp, FALSE);
+    if (!b || b->GetLastStatus() != Ok) {
+        delete b;
+        if (!g_atlas_dir_said) { g_atlas_dir_said = 1; LOG("触屏浮层：技能图集读不到（%s），技能钮回退成键位字母", path); }
+        g_atlas[i] = (Bitmap *)1;   // 标记已试过，别每次都开文件 | mark as tried so the file is not opened every frame
+        return NULL;
+    }
+    g_atlas[i] = b;
+    return b;
+}
+
+// 技能钮上的图标：取当前绑定 + 原版图集切片（按下用 pressed_frame），裁成圆、直径取按钮的 .76 / .68，和 iOS 的 drawButton 同一套读法
+// The icon on a skill button: current binding plus a slice of the original atlas (pressed_frame while held), cut into a circle, with the diameter
+// at .76 / .68 of the button — the same reading as iOS's drawButton
+static void skill_icon_draw(Graphics &g, const dm_ta_glyph &gl, int held, float cx, float cy, float r, int bare) {
+    dm_ta_frame fr;
+    if (!dm_ta_frame_at(gl.atlas, held ? gl.pressed_frame : gl.normal_frame, &fr)) return;
+    Bitmap *b = atlas_image(gl.atlas);
+    if (!b) return;
+    float size = r * 2 * (bare ? 0.76f : 0.68f);
+    float fit = size / (float)(fr.width > fr.height ? fr.width : fr.height);   // iOS：按最长边贴合 | iOS: fit by the longest edge
+    int w = (int)(fr.width * fit + 0.5f), h = (int)(fr.height * fit + 0.5f);
+    if (w < 2 || h < 2) return;
+    // 原版图集里每格是一块带方角的技能牌，iOS 把它裁进椭圆。GDI+ 的 SetClip 在从这里画位图时不起作用（同一帧图仍是方的），
+    // 所以自己按像素把圆外的 alpha 抹掉：缓存一张按目标尺寸、已经裁圆的图标
+    // Every frame is a square-cornered skill tile and iOS clips it into an ellipse. GDI+ SetClip does not take effect for this DrawImage here
+    // (the frame still came out square), so the alpha outside the circle is cleared per pixel, with one already-clipped bitmap cached per size
+    struct Masked { int atlas, frame, w, h, mr; Bitmap *bmp; };
+    static Masked cache[48]; static int ncache;
+    Bitmap *masked = NULL;
+    for (int i = 0; i < ncache; ++i)
+        if (cache[i].atlas == gl.atlas && cache[i].frame == (held ? gl.pressed_frame : gl.normal_frame) && cache[i].w == w && cache[i].h == h) masked = cache[i].bmp;
+    if (!masked) {
+        Bitmap *tmp = new Bitmap(w, h, PixelFormat32bppPARGB);
+        if (!tmp || tmp->GetLastStatus() != Ok) { delete tmp; return; }
+        { Graphics tg(tmp); tg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+          tg.DrawImage(b, RectF(0, 0, (REAL)w, (REAL)h), (REAL)fr.x, (REAL)fr.y, (REAL)fr.width, (REAL)fr.height, UnitPixel); }
+        float mr = 0.82f * r;   // iOS 的裁圆半径：按钮外接矩形内缩 9%（直径 2r）| iOS's clip radius: the button rect inset by 9% (diameter 2r)
+        Rect rl(0, 0, w, h); BitmapData bd;
+        if (tmp->LockBits(&rl, ImageLockModeWrite, PixelFormat32bppPARGB, &bd) == Ok) {
+            float mx = w / 2.0f, my = h / 2.0f;
+            for (int y = 0; y < h; ++y) {
+                unsigned char *row = (unsigned char *)bd.Scan0 + (size_t)y * bd.Stride;
+                for (int x = 0; x < w; ++x) {
+                    float d = sqrtf((x + 0.5f - mx) * (x + 0.5f - mx) + (y + 0.5f - my) * (y + 0.5f - my));
+                    float cover = mr - d + 0.5f; if (cover <= 0) cover = 0; if (cover > 1) cover = 1;
+                    if (cover < 1) { unsigned char *p = row + x * 4; for (int c = 0; c < 4; ++c) p[c] = (unsigned char)(p[c] * cover); }
+                }
+            }
+            tmp->UnlockBits(&bd);
+        }
+        masked = tmp;
+        if (ncache < 48) { cache[ncache].atlas = gl.atlas; cache[ncache].frame = held ? gl.pressed_frame : gl.normal_frame; cache[ncache].w = w; cache[ncache].h = h; cache[ncache].mr = (int)mr; cache[ncache].bmp = tmp; ++ncache; }
+    }
+    // iOS：图标先铺一层柔光阴影（按住半径更大），非主钮上移 .12r，静止态 .94 透明
+    // iOS: a soft shadow behind the icon (a larger radius while held), non-primary buttons shifted up by .12r, .94 alpha at rest
+    float ix = cx, iy = cy - (bare ? 0.0f : r * 0.12f);
+    {
+        GraphicsPath sp; float sr = w / 2.0f + r * (held ? 0.10f : 0.055f);
+        sp.AddEllipse(ix - sr, iy - sr, sr * 2, sr * 2);
+        PathGradientBrush pg(&sp);
+        Color cc((BYTE)(held ? 82 : 72), 0, 0, 0), bc(0, 0, 0, 0);
+        int cnt = 1; pg.SetCenterColor(cc); pg.SetSurroundColors(&bc, &cnt);
+        g.FillEllipse(&pg, ix - sr, iy - sr, sr * 2, sr * 2);
+    }
+    if (!held) { ImageAttributes ia; ColorMatrix cm = {}; cm.m[0][0] = cm.m[1][1] = cm.m[2][2] = 1.0f; cm.m[3][3] = 0.94f; cm.m[4][4] = 1.0f;
+        ia.SetColorMatrix(&cm); g.DrawImage(masked, RectF(ix - w / 2.0f, iy - h / 2.0f, (REAL)w, (REAL)h), 0.0f, 0.0f, (REAL)w, (REAL)h, UnitPixel, &ia); }
+    else g.DrawImage(masked, RectF(ix - w / 2.0f, iy - h / 2.0f, (REAL)w, (REAL)h), 0.0f, 0.0f, (REAL)w, (REAL)h, UnitPixel);
+}
+
+// 固定图标（地图 / 功能入口）：原版小图三帧横排，36x36 一格，按下取第二格
+// Fixed icons (map / function entry): the original small image holds three 36x36 frames side by side; held takes the second
+static void fixed_icon_draw(Graphics &g, const char *asset, int held, float cx, float cy, float r) {
+    const char *dir = getenv("DM_WIN_TOUCH_ART");
+    if (!dir || !*dir) dir = "touchart\\TouchArt";
+    static Bitmap *cache[4]; static const char *names[4];
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) { if (names[i] && !strcmp(names[i], asset)) { slot = i; break; } if (!names[i]) { slot = i; names[i] = asset; break; } }
+    if (slot < 0) return;
+    if (!cache[slot]) {
+        char path[512]; snprintf(path, sizeof path, "%s\\%s.png", dir, asset);
+        wchar_t wp[600]; wide(path, wp, 600);
+        Bitmap *b = new Bitmap(wp, FALSE);
+        if (!b || b->GetLastStatus() != Ok) { delete b; cache[slot] = (Bitmap *)1; return; }
+        cache[slot] = b;
+    }
+    if (cache[slot] == (Bitmap *)1) return;
+    Bitmap *b = cache[slot];
+    float side = r * 1.63f;   // iOS：36 点图标 / 22 点半径 | iOS: a 36-point icon on a 22-point radius
+    g.DrawImage(b, RectF(cx - side / 2, cy - side / 2, side, side), (REAL)(held ? 36 : 0), 0.0f, 36.0f, 36.0f, UnitPixel);
+}
+
 // 按钮上的字：技能钮写键位字母（没有技能图标时才这么画，和 iOS 取不到图时回退的标签同理）
 // Text on the buttons: skill buttons carry the key letter (only drawn when there is no skill icon, the same fallback the iOS labels use)
 static const char *key_letter(uint64_t b) {
@@ -182,8 +293,7 @@ static const char *key_letter(uint64_t b) {
     return "";
 }
 
-static void caption(Graphics &g, const char *utf8, float cx, float cy, float size, Color c) {
-    wchar_t w[64]; wide(utf8, w, 64);
+static void caption(Graphics &g, const char *utf8, float cx, float cy, float size, Color c) {    wchar_t w[64]; wide(utf8, w, 64);
     if (!w[0]) return;
     Font f(L"Segoe UI", size, FontStyleRegular, UnitPixel);
     StringFormat fmt; fmt.SetAlignment(StringAlignmentCenter); fmt.SetLineAlignment(StringAlignmentCenter);
@@ -320,6 +430,8 @@ static void paint(void) {
         uint64_t seen;
         { std::lock_guard<std::mutex> lk(g_mx); s = g_tc; seen = g_tc.enabled_targets; }
         (void)seen;
+        // 当前技能绑定的快照（锁内一份副本；共享桥保证只读）| snapshot of the current skill bindings (one copy; the shared bridge keeps it read-only)
+        dm_tg_snapshot snap; memset(&snap, 0, sizeof snap); dm_touch_game_snapshot(&snap);
         const dm_tc_layout &l = s.layout;
         float k = 1.0f;                 // 布局点数 → 像素 | layout points to pixels
         float px = g_px;
@@ -350,17 +462,48 @@ static void paint(void) {
             for (int f = 0; f < DM_TC_MAX_TOUCH && !held; ++f)
                 if (s.finger[f].active && !s.finger[f].aim_cancelled && s.finger[f].target == i) held = 1;
             float cx = t.x * px, cy = t.y * px, r = t.r * px;
-            button_draw(g, cx, cy, r, held, 0, i == DM_TC_MAIN);
-            if (i <= DM_TC_SKILL4 || i == DM_TC_PORTAL) {
-                const char *lbl = i == DM_TC_PORTAL ? (dm_lang_zh() ? "\xE5\x9B\x9E\xE5\x9F\x8E" : "TP") : key_letter(b);
-                // 回城写两个汉字，字号要压到圆内 | the town portal label is two CJK characters, so the font has to stay inside the circle
-                caption(g, lbl, cx, cy, (i == DM_TC_PORTAL ? r * 0.46f : (i == DM_TC_MAIN ? r * 0.62f : r * 0.72f)), col(217, 201, 166, held ? 255 : 214));
-            } else {
-                caption(g, dm_ui("dmTcMap"), cx, cy, r * 0.44f, col(217, 201, 166, held ? 255 : 214));
+            // 技能钮：先问当前绑定取到哪张图标；取不到（不在局内 / 共享表还没认全 HUD）才回退成键位字母，空槽画十字
+            // Skill buttons: ask the current binding which icon it maps to; only when that is unavailable (not in a run, or the shared table has
+            // not fully identified the HUD yet) fall back to the key letter, and an empty slot draws a cross
+            int empty = 0, charges = 0;
+            dm_ta_glyph glg; memset(&glg, 0, sizeof glg); glg.status = DM_TA_UNKNOWN;
+            if (i <= DM_TC_SKILL4 && b) {
+                glg = dm_ta_current_set(&snap, b, now_ns(), (int)s.skill_set);
+                if (glg.status == DM_TA_EMPTY) empty = 1;
+            } else if (i == DM_TC_PORTAL) {
+                glg = dm_ta_skill(359);   // 回城：原版通用的那张技能图（iOS 同一张）| town portal: the original game's shared skill image (the same one iOS uses)
             }
-            if (i == DM_TC_MAIN) {
-                // 主钮下面一行小字，和 iOS 的技能名标签同位 | one line of small text under the main button, in the same place as the iOS skill-name label
-                caption(g, dm_lang_zh() ? "\xE6\x94\xBB\xE5\x87\xBB" : "ATTACK", cx, cy + r * 0.80f, r * 0.24f, col(200, 186, 152, 170));
+            button_draw(g, cx, cy, r, held, empty, i == DM_TC_MAIN);
+            if (glg.status == DM_TA_GLYPH) {
+                skill_icon_draw(g, glg, held, cx, cy, r, !empty && i == DM_TC_MAIN);
+                // 副手组「Ⅱ」与充能剩余次数：和 iOS 同一处（右上 / 右下），只在技能钮上画
+                // The off-hand-set "II" and the remaining charges, in the same places as iOS (top right / bottom right), skill buttons only
+                int ssKind = dm_swapskill_slot(glg.slot, &charges);
+                if (ssKind & 1) {
+                    float br = r * 0.30f, bx = cx + r * 0.74f, by = cy - r * 0.74f;
+                    SolidBrush bg(col(28, 24, 20, 242));
+                    g.FillEllipse(&bg, bx - br, by - br, br * 2, br * 2);
+                    Pen rim(col(161, 128, 69, 255), (REAL)fmax(1.0f, br * 0.14f));
+                    g.DrawEllipse(&rim, bx - br * 0.92f, by - br * 0.92f, br * 1.84f, br * 1.84f);
+                    caption(g, "\xE2\x85\xA1", bx, by, br * 1.30f, col(217, 201, 166, 255));
+                }
+                if (ssKind & 2)
+                    caption(g, std::to_string(charges < 0 ? 0 : charges).c_str(), cx + r * 0.62f, cy + r * 0.46f, r * 0.30f,
+                            col(226, 208, 170, 255));
+            } else if (i == DM_TC_MAP) {
+                fixed_icon_draw(g, "dm_native_map", held, cx, cy, r);
+            } else if (!empty) {
+                if (i <= DM_TC_SKILL4 || i == DM_TC_PORTAL) {
+                    const char *lbl = i == DM_TC_PORTAL ? (dm_lang_zh() ? "\xE5\x9B\x9E\xE5\x9F\x8E" : "TP") : key_letter(b);
+                    // 回城写两个汉字，字号要压到圆内 | the town portal label is two CJK characters, so the font has to stay inside the circle
+                    caption(g, lbl, cx, cy, (i == DM_TC_PORTAL ? r * 0.46f : (i == DM_TC_MAIN ? r * 0.62f : r * 0.72f)), col(217, 201, 166, held ? 255 : 214));
+                } else {
+                    caption(g, dm_ui("dmTcMap"), cx, cy, r * 0.44f, col(217, 201, 166, held ? 255 : 214));
+                }
+                if (i == DM_TC_MAIN) {
+                    // 主钮下面一行小字，和 iOS 的技能名标签同位 | one line of small text under the main button, in the same place as the iOS skill-name label
+                    caption(g, dm_lang_zh() ? "\xE6\x94\xBB\xE5\x87\xBB" : "ATTACK", cx, cy + r * 0.80f, r * 0.24f, col(200, 186, 152, 170));
+                }
             }
         }
 
@@ -392,11 +535,25 @@ static void paint(void) {
     }
 
     POINT src = {0, 0};
-    POINT dst; ClientToScreen(g_game, &dst);
+    POINT dst = {0, 0};
+    if (!ClientToScreen(g_game, &dst)) {
+        static int once;
+        if (!once++) LOG("触屏浮层：ClientToScreen 失败（游戏窗口 %p，IsWindow=%d，错误 %lu）", (void *)g_game, IsWindow(g_game), GetLastError());
+        RECT rc; GetWindowRect(g_game, &rc); dst.x = rc.left; dst.y = rc.top;
+    }
     dst.x += g_vx; dst.y += g_vy;
     SIZE sz = {g_vw, g_vh};
     BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(g_ov, NULL, &dst, &sz, g_mdc, &src, 0, &bf, ULW_ALPHA);
+    BOOL ok = UpdateLayeredWindow(g_ov, NULL, &dst, &sz, g_mdc, &src, 0, &bf, ULW_ALPHA);
+    // 分层窗口贴图是否真的成功：失败时桌面截屏又拿不到证据，只能靠返回值和 GetLastError 说话
+    // Whether the layered blit actually succeeded: with no usable screen capture, the return value and GetLastError are the only evidence
+    static int said;
+    int now = ok ? 1 : 2;
+    if (now != said) {
+        said = now;
+        if (ok) LOG("触屏浮层：贴图成功，窗口 %ld,%ld %ldx%ld（可见 %d）", (long)dst.x, (long)dst.y, (long)sz.cx, (long)sz.cy, IsWindowVisible(g_ov));
+        else LOG("触屏浮层：贴图失败，GetLastError=%lu", GetLastError());
+    }
     dump_bmp();
 }
 
@@ -449,11 +606,30 @@ void dm_win_touch_layout(int vx, int vy, int vw, int vh) {
 void dm_win_touch_tick(void) {
     if (!g_on) return;
     scene_apply();
+    {
+        // 告诉共享桥「在不在局内 / 场景与 HUD 换过没有」：桥只在 scene_game 且 world_epoch 非零时才认那几次 getter 调用
+        // Tell the shared bridge whether we are in a run and whether the scene / HUD changed: the bridge only accepts those getter calls when
+        // scene_game is set and world_epoch is non-zero
+        static uint64_t scene_epoch = 1, world_epoch = 1;
+        static int prev_run = -1;
+        static uint32_t prev_rebuilds;
+        int run = g_in_run.load();
+        if (run != prev_run) { ++scene_epoch; prev_run = run; }
+        uint32_t rb = dm_padmode_rebuilds();
+        if (rb != prev_rebuilds) { prev_rebuilds = rb; ++world_epoch; }   // 布局重建 = HUD 控件全换，技能钮要重新认 | a layout rebuild replaced every HUD widget, so the buttons have to re-identify
+        dm_touch_game_set_scene(run, scene_epoch, world_epoch);
+    }
     if (!g_in_run.load()) {
         if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE);
         return;
     }
-    if (!IsWindowVisible(g_ov)) { ShowWindow(g_ov, SW_SHOWNA); g_dirty.store(1); }
+    if (!IsWindowVisible(g_ov)) {
+        ShowWindow(g_ov, SW_SHOWNA);
+        // 两个都是 topmost：把浮层插到游戏窗口后面一号（即紧贴其上），免得别的 topmost 窗口夹在中间
+        // Both are topmost: insert the overlay right behind the game window (i.e. immediately above it) so no other topmost window sits between
+        SetWindowPos(g_ov, g_game, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        g_dirty.store(1);
+    }
     // 摇杆头没动、状态没变就不重画（拖动时每帧一张全屏位图太贵）| skip repainting when neither the thumb nor anything else moved
     float tx, ty;
     { std::lock_guard<std::mutex> lk(g_mx);
@@ -482,14 +658,26 @@ void dm_win_touch_start(void *game_hwnd) {
         GdiplusStartupInput in; if (GdiplusStartup(&g_gdip, &in, NULL) != Ok) { LOG("触屏浮层：GDI+ 起不来，浮层不画"); return; }
         g_gdip_on = 1;
     }
+    LOG("触屏浮层：技能绑定门 %d（1 = 产物里有 OBS_BINDING_GETTER，技能钮能取到图标）", gate_obs_present(6));
+    // 挂上共享的技能绑定桥（和安卓 / iOS 同一份 dm_touch_game_bridge.c）：它接的是产物里那颗 getter 观测门
+    // Hook up the shared binding bridge (the same dm_touch_game_bridge.c Android / iOS use): it attaches to the getter observation gate in the build
+    {
+        int attached = dm_touch_game_attach();
+        int nm = 0; for (int i = 0; i < g_nmod; ++i) ++nm;
+        LOG("触屏浮层：技能绑定读取%s（模块 %d，main %s）", attached ? "已挂上" : "没挂上（技能钮回退成键位字母）", nm,
+            attached ? "认出" : "没认出");
+    }
     HINSTANCE hi = GetModuleHandleA(NULL);
     WNDCLASSEXA wc; memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc; wc.lpfnWndProc = ov_proc; wc.hInstance = hi;
     wc.lpszClassName = "dmhost_touch_overlay";
     if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
-    // WS_EX_TRANSPARENT：鼠标事件全部落到下面的游戏窗口；WS_EX_NOACTIVATE：点它不抢焦点（本来也点不到）
-    // WS_EX_TRANSPARENT: every mouse event falls to the game window below; WS_EX_NOACTIVATE: it never takes the focus (unreachable anyway)
-    g_ov = CreateWindowExA(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+    // WS_EX_TOPMOST：游戏窗口自己是 topmost（front_win.c 的 create_window），普通 owned 弹出窗会被压在下面（贴图成功但看不见）
+    // WS_EX_LAYERED：贴预乘位图；WS_EX_TRANSPARENT：鼠标事件全部落到下面的游戏窗口；WS_EX_NOACTIVATE：点它不抢焦点
+    // WS_EX_TOPMOST: the game window itself is topmost (create_window in front_win.c), and an ordinary owned popup ends up *under* it
+    // (the blit succeeds but nothing is visible). WS_EX_LAYERED: blit a premultiplied bitmap; WS_EX_TRANSPARENT: every mouse event falls to
+    // the game window below; WS_EX_NOACTIVATE: it never takes the focus (unreachable anyway)
+    g_ov = CreateWindowExA(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                            wc.lpszClassName, "dmhost touch overlay", WS_POPUP, 0, 0, 1, 1, g_game, NULL, hi, NULL);
     if (!g_ov) { LOG("触屏浮层：覆盖层窗口建不出来（%lu）", GetLastError()); return; }
 

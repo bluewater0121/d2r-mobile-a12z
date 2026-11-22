@@ -6,12 +6,36 @@
 #include <mach/vm_map.h>
 #endif
 #endif
+#if defined(DM_WIN) || defined(_WIN32)
+#include <windows.h>
+#endif
 int dm_tg_vm_read(uint64_t address,void *out,size_t bytes) {
     if(!out || !bytes || !address || address>UINT64_MAX-bytes)return 0;
 #if defined(__APPLE__) || defined(__ANDROID__) || defined(__OHOS__)
     vm_size_t copied=0;
     kern_return_t rc=vm_read_overwrite(mach_task_self(),(vm_address_t)address,(vm_size_t)bytes,(vm_address_t)out,&copied);
     return rc==KERN_SUCCESS && copied==bytes;
+#elif defined(DM_WIN) || defined(_WIN32)
+    /* Windows：客体代码和宿主在同一个进程地址里，直接读；先按 VirtualQuery 查这一段是不是可读的已提交内存（跨区域就逐段走）。
+       读坏指针 / 未提交页 / PAGE_GUARD 一律当读失败返回 0，与 Mach 版的返回语义一致。
+       Windows: the guest runs in the same process address space, so read directly; check with VirtualQuery that this span is committed and
+       readable first, walking segment by segment when it crosses regions. A bad pointer, an uncommitted page or PAGE_GUARD all count as a
+       failed read (returns 0), the same semantics as the Mach version. */
+    unsigned char *dst=(unsigned char *)out;
+    uint64_t at=address,left=bytes;
+    while(left) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if(!VirtualQuery((LPCVOID)(uintptr_t)at,&mbi,sizeof mbi))return 0;
+        if(mbi.State!=MEM_COMMIT)return 0;
+        DWORD prot=mbi.Protect & 0xff;
+        if(!prot || prot==PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD))return 0;
+        uint64_t base=(uint64_t)(uintptr_t)mbi.BaseAddress, end=base+(uint64_t)mbi.RegionSize;
+        if(at>=end)return 0;
+        uint64_t n=end-at; if(n>left)n=left;
+        memcpy(dst,(const void *)(uintptr_t)at,(size_t)n);
+        dst+=n; at+=n; left-=n;
+    }
+    return 1;
 #else
     (void)address;return 0;
 #endif

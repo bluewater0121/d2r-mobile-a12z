@@ -35,6 +35,14 @@ endforeach()
 if(NOT DM_GEN_DIR OR NOT EXISTS ${DM_GEN_DIR}/dm_vault_tab.h)
   message(FATAL_ERROR "要 -DDM_GEN_DIR=<由游戏文件生成的宿主表头目录>（dm_vault_tab.h / dm_hud_exp.h / dm_bright_levels.inc，见 dm/host/Makefile）")
 endif()
+# 技能钮图集索引：dm/ios/tools/native_art/generate.py <RomFS> --output-dir <这里>
+# Skill-button atlas index: dm/ios/tools/native_art/generate.py <RomFS> --output-dir <this>
+if(NOT DEFINED DM_WIN_TOUCHART)
+  set(DM_WIN_TOUCHART ${CMAKE_BINARY_DIR}/../touchart)
+endif()
+if(NOT EXISTS ${DM_WIN_TOUCHART}/dm_touch_native_art.c)
+  message(FATAL_ERROR "要 -DDM_WIN_TOUCHART=<native_art 生成目录>（缺 ${DM_WIN_TOUCHART}/dm_touch_native_art.c）：先跑 dm/ios/tools/native_art/generate.py <RomFS> --output-dir ${DM_WIN_TOUCHART}")
+endif()
 if(NOT DM_VULKAN_INCLUDE)
   if(DEFINED ENV{VULKAN_SDK} AND EXISTS $ENV{VULKAN_SDK}/Include/vulkan/vulkan.h)
     set(DM_VULKAN_INCLUDE $ENV{VULKAN_SDK}/Include)
@@ -92,6 +100,13 @@ set(WIN_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/sched_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/touch_win.cpp
   ${DM}/ios/Sources/dm_touch_controls.c
+  # 技能钮图标：当前绑定 + 原版技能图集切片（和安卓同一套源；图集索引由 native_art/generate.py 从玩家的游戏文件生成）
+  # Skill-button icons: current bindings + slices of the original skill atlas (the same sources Android uses; the atlas index is generated
+  # from the player's own game files by native_art/generate.py)
+  ${DM}/ios/Sources/dm_touch_game_state.c
+  ${DM}/ios/Sources/dm_touch_game_identity.c
+  ${DM}/ios/Sources/dm_touch_game_bridge.c
+  ${DM_WIN_TOUCHART}/dm_touch_native_art.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_win.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/tls_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/misc_win.c
@@ -104,6 +119,7 @@ add_library(dmcore STATIC ${HOST_SRCS} ${HLE_SRCS} ${GFX_SRCS} ${LIBDEFLATE_SRCS
 list(REMOVE_DUPLICATES HOST_SRCS)
 target_include_directories(dmcore PUBLIC
   ${HOST} ${DM}/gfx ${DM}/gfx/nvn/include ${DM}/gfx/vulkan ${DM}/gfx/vulkan/engine
+  ${DM}/ios/Sources ${DM_WIN_TOUCHART}
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/include ${DM_GEN_DIR} ${DM_VULKAN_INCLUDE})
 # 与安卓同档（-O1 -g），dm_win_compat.h 强制包含；客体代码要大量读写宿主内存，关掉严格别名
 # Same tier as Android (-O1 -g), dm_win_compat.h force-included; guest code reads and writes host memory heavily, so strict aliasing is off
