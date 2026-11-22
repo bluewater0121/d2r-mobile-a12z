@@ -32,6 +32,8 @@ extern "C" {
 #include "../host/dm.h"
 #include "../host/dm_hud.h"
 #include "../host/dm_actions.h"
+#include "../host/dm_cursor.h"   // dm_ui_touch / dm_ui_long_press / dm_ui_use_item / dm_world_tap …：手势请求的宿主终点 | host endpoints of the gesture requests
+#include "../host/dm_uiscreen.h"  // dm_ui_rect / dm_screen_real：界面矩形与画面尺寸（点世界要整屏归一化）| UI rectangle and picture size (tapping the world needs screen-normalised)
 #include "../ios/Sources/dm_touch_game_state.h"
 #include "../ios/Sources/dm_touch_native_art.h"
 uint32_t dm_padmode_rebuilds(void);   // dm/host/dm_padmode.c：布局重建次数（变化 = HUD 控件全换，技能钮要重新认）| layout rebuild count (a change means the HUD widgets were all replaced)
@@ -136,6 +138,8 @@ static void layout_make(void) {
 // put-down). iOS withdraws those in front_ios.m's pulseTick; on Windows nobody ever did, so a pulse once landed stayed pressed forever -- which
 // reads as "tap a skill once and it keeps casting", because every update() folds pulse_button back into the buttons. The criteria follow iOS,
 // with "has the game taken it yet" counted by how often pad_step (the game's input sampling) ran.
+// 面板态手势泵（定义在下面「手指」一段）：把排队的手指事件交给手势层并调宿主 | panel-state gesture pump (defined below in the fingers section)
+static void gesture_pump(double now);
 static uint64_t g_pad_polls;               // pad_step 被游戏取了几次 | how many times the game polled pad_step
 static uint64_t g_pulse_epoch_seen;        // 正在收的那个脉冲 | the pulse being withdrawn
 static uint64_t g_pulse_poll0;             // 这个脉冲落地 / 上一次收回时的采样数 | sample count when it landed / at the last withdrawal
@@ -179,6 +183,15 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
     // lost to it). So this no longer bails out on the input source -- only "overlay off / not in a run" stands down.
     if (!g_on || !g_in_run.load()) return;   // 浮层没开 / 不在局内：照旧让手柄与键盘的输入走 | overlay off / not in a run: leave pad and keyboard input alone
     std::lock_guard<std::mutex> lk(g_mx);
+    // 面板态（物品栏 / 技能树 / 选项开着）= 手势层的导航态：手指变成界面指针，圆钮与摇杆停发（照 iOS / mac 宿主）
+    // Panel state (inventory / skill tree / options open) = the gesture layer's navigation state: fingers become UI pointers and the round
+    // buttons / stick stop publishing (same as the iOS and Mac hosts)
+    { int panel = dm_ui_panel_state();
+      dm_tc_set_panel_state(panel);
+      dm_tc_set_navigation_mode(&g_tc, panel != 0);
+      static int nav_prev = -1;
+      if ((panel != 0) != nav_prev) { nav_prev = (panel != 0); LOG("触屏浮层：%s（面板位 %d）", panel ? "切面板态（手指当界面指针）" : "回游戏态（圆钮与摇杆）", panel); } }
+    gesture_pump((double)now / 1e9);
     ++g_pad_polls;
     dm_tc_tick(&g_tc, (double)now / 1e9);
     pulse_pump(&g_tc, (double)now / 1e9);
@@ -202,7 +215,93 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
 }
 
 // ---------- 手指 ----------
+// 面板态（物品栏 / 技能树 / 选项开着，或不在局内）下，手指不是游戏触点而是「界面指针」：手势层只定型，
+// 真正干活的是宿主的请求泵（dm_ui_long_press / dm_ui_use_item / dm_ui_identify_hovered / dm_world_tap / dm_ui_drag_*）。
+// iOS 由 front_ios.m 在松手那一刻比较手势层的那几个计数器再调宿主；mac 宿主由 touch_mac.c 把事件排队、在取手柄那一拍做同样的事。
+// 这里照 mac 宿主：窗口线程只把事件排进队，游戏线程（pad_step）里再动状态机并调宿主（宿主那套要读游戏内存，不能跨线程）。
+// In panel state (inventory / skill tree / options open, or outside a run) a finger is not a game touch point but a "UI pointer": the gesture
+// layer only classifies it, and the host's request pumps do the work (dm_ui_long_press / dm_ui_use_item / dm_ui_identify_hovered /
+// dm_world_tap / dm_ui_drag_*). iOS compares those counters in front_ios.m at the moment of release and calls the host; the Mac host queues
+// the events in touch_mac.c and does the same on the controller-read tick. Here we follow the Mac host: the window thread only enqueues, and
+// the game thread (pad_step) drives the state machine and calls the host (the host reads game memory and must not be called cross-thread).
+#define DM_GQ_MAX 64
+static struct { int op, slot; float x, y; } g_gq[DM_GQ_MAX];
+static int g_gqn;
+static int g_ui_drag_on;
 static int g_claim[DM_TC_MAX_TOUCH];    // 这根手指归触屏控件（命中了圆钮 / 摇杆 / 边缘区，或面板态的界面指针）| this finger belongs to the touch controls
+
+// 界面归一化 y → 整屏归一化 y（真全屏时界面按 16:9 贴底、画面更高，与 iOS 的 world_norm 同一步）
+// Interface-normalised y -> screen-normalised y (with true full screen the interface sits 16:9 at the bottom of a taller picture; the same step
+// as iOS's world_norm)
+static float ui_y_to_screen(float uy) {
+    int x, y, w, h, rw = 0, rh = 0;
+    dm_ui_rect(&x, &y, &w, &h);
+    return dm_screen_real(&rw, &rh) && rh > 0 && h > 0 ? (uy * h + y) / rh : uy;
+}
+
+// 面板态的手势泵：把排队的手指事件交给手势层，并在松手那一刻按计数器把请求发给宿主（照 touch_mac.c 的松手那一段）
+// Gesture pump for panel state: hand the queued finger events to the gesture layer and, at release, send the requests to the host according
+// to the counters (the release block of touch_mac.c)
+static void gesture_pump(double now) {
+    const float W = g_tc.layout.width > 0 ? g_tc.layout.width : 667.0f;
+    const float H = g_tc.layout.height > 0 ? g_tc.layout.height : 375.0f;
+    for (int i = 0; i < g_gqn; ++i) {
+        int op = g_gq[i].op, slot = g_gq[i].slot;
+        float x = g_gq[i].x, y = g_gq[i].y;
+        if (slot < 0 || slot >= DM_TC_MAX_TOUCH) continue;
+        if (op == 0) {
+            dm_tc_begin_at(&g_tc, slot, x, y, now);
+            // 命中结果一出来就告诉手势层（1 物品区 / 2 页签 / 3 面板外 / 其余 = 面板内别处）
+            // Tell the gesture layer the hit result as soon as it exists (1 item area / 2 tab / 3 outside the panel / anything else = elsewhere)
+            if (g_tc.navigation_mode && g_tc.pointer_slot == slot) {
+                int kind = dm_ui_item_at_now(x / W, y / H);
+                dm_tc_pointer_item(&g_tc, kind);
+                if (getenv("DM_TOUCH_LOG")) LOG("触屏浮层：界面手指分类 %d（%.3f,%.3f）", kind, (double)(x / W), (double)(y / H));
+            }
+        } else if (op == 1) {
+            dm_tc_move_at(&g_tc, slot, x, y, now);
+            dm_tc_finger *f = &g_tc.finger[slot];
+            if (g_tc.navigation_mode && slot == g_tc.pointer_slot && f->ui_drag) {
+                if (!g_ui_drag_on) { g_ui_drag_on = 1; dm_ui_drag_lift(DM_TC_POINTER_LIFT_PT / H);
+                    dm_ui_drag_begin(f->ui_drag, f->aim_origin_x / W, f->aim_origin_y / H, 44.0f / H); }
+                dm_ui_drag_move(x / W, y / H);
+            }
+        } else {
+            if (g_ui_drag_on && slot == g_tc.pointer_slot) { g_ui_drag_on = 0; dm_ui_drag_end(); }
+            // 松手前先把手势层判类要用的几样交上去：是否拿着、刚点的那件是不是魔盒、仓库里指着哪一叠、指着哪件未鉴定
+            // Before release hand over what the classification needs: whether something is held, whether the tapped item is the cube, which
+            // stack the cursor points at in the stash, and which unidentified item it points at
+            { dm_hud_info hi; dm_hud_get(&hi); dm_tc_set_holding(&g_tc, hi.valid && hi.holding && !dm_ui_targeting()); }
+            dm_tc_set_tap_box(dm_ui_tap_box()); dm_tc_set_cur_stack(dm_ui_cur_stack_id()); dm_tc_set_hover_unid(dm_ui_hover_unid());
+            unsigned wt = g_tc.world_tap_seq, mc = g_tc.mouse_click_seq, tt = g_tc.tab_tap_seq, us = g_tc.use_seq;
+            unsigned ids = g_tc.ident_seq, lps = g_tc.long_press_seq, its = g_tc.item_tap_seq;
+            dm_tc_finger *f = &g_tc.finger[slot];
+            if (g_tc.navigation_mode && slot == g_tc.pointer_slot) {
+                if (f->shop_drag) {   // 从货架起拖、落在背包类物品区 = 买（光标先放回那件货上）| drag from the shelf, dropped on an inventory-type area = buy (cursor first goes back onto the goods)
+                    if (dm_ui_drop_at_now(f->x / W, (f->y - DM_TC_POINTER_LIFT_PT) / H, f->y / H) == 5) {
+                        dm_ui_shop_buy_at(f->aim_origin_x / W, f->aim_origin_y / H);
+                        g_tc.pointer_x = f->aim_origin_x; g_tc.pointer_y = f->aim_origin_y; }
+                } else if (f->pointer_dragged) {
+                    int dk = dm_ui_drop_at_now(f->x / W, (f->y - DM_TC_POINTER_LIFT_PT) / H, f->y / H); float dx, dy;
+                    if ((dk == 5 && dm_ui_drop_point(&dx, &dy)) || (dk == 0 && dm_ui_origin_point(&dx, &dy))) dm_tc_pointer_release_at(&g_tc, dx * W, dy * H);
+                    else { if (dk == 7) { dm_shop_sell_cursor(); dk = 0; } dm_tc_pointer_release(&g_tc, dk); }   // 7 = 松在商人货架上：卖 | 7 = released on the vendor shelf: sell
+                }
+            }
+            dm_tc_end_at(&g_tc, slot, now);
+            if (g_tc.tab_tap_seq != tt) dm_ui_tab_go();
+            if (g_tc.long_press_seq != lps) { LOG("触屏浮层：物品区长按 → 宿主界面长按"); dm_ui_long_press(); }
+            if (g_tc.item_tap_seq != its) dm_ui_item_tap();
+            if (g_tc.ident_seq != ids) { LOG("触屏浮层：双击未鉴定物品 → 免鉴定"); dm_ui_identify_hovered(); }
+            if (g_tc.use_seq != us) { LOG("触屏浮层：双击物品 → 使用（喝药 / 读卷轴 / 开魔盒）"); dm_ui_use_item(); }
+            if (g_tc.world_tap_seq != wt) {
+                float ux = x / W, uy = y / H;   // 视图归一化（用来认佣兵头像）| view-normalised (used to recognise the mercenary portrait)
+                float wx = g_tc.world_tap_x / W, wy = ui_y_to_screen(g_tc.world_tap_y / H);   // 出图归一化 | normalised to the rendered picture
+                LOG("触屏浮层：点世界 (%.3f,%.3f)", (double)wx, (double)wy); dm_ui_world_tap(ux, uy, wx, wy); }
+            if (g_tc.mouse_click_seq != mc) { float nx = g_tc.mouse_click_x / W, ny = g_tc.mouse_click_y / H; dm_ui_touch(0, nx, ny); dm_ui_touch(2, nx, ny); }
+        }
+    }
+    g_gqn = 0;
+}
 
 int dm_win_touch_pointer(int op, float nx, float ny, int slot) {
     if (!g_on) return 0;
@@ -210,6 +309,14 @@ int dm_win_touch_pointer(int op, float nx, float ny, int slot) {
     float x = nx * g_dpw, y = ny * g_dph;
     double now = (double)now_ns() / 1e9;
     std::lock_guard<std::mutex> lk(g_mx);
+    // 面板态：手指当界面指针，排进队由游戏线程处理（宿主调用只能在那边做）；面板里的手指不喂给游戏当触点，那边收的是鼠标点击
+    // Panel state: the finger is a UI pointer, queued for the game thread (host calls may only happen there); it is not handed to the game as a
+    // touch point -- panels take mouse clicks instead
+    if (g_tc.navigation_mode) {
+        if (g_gqn < DM_GQ_MAX) { g_gq[g_gqn].op = op; g_gq[g_gqn].slot = slot; g_gq[g_gqn].x = x; g_gq[g_gqn].y = y; ++g_gqn; }
+        g_dirty.store(1);
+        return 1;
+    }
     if (op == 0) {
         // 落点先按「差一点」修正一次再交给状态机：指头落在圆钮外沿 25% 以内 = 就算按在这颗钮的正中。
         // 只对圆钮（主技能 / 四个技能 / 回城）这样做，且只在完全没命中任何控件时；摇杆不吸——它的落点就是底盘位置。

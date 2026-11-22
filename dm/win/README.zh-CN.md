@@ -299,6 +299,18 @@ z 序里 `hWndInsertAfter = g_game` 是**放到它后面**（below），所以�
 
 进程内触摸模拟（`DM_TOUCH_SIM`）走的是同一条 `touch_dispatch`，所以它验证的是状态机与发布这一半；「触点能不能到窗口」这一半只能在真机上验（本机 RDP 会话注入恒 87，见坑 23）。
 
+**25. 触屏点物品没有手势（长按 / 双击使用·鉴定 / 点世界 / 拖放）——Windows 只接了「圆钮 + 摇杆」，手势层那一半一直没人把请求发给宿主。**
+
+`dm_touch_controls.c` 的手势层只定型、不干活，真正动手的是宿主的请求泵（`dm_ui_long_press` / `dm_ui_use_item` / `dm_ui_identify_hovered` / `dm_world_tap` / `dm_ui_drag_*`）。iOS 由 `front_ios.m` 在松手那一刻比较手势层的计数器（`long_press_seq` / `use_seq` / `ident_seq` / `item_tap_seq` / `world_tap_seq` / `mouse_click_seq` / `tab_tap_seq`）再调宿主，`touch_mac.c` 是同一套的桌面版（事件排队、在取手柄那一拍做）。`dm/win` 原先一处都没有：`grep long_press_seq dm/win` 为空——所以面板里的长按、双击（读卷轴 / 喝药 / 免鉴定）、点世界（拾取 / 对话 / 开箱）、拖放全都不存在，能用的只有圆钮与摇杆。
+
+补齐的三件事（照 `touch_mac.c`）：
+
+- **面板态**：`pad_step` 里读 `dm_ui_panel_state()` → `dm_tc_set_panel_state` + `dm_tc_set_navigation_mode(panel != 0)`。面板开着（物品栏 / 技能树 / 选项）= 手势层的导航态：手指变成「界面指针」，圆钮与摇杆停发（日志 `切面板态（手指当界面指针）` / `回游戏态（圆钮与摇杆）`）。
+- **事件排队**：窗口线程不许读游戏内存，所以面板态的手指事件（`op 0/1/2` + 槽 + 点）只排进 `g_gq[]`，由游戏线程（`pad_step`）里的 `gesture_pump()` 消费：`dm_tc_begin_at` 之后立刻 `dm_tc_pointer_item(dm_ui_item_at_now(...))`（1 物品区 / 2 页签 / 3 面板外 / 其余面板内别处），拖动走 `dm_ui_drag_begin/move/end`。
+- **松手发请求**：先交 `dm_tc_set_holding` / `set_tap_box` / `set_cur_stack` / `set_hover_unid`（判类要用），再 `dm_tc_end_at`，然后按计数器变化调宿主：`tab_tap_seq`→`dm_ui_tab_go`、`long_press_seq`→`dm_ui_long_press`（日志 `物品区长按 → 宿主界面长按`）、`item_tap_seq`→`dm_ui_item_tap`、`ident_seq`→`dm_ui_identify_hovered`、`use_seq`→`dm_ui_use_item`（日志 `双击物品 → 使用（喝药 / 读卷轴 / 开魔盒）`）、`world_tap_seq`→`dm_ui_world_tap`、`mouse_click_seq`→`dm_ui_touch(0)+dm_ui_touch(2)`。拖放的落点仍按 `DM_TC_POINTER_LIFT_PT` 抬起量算（`dm_ui_drop_at_now` / `dm_ui_drop_point` / `dm_ui_origin_point` / `dm_ui_shop_buy_at`）。点世界的纵向走 `ui_y_to_screen()`（界面归一化 → 出图归一化，同 iOS 的 world_norm）。
+
+游戏态（没面板）一点没动：`面板位 0` → 直接走原来的 `dm_tc_begin_at`，`DM_TOUCH_SIM` 复跑仍是 `摇杆 0,0 → -8193,31726（同时按键 0x4）`。
+
 
 ## 排障
 
