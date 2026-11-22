@@ -74,8 +74,21 @@ set "DM_WINDOW=1"
 if not defined DM_TACT_PREFETCH set "DM_TACT_PREFETCH=0"
 if defined RES set "DM_GAME_RES=%RES%"
 
-rem one instance only: the save dir has a transaction log, two processes would fight over it
-taskkill /im dmhost.exe /f >nul 2>nul
+rem one instance only: the save dir has a transaction log, two processes would fight over it.
+rem Close the old instance politely first (WM_CLOSE) so it asks the game to save and waits for the commit,
+rem and only force-kill it if it is still there after ~8 seconds.
+"%SystemRoot%\System32\taskkill.exe" /im dmhost.exe >nul 2>nul
+set "OLDN=0"
+:waitold
+"%SystemRoot%\System32\tasklist.exe" /fi "imagename eq dmhost.exe" 2>nul | "%SystemRoot%\System32\find.exe" /i "dmhost.exe" >nul || goto oldgone
+set /a OLDN+=1
+if %OLDN% geq 8 goto oldkill
+"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul
+goto waitold
+:oldkill
+echo The previous instance did not save and quit in 8s - killing it.
+"%SystemRoot%\System32\taskkill.exe" /im dmhost.exe /f >nul 2>nul
+:oldgone
 
 cd /d "%ROOT%\build\win"
 echo Launching %BIN%

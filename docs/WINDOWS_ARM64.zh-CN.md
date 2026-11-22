@@ -68,6 +68,8 @@ ninja -C build/win/obj
 
 `-DDM_GEN_DIR` 指向由游戏文件生成的宿主表头目录（`dm_vault_tab.h` / `dm_hud_exp.h` / `dm_bright_levels.inc`）。Vulkan 没有 ARM64 导入库，链接时直接用 `C:\Windows\System32\vulkan-1.dll`（`-DDM_VULKAN_DLL` 可改），头文件路径用 `-DDM_VULKAN_INCLUDE` 指定。
 
+产物 `build/win/obj/dmhost.exe` 是自带的：C++ 运行库静态链进来（`-static`），只剩 `libwinpthread-1.dll` 是导入项，构建时从工具链的 `bin` 拷到 exe 旁边（`CMakeLists.txt` 的 POST_BUILD）。少这一步时双击 `start-win-arm64.bat` 会以 `0xC0000135`（找不到 DLL）秒退、日志一个字都没有。
+
 ## 运行
 
 ```
@@ -109,6 +111,18 @@ obj\dmhost.exe dmdata main sdk subsdk0
 
 面键默认按位置（下 = A 确认、右 = B 返回、左 = Y、上 = X），与 PC / Xbox 版同位置同功能；按 Switch 字母报键的手柄（或习惯「右 A 确认」）加 `DM_PAD_AB=switch` 只换 A/B。细节与验证方法见 [../dm/win/README.zh-CN.md](../dm/win/README.zh-CN.md) 的「手柄」一节。
 
+### 前端流程：开机停在主菜单
+
+iOS / 安卓是触屏，前端流程由宿主「替玩家按键」理顺（`dm/host/dm_cursor.c` 的「前端路径理顺」）：有存档就在主菜单替按 X 打开选角页、选角列表一收起又替按 X 重开。键盘 / 手柄能自己走原版菜单，这两下会跟玩家抢：开机第一屏直接成了人物列表，选角页按 A 选定后列表被替按的 X 重开、要再按一次才进得去。
+
+所以 Windows 上 `tuning_defaults()` 把 `DM_FE_AUTO` 设成 `0`，走原版流程：**开机是主菜单 → A 进选角页 → A 开始游戏**，和原版 Switch 一致。要看触屏那套行为加 `DM_FE_AUTO=1`（例如以后接上真实触屏）。
+
+### 存档：关窗口前会先请游戏存盘
+
+游戏自己的定时自动存盘约 5 分钟一次，直接关窗口会丢掉这之间的进度。关窗口（右上角 ×、Alt+F4、`taskkill /im dmhost.exe`）时前端照 Mac 壳 `app_quit` 的做法，先 `dm_save_wait(3, …)` 请游戏走一次它自己的存盘、等 `存档提交 #N … 原子换入` 落盘再收尾，日志是 `窗口：退出前等游戏存盘 388 ms，期间存档提交 2 次`；3 秒内没等到会如实打一行 `【红】窗口：未存盘退出`。
+
+`start-win-arm64.bat` 关旧实例也是先温和关（发 WM_CLOSE）等最多 8 秒，实在不走才 `taskkill /f`。
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -119,6 +133,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 | `DM_TACT_PREFETCH=0` | 关掉战术预取（Windows 上建议关） |
 | `DM_KBD=<文本>` | `swkbd` 起名面板直接返回这段文本，跳过宿主输入框 |
 | `DM_PAD=0` / `DM_PAD_AB=switch` / `DM_PAD_LOG=1` / `DM_PAD_TEST=<秒>` | 手柄开关 / Switch 面键语义 / 手柄日志 / 无手柄时注入一次 A 验通路 |
+| `DM_FE_AUTO=0` | 关掉触屏那套「替玩家按键」的前端流程（Windows 缺省关，开机停在主菜单） |
 | `DM_WIN_SHOT=<首帧>[+<步长>]:<路径模板>` | 在呈现线程把上屏前的图读回成 32 位 BMP，例如 `200+100:C:\...\shot%d.bmp` |
 | `DM_WIN_SIZE=宽x高` | 窗口客户区尺寸（缺省 1600x900，按屏幕工作区不超过 90%） |
 | `DM_GAME_RES=宽x高` | 游戏渲染分辨率（缺省按原版 16:9：1600x900） |
@@ -128,6 +143,7 @@ obj\dmhost.exe dmdata main sdk subsdk0
 | `DM_PRESENT_IMAGES=N` | 交换链张数（缺省 3；4 张实测更差，排障可调） |
 | `DM_PRESENT_LEAD_MS=N` | 出图提前量（缺省 0 = 关；4 ms 实测无效，见「性能」第五步） |
 | `DM_STALL_PROBE=1` | 长帧取栈：每 1 ms 采出图线程 PC，超过 22 ms 的帧打一行命中函数（会拖慢一点，只在排障时开） |
+| `DM_HID_LOG=1` | 两份输入通道（宿主键盘 `dm_input_set` / 手柄 `dm_pad_set`）按键变化各打一行，带调用者地址 |
 | `DM_GFX_FENCE_LOG=1` | 每次栅栏等待打一行 `wait_ms` / `since_submit_ms` |
 | `DM_NVN_LOG` / `DM_FS` / `DM_IMPORTS` / `DM_FAULT_LOG` / `DM_VEH_LOG` / `DM_VEH_TRACE` | 排障日志开关 |
 
@@ -177,7 +193,6 @@ obj\dmhost.exe dmdata main sdk subsdk0
 - `DM_WINDOW=0` 走到 `真实Vulkan后端未初始化` 就停，尚未接上。
 - 音频（WASAPI）已实现但没实际听过；`hle_lifecycle.c` 的 SIGTERM/GCD、`hle_movie.c` 的解码在 Windows 上没验过。
 - 「掉落过滤」规则还没能写进 `save/Settings/*.fltr`（日志有 `规则文件没写成`）。
-- 角色列表页用键盘 A 直接「选择」在这台机器上没能触发（职业选择页和模式页没问题），自动化时走「新建角色」那条路更稳。
 - 掉帧还在：300 帧里约 50 帧会掉一个垂直同步（`[nvn] 上屏` 的「掉帧」一列），来源是帧内偶尔的几毫秒抖动，暂时只能靠余量吃。
 - 窗口拉伸 / 全屏切换没实测；实体手柄这台机器上没有，通路靠 `DM_PAD_TEST` 注入 A 验过。
 
