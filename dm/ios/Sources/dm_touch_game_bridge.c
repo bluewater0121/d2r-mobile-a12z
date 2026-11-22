@@ -23,8 +23,7 @@ int dm_touch_game_snapshot(dm_tg_snapshot *out) {
     if(!out)return 0;
     pthread_mutex_lock(&lock);*out=latest;pthread_mutex_unlock(&lock);return out->valid;
 }
-/* 只读render实例门；不学习cohort，不续反馈TTL，不写客体。未知一律原render。 | Read-only render instance gate; does not learn the cohort, does not extend the feedback TTL, does not write to the guest. Anything unknown gets the original render. */
-int dm_touch_game_hide_own_glyph(uint64_t widget) {
+/* 只读render实例门；不学习cohort，不续反馈TTL，不写客体。未知一律原render。 | Read-only render instance gate; does not learn the cohort, does not extend the feedback TTL, does not write to the guest. Anything unknown gets the original render. */int dm_touch_game_hide_own_glyph(uint64_t widget) {
     int match=0;pthread_mutex_lock(&lock);
     const module_t *m=main_module;uint64_t t=now_ns();
     if(m && scene_game && scene_epoch && world_epoch && hud_cohort.confirmed && hud_cohort.seen==63 &&
@@ -50,8 +49,9 @@ static unsigned dg[8], dg_id[8]; static uint64_t dg_last;
 static void diag_tick(void) {
     static int on=-1; if(on<0) on=getenv("DM_BINDING_DIAG")!=NULL; if(!on) return;
     uint64_t t=now_ns(); if(t-dg_last<3000000000ull) return; dg_last=t;
-    LOG("绑定诊断：调用 %u｜寄存器不符 %u｜槽越界 %u｜组不符 %u｜不在局内 %u｜身份未确认 %u（原因 3:%u 4:%u 5:%u 6:%u 7:%u，LR 偏移 %#llx 槽 %u）｜成功 %u｜scene_game %d world %llu",
-        dg[0],dg[1],dg[2],dg[3],dg[4],dg[5],dg_id[3],dg_id[4],dg_id[5],dg_id[6],dg_id[7],(unsigned long long)dm_tg_identity_lr,dm_tg_identity_slot,dg[6],scene_game,(unsigned long long)world_epoch);
+    LOG("绑定诊断：调用 %u｜寄存器不符 %u｜槽越界 %u｜组不符 %u｜不在局内 %u｜身份未确认 %u（原因 3:%u 4:%u 5:%u 6:%u 7:%u，LR 偏移 %#llx 槽 %u）｜成功 %u｜负缓存 命中 %d 标记 %d｜scene_game %d world %llu",
+        dg[0],dg[1],dg[2],dg[3],dg[4],dg[5],dg_id[3],dg_id[4],dg_id[5],dg_id[6],dg_id[7],(unsigned long long)dm_tg_identity_lr,dm_tg_identity_slot,dg[6],
+        dm_tg_neg_hits,dm_tg_neg_marks,scene_game,(unsigned long long)world_epoch);
 }
 static int live_check;   /* 真游戏里才开（要调游戏函数）；单测的假模块上不开 | Turned on only in the real game (it calls game functions); not turned on for the unit tests' fake module */
 void dm_touch_game_live_check(int on) { live_check=on; }
@@ -82,7 +82,15 @@ static int skill_live(const unsigned char *b,uint32_t id,int32_t item) {
 }
 static void binding_getter(const uint64_t *regs) {
     const module_t *m=main_module;
+    { static int noop=-1; if(noop<0) noop=getenv("DM_BINDING_NOOP")!=NULL; if(noop) return; }   // 排查：只留门本身的开销 | debugging: leave only the gate's own overhead
+    /* 分级早退（只用于定位掉帧：DM_BINDING_STAGE=n 表示走到第 n 段就 return，n 越大越接近完整回调）；
+       0/不设 = 正常跑。查完可以留着，它只多一次 getenv。
+       Staged early returns, only for locating frame loss: DM_BINDING_STAGE=n returns at stage n; 0/unset = normal run. */
+    static int st=-2;
+    if(st==-2){const char *e=getenv("DM_BINDING_STAGE");st=e?atoi(e):0;}
+    if(st==1)return;
     dg[0]++; diag_tick();
+    if(st==2)return;
     if(!m || !regs || regs[10]!=(uint64_t)(m->base+BINDING_OFFSET) || regs[8]%DM_TG_STRIDE){dg[1]++;return;}
     uint64_t effective=regs[8]/DM_TG_STRIDE;
     uint32_t input_slot=(uint32_t)regs[19]; // PRE-ldr原getter arg，不是ID。 | PRE-ldr arg of the original getter, not an ID.
@@ -90,8 +98,23 @@ static void binding_getter(const uint64_t *regs) {
     uint64_t selected_bank=effective-input_slot;
     if(selected_bank!=0 && selected_bank!=16){dg[3]++;return;}
 #ifndef DM_TG_TEST_SYNTHETIC_IDENTITY
-    if(regs[23]!=regs[19]) {dg[5]++;dg_id[4]++;return;}   /* 不是 HUD updater（见下面同一判定的说明）：先筛掉，免得每次调用都去查 16 个槽（Time Profiler：混战里占游戏主线程三成） | not the HUD updater (see the same check below): filter first, so not every call checks 16 slots (Time Profiler: a third of the game main thread in heavy fights) */
+    /* 不是 HUD updater（见下面同一判定的说明）：先筛掉，免得每次调用都去查 16 个槽（Time Profiler：混战里占游戏主线程三成）
+       | not the HUD updater (see the same check below): filter first, so not every call checks 16 slots (Time Profiler: a third of the game main thread in heavy fights) */
+    if(regs[23]!=regs[19]) {dg[5]++;dg_id[4]++;return;}
 #endif
+    if(st==3)return;
+    /* 节流（放在 HUD 前置筛之后，且**按槽位**各算一个间隔；Windows 缺省 0 = 不节流）：这颗 getter 在 Windows 上被游戏叫到 3~6 千次/秒，
+       每次都要离开客体进宿主函数。实测 15 ms 的按槽位节流能多回 1 帧左右，但**六槽身份学习会时好时坏**（学不齐就退回键位字母、图标出不来），
+       所以缺省关掉、只留开关做对照；日常开销已经由「栈读页缓存 + 按 fp 的负缓存」压下去了。
+       Throttle, placed after the HUD pre-filter with **one interval per slot**; default 0 = off on Windows. The game calls this getter 3-6k times a
+       second. A 15 ms per-slot throttle buys about one extra frame but makes the six-slot identity learning flaky (an incomplete cohort falls back to
+       key letters and the icons never appear), so it stays off by default and is left as a comparison switch; the everyday cost is already handled by
+       the stack-read page cache and the per-fp negative cache. */
+    { static int th_ms=-1; static uint64_t th_last[2*DM_TG_SLOTS];
+      if(th_ms<0){const char *e=getenv("DM_BINDING_THROTTLE_MS");th_ms=e?atoi(e):0;}
+      if(th_ms>0){int k=(selected_bank?DM_TG_SLOTS:0)+(int)input_slot; uint64_t t=now_ns();
+          if(t-th_last[k]<(uint64_t)th_ms*1000000ull){dg[7]++;return;} th_last[k]=t;} }
+    if(st==4)return;
     /* 绑着但玩家现在没有的技能（位 = 槽）。要调游戏函数，放在取锁之前；只随换装备变，每组 0.2 秒查一次 | Skills that are bound but the player does not currently have (bit = slot). This calls a game function, so it is placed before taking the lock; it only changes with gear, checked once per 0.2 s per bank */
     static unsigned dead_c[2]; static uint64_t dead_at[2]; uint64_t tn=now_ns(); int bk=selected_bank!=0;
     unsigned dead=dead_c[bk]; int recheck=live_check && tn-dead_at[bk]>=200000000ull; if(recheck) { dead=0; dead_at[bk]=tn; }
@@ -99,22 +122,17 @@ static void binding_getter(const uint64_t *regs) {
         static uint32_t gone[32]; int live=skill_live((const unsigned char*)m->base,id,item); if(!live)dead|=1u<<i;
         if(gone[selected_bank+i]!=(live?UINT32_MAX:id)) { gone[selected_bank+i]=live?UINT32_MAX:id; if(!live)LOG("技能钮：槽 %d 绑的技能 %u（物品 %d）玩家现在没有，按空位显示",(int)selected_bank+i,id,item); else LOG("技能钮：槽 %d 的技能回来了，照常显示",(int)selected_bank+i); } }
     if(recheck) dead_c[bk]=dead;
+    if(st==5)return;
     pthread_mutex_lock(&lock);
     if(!scene_game || !world_epoch) {dg[4]++;pthread_mutex_unlock(&lock);return;} // menu/nav不学cohort。 | menu/nav do not learn the cohort.
     uint64_t caller=0,hud=0;
-#ifndef DM_TG_TEST_SYNTHETIC_IDENTITY
-    /* 不读内存的前置筛：HUD updater在main3e2f68把arg放进w23、3e2f6c再mov w0,w23后BL原Get；原Get只动x19-x21，
-       被调函数按AAPCS保x23，所以HUD这条调用到门时必有x23==x19（arg）。不等=不是HUD updater，同「savedLR不符」一样IGNORE，省掉读栈。
-       Pre-filter that reads no memory: at main3e2f68 the HUD updater puts arg into w23, at 3e2f6c it does mov w0,w23 and then BL to the original Get; the original Get only touches x19-x21,
-              and the callee preserves x23 per AAPCS, so when this HUD call reaches the gate x23==x19 (arg) must hold. Not equal = not the HUD updater; IGNORE just like "savedLR mismatch", saving the stack read. */
-    if(regs[23]!=regs[19]) {dg[5]++;dg_id[4]++;pthread_mutex_unlock(&lock);return;}
-#endif
 #ifdef DM_TG_TEST_SYNTHETIC_IDENTITY
     int scope=dm_touch_game_test_identity(regs,&caller,&hud); // 仅独立SDK_STUB构建；不与生产符号碰撞。 | Only for the standalone SDK_STUB build; does not collide with production symbols.
 #else
     int scope=dm_tg_hud_identity(&hud_cohort,regs,(uint64_t)m->base,scene_game,world_epoch,dm_tg_vm_read,&caller,&hud);
 #endif
     if(scope==DM_TG_IDENTITY_UNCONFIRMED) {dg[5]++;if(dm_tg_identity_reason>=0&&dm_tg_identity_reason<8)dg_id[dm_tg_identity_reason]++;pthread_mutex_unlock(&lock);return;} // cache/unknown/readFail全IGNORE，不清HUD快照/不续时。 | cache/unknown/readFail are all IGNORE; do not clear the HUD snapshot / do not extend the time.
+    if(st==6) {pthread_mutex_unlock(&lock);return;}
     unsigned char mapping[72],bindings[DM_TG_SLOTS*DM_TG_STRIDE]={0};
     memcpy(mapping,m->base+MAPPING_OFFSET,sizeof mapping);
     for(int i=0;i<DM_TG_SLOTS;i++)memcpy(bindings+i*DM_TG_STRIDE,m->base+BINDING_OFFSET+(selected_bank+i)*DM_TG_STRIDE,4);
