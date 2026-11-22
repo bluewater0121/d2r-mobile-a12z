@@ -65,6 +65,8 @@ static int g_kw, g_ka, g_ks, g_kd;
 static int g_stick_rx;             // 滚轮累计的小幅右摇杆（松开后缓回 0） | small right-stick nudge accumulated from the wheel (eases back to 0)
 static int g_mouse_down, g_finger;
 static float g_mouse_x, g_mouse_y;
+static int g_front_click;          // 这一下按下走的是前端页面的界面点击（dm_ui_touch）| this press goes through the front-end UI click path (dm_ui_touch)
+void dm_ui_touch(int phase, float nx, float ny);   // dm/host/dm_cursor.c：界面点击（相 0 按下 / 1 移动 / 2 抬起 / 3 作废）| UI click (phase 0 down / 1 move / 2 up / 3 cancelled)
 
 static void push_input(void) {
     int32_t lx = (g_kd - g_ka) * 32767, ly = (g_kw - g_ks) * 32767;
@@ -97,8 +99,7 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
     (void)cx; (void)cy;
     *nx = x; *ny = y;
 }
-static void set_finger(int down) {
-    if (down && !g_mouse_down) {
+static void set_finger(int down) {    if (down && !g_mouse_down) {
         g_mouse_down = 1; g_finger = 1;
         dm_win_pad_touch();
     } else if (!down && g_mouse_down) {
@@ -156,18 +157,27 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         int cx = (int)(short)LOWORD(lp), cy = (int)(short)HIWORD(lp);
         mouse_to_pic(cx, cy, &g_mouse_x, &g_mouse_y);
-        // 触屏浮层开着（DM_WIN_TOUCH=1 且局内）：鼠标当一根手指喂给共用的触屏状态机 | overlay on (DM_WIN_TOUCH=1, in a run): the mouse is one finger for the shared touch state machine
-        if (dm_win_touch_enabled()) { if (g_mouse_down) dm_win_touch_pointer(1, g_mouse_x, g_mouse_y, 0); return 0; }
+        if (g_front_click) { dm_ui_touch(1, g_mouse_x, g_mouse_y); return 0; }
+        // 触屏浮层开着（DM_WIN_TOUCH=1 且局内）：鼠标当一根手指先喂给共用的触屏状态机；没落在控件上它返回 0，照旧当普通触点给游戏
+        // Overlay on (DM_WIN_TOUCH=1, in a run): the mouse goes to the shared touch state machine as one finger first; when it lands on no control the
+        // call returns 0 and the event still goes to the game as an ordinary touch point
+        if (dm_win_touch_enabled() && g_mouse_down && dm_win_touch_pointer(1, g_mouse_x, g_mouse_y, 0)) return 0;
         if (g_mouse_down) set_finger(1);   // 拖动 = 手指移动 | drag = finger move
         return 0; }
     case WM_LBUTTONDOWN:
-        if (dm_win_touch_enabled()) {
-            SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y);
-            g_mouse_down = 1; dm_win_touch_pointer(0, g_mouse_x, g_mouse_y, 0); return 0;
-        }
-        SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y); set_finger(1); return 0;
+        SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y);
+        if (dm_win_touch_enabled() && dm_win_touch_pointer(0, g_mouse_x, g_mouse_y, 0)) { g_mouse_down = 1; return 0; }
+        // 没落在浮层控件上的点击 = 界面点击（和 iOS 一样走 dm_ui_touch），别当触点喂给游戏——否则「进入游戏 / 开始游戏」这类按钮、
+        // 以及局内的物品栏 / 技能树 / 选项面板全都没反应（面板也是原版 UI，走的是同一条界面点击通道）。
+        // A press that lands on none of the overlay's controls is a UI click (routed through dm_ui_touch like iOS does) and must not be handed to the
+        // game as a touch point -- otherwise buttons such as PLAY / Start Game, and the in-run inventory / skill-tree / options panels (also original UI,
+        // on the same UI click channel), never respond.
+        if (dm_win_touch_on()) { g_mouse_down = 1; g_front_click = 1; dm_ui_touch(0, g_mouse_x, g_mouse_y);
+            LOG("前端：界面点击 (%.3f,%.3f)（前端页面走 dm_ui_touch，不当触点）", g_mouse_x, g_mouse_y); return 0; }
+        set_finger(1); return 0;
     case WM_LBUTTONUP:
-        if (dm_win_touch_enabled()) { ReleaseCapture(); g_mouse_down = 0; dm_win_touch_pointer(2, g_mouse_x, g_mouse_y, 0); return 0; }
+        if (g_front_click) { g_front_click = 0; g_mouse_down = 0; dm_ui_touch(2, g_mouse_x, g_mouse_y); ReleaseCapture(); return 0; }
+        if (g_mouse_down && dm_win_touch_enabled() && dm_win_touch_pointer(2, g_mouse_x, g_mouse_y, 0)) { ReleaseCapture(); g_mouse_down = 0; return 0; }
         ReleaseCapture(); set_finger(0); return 0;
     case WM_RBUTTONDOWN:
         if (dm_win_touch_enabled()) return 0;   // 触屏模式没有右键（B 在圆钮上）| no right button in touch mode (B lives on a round button)

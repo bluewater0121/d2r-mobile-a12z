@@ -16,10 +16,16 @@ extern "C" {
 #endif
 
 int dm_win_touch_enabled(void);            // DM_WIN_TOUCH=1 且已启动 | DM_WIN_TOUCH=1 and started
+int dm_win_touch_on(void);                 // DM_WIN_TOUCH=1 且已启动（不看在不在局内）：前端页面走界面点击用 | started with DM_WIN_TOUCH=1, regardless of being in a run: the front-end pages use it to route clicks to the UI
 void dm_win_touch_start(void *game_hwnd);  // 建浮层窗口、初始化状态机、注册 dm_pad_hook | create the overlay window, init the state machine, register dm_pad_hook
 void dm_win_touch_stop(void);
-// 鼠标 / 触摸：op 0 按下 1 拖动 2 抬起；nx / ny = 画面归一化坐标（视图矩形内 0..1）| op 0 down 1 drag 2 up; nx / ny = normalised picture coordinates
-void dm_win_touch_pointer(int op, float nx, float ny, int slot);
+// 鼠标 / 触摸：op 0 按下 1 拖动 2 抬起；nx / ny = 画面归一化坐标（视图矩形内 0..1）
+// 返回 1 = 这一下被触屏控件吃掉了；0 = 没落在任何控件上，调用方要照旧把它当普通触点（set_finger）交给游戏——
+// 否则角色选择页的「开始游戏」这类界面按钮会被浮层吞掉
+// Mouse / touch: op 0 down 1 drag 2 up; nx / ny = normalised picture coordinates
+// Returns 1 when the touch controls took the event; 0 when it landed on no control, in which case the caller must still hand it to the game as an
+// ordinary touch point (set_finger) -- otherwise front-end buttons such as PLAY on the character select page get swallowed by the overlay
+int dm_win_touch_pointer(int op, float nx, float ny, int slot);
 // 窗口尺寸或视图矩形变了：vx / vy / vw / vh = 视图矩形（客户区像素）| window size or view rectangle changed
 void dm_win_touch_layout(int vx, int vy, int vw, int vh);
 void dm_win_touch_cancel(void);            // 失焦：所有手指抬起 | focus lost: lift every finger

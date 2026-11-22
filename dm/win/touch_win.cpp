@@ -50,6 +50,7 @@ using namespace Gdiplus;
 static std::mutex g_mx;
 static dm_tc_state g_tc;
 static int g_on;                       // DM_WIN_TOUCH=1 | enabled
+static int g_noart;                    // DM_WIN_TOUCH_NOICON=1：只画矢量外观、不贴技能图（排查用）| vector look only, no skill art (debugging)
 static std::atomic<int> g_in_run;      // 局内（浮层可见、触屏布局） | in a run (overlay visible, touch layout)
 static std::atomic<int> g_always;      // DM_WIN_TOUCH_ALWAYS=1：前端页面也用触屏布局（页面按钮栏还没有，测试用） | touch layout in the front end too (its ribbon is not implemented yet; for testing)
 static HWND g_game, g_ov;
@@ -109,26 +110,45 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
 }
 
 // ---------- 手指 ----------
-void dm_win_touch_pointer(int op, float nx, float ny, int slot) {
-    if (!g_on) return;
+static int g_claim[DM_TC_MAX_TOUCH];    // 这根手指归触屏控件（命中了圆钮 / 摇杆 / 边缘区，或面板态的界面指针）| this finger belongs to the touch controls
+
+int dm_win_touch_pointer(int op, float nx, float ny, int slot) {
+    if (!g_on) return 0;
+    if (slot < 0 || slot >= DM_TC_MAX_TOUCH) return 0;
     float x = nx * g_dpw, y = ny * g_dph;
     double now = (double)now_ns() / 1e9;
     std::lock_guard<std::mutex> lk(g_mx);
     if (op == 0) {
         dm_tc_begin_at(&g_tc, slot, x, y, now);
-        if (getenv("DM_WIN_TOUCH")) LOG("触屏浮层：手指按下 点(%g,%g) 目标 %d（画布 %gx%g 点，缩放 %g）", x, y, g_tc.finger[slot].target, g_dpw, g_dph, g_px);
-        // 回城钮不发按键，点下由宿主施放原版回城技能（dm_freetp.c）| the town portal button sends no key; tapping casts the original town portal on the host side
-        if (!g_tc.navigation_mode && g_tc.finger[slot].target == DM_TC_PORTAL) { dm_tc_cancel_finger(&g_tc, slot); dm_tp_request(); }
-    } else if (op == 1) dm_tc_move_at(&g_tc, slot, x, y, now);
-    else dm_tc_end_at(&g_tc, slot, now);
+        // 只有真命中控件才算「吃掉」：没命中就撤销这根手指，让调用方当普通触点交给游戏（前端页面的按钮、局内界面按钮都靠它点）
+        // Only a real hit is consumed: on a miss the finger is taken back so the caller hands it to the game as an ordinary touch point
+        // (front-end buttons and in-run UI buttons are clicked that way)
+        int claimed = g_tc.finger[slot].target != DM_TC_NONE || g_tc.pointer_slot == slot || g_tc.joy_slot == slot;
+        int portal = claimed && !g_tc.navigation_mode && g_tc.finger[slot].target == DM_TC_PORTAL;
+        if (getenv("DM_WIN_TOUCH")) LOG("触屏浮层：手指按下 点(%g,%g) 目标 %d %s（画布 %gx%g 点，缩放 %g）", x, y, g_tc.finger[slot].target,
+                                        claimed ? "→ 触屏控件" : "→ 交给游戏触点", g_dpw, g_dph, g_px);
+        if (!claimed) { dm_tc_cancel_finger(&g_tc, slot); return 0; }
+        // 回城钮不发按键，点下由宿主施放原版回城技能（dm_freetp.c）| the town portal button sends no key; tapping it casts the original town portal on the host side
+        if (portal) { dm_tc_cancel_finger(&g_tc, slot); dm_tp_request(); return 1; }   // 一次性，这根手指到此为止 | one-shot: this finger ends here
+        g_claim[slot] = 1;
+    } else if (op == 1) {
+        if (!g_claim[slot]) return 0;
+        dm_tc_move_at(&g_tc, slot, x, y, now);
+    } else {
+        if (!g_claim[slot]) return 0;
+        dm_tc_end_at(&g_tc, slot, now);
+        g_claim[slot] = 0;
+    }
     g_latch |= g_tc.buttons;
     g_dirty.store(1);
+    return 1;
 }
 
 void dm_win_touch_cancel(void) {
     if (!g_on) return;
     std::lock_guard<std::mutex> lk(g_mx);
     dm_tc_cancel_all(&g_tc);
+    for (int i = 0; i < DM_TC_MAX_TOUCH; ++i) g_claim[i] = 0;
     g_latch = 0;
     g_dirty.store(1);
 }
@@ -212,50 +232,52 @@ static void skill_icon_draw(Graphics &g, const dm_ta_glyph &gl, int held, float 
     int w = (int)(fr.width * fit + 0.5f), h = (int)(fr.height * fit + 0.5f);
     if (w < 2 || h < 2) return;
     // 原版图集里每格是一块带方角的技能牌，iOS 把它裁进椭圆。GDI+ 的 SetClip 在从这里画位图时不起作用（同一帧图仍是方的），
-    // 所以自己按像素把圆外的 alpha 抹掉：缓存一张按目标尺寸、已经裁圆的图标
+    // 所以自己按像素把圆外的 alpha 抹掉；iOS 的柔光（CGContextSetShadowWithColor，白 .65 / alpha .32）也一起烘进这张小图：
+    // 每次重画就只剩一次 DrawImage，不必每个钮现搭一个 PathGradientBrush
     // Every frame is a square-cornered skill tile and iOS clips it into an ellipse. GDI+ SetClip does not take effect for this DrawImage here
-    // (the frame still came out square), so the alpha outside the circle is cleared per pixel, with one already-clipped bitmap cached per size
-    struct Masked { int atlas, frame, w, h, mr; Bitmap *bmp; };
+    // (the frame still came out square), so the alpha outside the circle is cleared per pixel; iOS's glow (CGContextSetShadowWithColor, white .65 /
+    // alpha .32) is baked into the same small bitmap, so a repaint costs one DrawImage per button instead of building a PathGradientBrush each time
+    float mr = 0.82f * r;                          // iOS 的裁圆半径：按钮外接矩形内缩 9%（直径 2r）| iOS's clip radius: the button rect inset by 9% (diameter 2r)
+    int m = (int)(r * (held ? 0.10f : 0.055f)) + 2;   // 柔光边宽（按住更大）| glow margin (larger while held)
+    int bw = w + m * 2, bh = h + m * 2;
+    struct Masked { int atlas, frame, w, h, m; Bitmap *bmp; };
     static Masked cache[48]; static int ncache;
     Bitmap *masked = NULL;
     for (int i = 0; i < ncache; ++i)
-        if (cache[i].atlas == gl.atlas && cache[i].frame == (held ? gl.pressed_frame : gl.normal_frame) && cache[i].w == w && cache[i].h == h) masked = cache[i].bmp;
+        if (cache[i].atlas == gl.atlas && cache[i].frame == (held ? gl.pressed_frame : gl.normal_frame) && cache[i].w == w && cache[i].h == h && cache[i].m == m) masked = cache[i].bmp;
     if (!masked) {
-        Bitmap *tmp = new Bitmap(w, h, PixelFormat32bppPARGB);
+        Bitmap *tmp = new Bitmap(bw, bh, PixelFormat32bppPARGB);
         if (!tmp || tmp->GetLastStatus() != Ok) { delete tmp; return; }
         { Graphics tg(tmp); tg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-          tg.DrawImage(b, RectF(0, 0, (REAL)w, (REAL)h), (REAL)fr.x, (REAL)fr.y, (REAL)fr.width, (REAL)fr.height, UnitPixel); }
-        float mr = 0.82f * r;   // iOS 的裁圆半径：按钮外接矩形内缩 9%（直径 2r）| iOS's clip radius: the button rect inset by 9% (diameter 2r)
-        Rect rl(0, 0, w, h); BitmapData bd;
+          tg.DrawImage(b, RectF((REAL)m, (REAL)m, (REAL)w, (REAL)h), (REAL)fr.x, (REAL)fr.y, (REAL)fr.width, (REAL)fr.height, UnitPixel); }
+        Rect rl(0, 0, bw, bh); BitmapData bd;
         if (tmp->LockBits(&rl, ImageLockModeWrite, PixelFormat32bppPARGB, &bd) == Ok) {
-            float mx = w / 2.0f, my = h / 2.0f;
-            for (int y = 0; y < h; ++y) {
+            float mx = bw / 2.0f, my = bh / 2.0f;
+            for (int y = 0; y < bh; ++y) {
                 unsigned char *row = (unsigned char *)bd.Scan0 + (size_t)y * bd.Stride;
-                for (int x = 0; x < w; ++x) {
+                for (int x = 0; x < bw; ++x) {
                     float d = sqrtf((x + 0.5f - mx) * (x + 0.5f - mx) + (y + 0.5f - my) * (y + 0.5f - my));
-                    float cover = mr - d + 0.5f; if (cover <= 0) cover = 0; if (cover > 1) cover = 1;
-                    if (cover < 1) { unsigned char *p = row + x * 4; for (int c = 0; c < 4; ++c) p[c] = (unsigned char)(p[c] * cover); }
+                    float cover = mr - d + 0.5f;
+                    unsigned char *p = row + x * 4;
+                    if (cover >= 1) continue;                       // 圆内且够深：图自己 | well inside the circle: the tile itself
+                    if (cover > 0) { for (int c = 0; c < 4; ++c) p[c] = (unsigned char)(p[c] * cover); continue; }
+                    float t = (d - mr) / (float)m;                  // 圆外：柔光由内向外淡出 | outside the circle: the glow fades outwards
+                    if (t >= 1) { p[0] = p[1] = p[2] = p[3] = 0; continue; }
+                    p[3] = (unsigned char)(82 * (1.0f - t));         // 预乘：alpha .32 | premultiplied: alpha .32
+                    p[0] = p[1] = p[2] = (unsigned char)(53 * (1.0f - t));
                 }
             }
             tmp->UnlockBits(&bd);
         }
         masked = tmp;
-        if (ncache < 48) { cache[ncache].atlas = gl.atlas; cache[ncache].frame = held ? gl.pressed_frame : gl.normal_frame; cache[ncache].w = w; cache[ncache].h = h; cache[ncache].mr = (int)mr; cache[ncache].bmp = tmp; ++ncache; }
+        if (ncache < 48) { cache[ncache].atlas = gl.atlas; cache[ncache].frame = held ? gl.pressed_frame : gl.normal_frame; cache[ncache].w = w; cache[ncache].h = h; cache[ncache].m = m; cache[ncache].bmp = tmp; ++ncache; }
     }
-    // iOS：图标先铺一层柔光阴影（按住半径更大），非主钮上移 .12r，静止态 .94 透明
-    // iOS: a soft shadow behind the icon (a larger radius while held), non-primary buttons shifted up by .12r, .94 alpha at rest
+    // 非主钮上移 .12r（iOS 的 ir 里 t->r*.12），静止态 .94 透明
+    // Non-primary buttons sit .12r higher (t->r*.12 in iOS's ir), and are .94 alpha at rest
     float ix = cx, iy = cy - (bare ? 0.0f : r * 0.12f);
-    {
-        GraphicsPath sp; float sr = w / 2.0f + r * (held ? 0.10f : 0.055f);
-        sp.AddEllipse(ix - sr, iy - sr, sr * 2, sr * 2);
-        PathGradientBrush pg(&sp);
-        Color cc((BYTE)(held ? 82 : 72), 0, 0, 0), bc(0, 0, 0, 0);
-        int cnt = 1; pg.SetCenterColor(cc); pg.SetSurroundColors(&bc, &cnt);
-        g.FillEllipse(&pg, ix - sr, iy - sr, sr * 2, sr * 2);
-    }
     if (!held) { ImageAttributes ia; ColorMatrix cm = {}; cm.m[0][0] = cm.m[1][1] = cm.m[2][2] = 1.0f; cm.m[3][3] = 0.94f; cm.m[4][4] = 1.0f;
-        ia.SetColorMatrix(&cm); g.DrawImage(masked, RectF(ix - w / 2.0f, iy - h / 2.0f, (REAL)w, (REAL)h), 0.0f, 0.0f, (REAL)w, (REAL)h, UnitPixel, &ia); }
-    else g.DrawImage(masked, RectF(ix - w / 2.0f, iy - h / 2.0f, (REAL)w, (REAL)h), 0.0f, 0.0f, (REAL)w, (REAL)h, UnitPixel);
+        ia.SetColorMatrix(&cm); g.DrawImage(masked, RectF(ix - bw / 2.0f, iy - bh / 2.0f, (REAL)bw, (REAL)bh), 0.0f, 0.0f, (REAL)bw, (REAL)bh, UnitPixel, &ia); }
+    else g.DrawImage(masked, RectF(ix - bw / 2.0f, iy - bh / 2.0f, (REAL)bw, (REAL)bh), 0.0f, 0.0f, (REAL)bw, (REAL)bh, UnitPixel);
 }
 
 // 固定图标（地图 / 功能入口）：原版小图三帧横排，36x36 一格，按下取第二格
@@ -474,7 +496,7 @@ static void paint(void) {
                 glg = dm_ta_skill(359);   // 回城：原版通用的那张技能图（iOS 同一张）| town portal: the original game's shared skill image (the same one iOS uses)
             }
             button_draw(g, cx, cy, r, held, empty, i == DM_TC_MAIN);
-            if (glg.status == DM_TA_GLYPH) {
+            if (glg.status == DM_TA_GLYPH && !g_noart) {
                 skill_icon_draw(g, glg, held, cx, cy, r, !empty && i == DM_TC_MAIN);
                 // 副手组「Ⅱ」与充能剩余次数：和 iOS 同一处（右上 / 右下），只在技能钮上画
                 // The off-hand-set "II" and the remaining charges, in the same places as iOS (top right / bottom right), skill buttons only
@@ -653,6 +675,7 @@ void dm_win_touch_start(void *game_hwnd) {
     const char *e = getenv("DM_WIN_TOUCH");
     if (!e || strcmp(e, "1") != 0) return;
     g_always = getenv("DM_WIN_TOUCH_ALWAYS") && strcmp(getenv("DM_WIN_TOUCH_ALWAYS"), "1") == 0;
+    { const char *ni = getenv("DM_WIN_TOUCH_NOICON"); g_noart = ni && strcmp(ni, "1") == 0; }
 
     if (!g_gdip_on) {
         GdiplusStartupInput in; if (GdiplusStartup(&g_gdip, &in, NULL) != Ok) { LOG("触屏浮层：GDI+ 起不来，浮层不画"); return; }
@@ -662,7 +685,8 @@ void dm_win_touch_start(void *game_hwnd) {
     // 挂上共享的技能绑定桥（和安卓 / iOS 同一份 dm_touch_game_bridge.c）：它接的是产物里那颗 getter 观测门
     // Hook up the shared binding bridge (the same dm_touch_game_bridge.c Android / iOS use): it attaches to the getter observation gate in the build
     {
-        int attached = dm_touch_game_attach();
+        const char *nb = getenv("DM_WIN_TOUCH_NOBIND");   // 排查用：不挂绑定读取（技能钮回退字母）| debugging: skip the binding bridge (skill buttons fall back to letters)
+        int attached = (nb && strcmp(nb, "1") == 0) ? 0 : dm_touch_game_attach();
         int nm = 0; for (int i = 0; i < g_nmod; ++i) ++nm;
         LOG("触屏浮层：技能绑定读取%s（模块 %d，main %s）", attached ? "已挂上" : "没挂上（技能钮回退成键位字母）", nm,
             attached ? "认出" : "没认出");
@@ -703,3 +727,4 @@ void dm_win_touch_stop(void) {
 }
 
 int dm_win_touch_enabled(void) { return g_on && g_in_run.load(); }
+int dm_win_touch_on(void) { return g_on; }
