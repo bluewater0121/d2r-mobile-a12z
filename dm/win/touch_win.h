@@ -29,7 +29,15 @@ int dm_win_touch_pointer(int op, float nx, float ny, int slot);
 // 窗口尺寸或视图矩形变了：vx / vy / vw / vh = 视图矩形（客户区像素）| window size or view rectangle changed
 void dm_win_touch_layout(int vx, int vy, int vw, int vh);
 void dm_win_touch_cancel(void);            // 失焦：所有手指抬起 | focus lost: lift every finger
-void dm_win_touch_tick(void);              // 主线程定时（30 ms）：按需重画、按出局 / 进局切布局 | main-thread timer (30 ms): repaint when dirty, switch layout on entering / leaving a run
+void dm_win_touch_tick(void);              // 主线程定时（16 ms）：按需重画、按出局 / 进局切布局 | main-thread timer (16 ms): repaint when dirty, switch layout on entering / leaving a run
+// 输入来源切换（照 iOS：实体手柄有明确输入 = padMode，碰画面 / 敲键盘 = 触屏）——手柄模式收起浮层，
+// 触屏模式露出浮层并切回触屏布局。两边都由输入事件驱动，谁刚有输入就归谁。
+// Input-source switch (same as iOS: clear physical-controller input = padMode, touching the picture / typing = touch) -- controller mode hides the
+// overlay, touch mode shows it and switches back to the touch layout. Both are driven by input events; whichever just had input owns it.
+void dm_win_touch_pad_input(void);
+void dm_win_touch_screen_input(void);
+int dm_win_touch_pad_mode(void);
+int dm_win_touch_in_run(void);             // 在不在局内（手柄侧据此决定切换后要不要补发触发键） | in a run (the controller side uses it to decide whether to re-send the triggering key)
 
 #ifdef __cplusplus
 }

@@ -42,6 +42,7 @@ uint32_t dm_padmode_rebuilds(void);   // dm/host/dm_padmode.c：布局重建次�
 // dm_padmode 没有公共头，各家前端各自声明（它与 iOS / Mac 同一个实现）| dm_padmode has no public header; each front end declares it (same implementation as iOS / Mac)
 extern "C" void dm_padmode_request(int pad);
 extern "C" int dm_padmode_current(void);
+extern "C" int dm_padmode_busy(void);
 extern "C" void dm_tp_request(void);   // 回城钮（dm_freetp.c）| the town portal button (dm_freetp.c)
 
 using namespace Gdiplus;
@@ -54,6 +55,7 @@ static int g_noart;                    // DM_WIN_TOUCH_NOICON=1：只画矢量�
 static std::atomic<int> g_in_run;      // 局内（浮层可见、触屏布局） | in a run (overlay visible, touch layout)
 static std::atomic<int> g_always;      // DM_WIN_TOUCH_ALWAYS=1：前端页面也用触屏布局（页面按钮栏还没有，测试用） | touch layout in the front end too (its ribbon is not implemented yet; for testing)
 static HWND g_game, g_ov;
+static std::atomic<int> g_pad_in;      // 实体手柄的「明确输入」接管（iOS 的 _padMode）：成立就收起浮层、手柄布局归手柄 | controller owns the input: overlay hidden
 static int g_vx, g_vy, g_vw, g_vh;     // 视图矩形（客户区像素） | view rectangle (client pixels)
 static float g_px = 1.0f;              // 每个 dp 几个像素 | pixels per dp
 static float g_dpw, g_dph;             // 布局点数（dm_tc 的坐标空间） | layout points (dm_tc's coordinate space)
@@ -75,12 +77,38 @@ static void scene_apply(void) {
     dm_hud_get(&h);
     int in_run = h.valid ? 1 : 0;
     if (g_always) in_run = 1;
+    // 手柄刚有明确输入时不抢布局：那时手柄版归手柄（iOS 的 _padMode 同样只由 dm_gamepad.m 切）
+    // Do not grab the layout while the controller owns the input: the controller layout belongs to the controller then (iOS's _padMode is likewise
+    // switched only by dm_gamepad.m)
     if (in_run == g_in_run.load()) return;
     g_in_run.store(in_run);
-    dm_padmode_request(in_run ? 0 : 1);   // 局内 = 触屏版，局外 = 手柄版 | in a run = touch layout, outside = controller layout
+    dm_padmode_request((in_run && !g_pad_in.load()) ? 0 : 1);   // 局内 = 触屏版，局外 = 手柄版 | in a run = touch layout, outside = controller layout
     g_dirty.store(1);
     LOG("触屏浮层：%s（手柄布局 %d）", in_run ? "进局，切触屏布局并显示浮层" : "出局，切回手柄布局", dm_padmode_current());
 }
+
+// ---------- 输入来源（照 iOS 的 dm_gamepad.m / front_ios.m 的 _padMode）----------
+// iOS：实体手柄一有明确输入 → 手柄模式，_overlay.hidden = YES（顺便 dm_tc_cancel_all 把按着的手指全抬了）；碰屏幕 → 触屏模式，浮层重现。
+// 不做这一层的后果（本机实测）：局内浮层一直挂着，手柄按了键、游戏却还在触屏布局里，两边各说各话。
+// iOS: clear physical-controller input -> controller mode, _overlay.hidden = YES (and dm_tc_cancel_all lifts every finger); touching the screen ->
+// touch mode and the overlay comes back. Without this layer (measured here) the overlay stays up for the whole run, the player presses a controller
+// button and the game sits in the touch layout, each side talking past the other.
+void dm_win_touch_pad_input(void) {
+    if (!g_on) return;
+    if (g_pad_in.exchange(1)) return;
+    dm_win_touch_cancel();   // 按着的手指全抬，免得切过去时还留着一个按住的键 | lift every finger so no key stays held across the switch
+    g_dirty.store(1);
+    LOG("触屏浮层：手柄有输入 → 收起浮层（手柄布局）");
+}
+void dm_win_touch_screen_input(void) {
+    if (!g_on) return;
+    if (!g_pad_in.exchange(0)) return;
+    if (g_in_run.load()) dm_padmode_request(0);   // 碰画面 = 触屏侧（iOS 的 dm_gamepad_touched → 触屏模式）；请求相同值是无操作
+    g_dirty.store(1);
+    LOG("触屏浮层：碰了画面 / 敲键盘 → 露出浮层（触屏布局）");
+}
+int dm_win_touch_pad_mode(void) { return g_pad_in.load(); }
+int dm_win_touch_in_run(void) { return g_in_run.load(); }
 
 // ---------- 布局 ----------
 static void layout_make(void) {
@@ -95,7 +123,7 @@ static void layout_make(void) {
 
 // ---------- 取手柄那一拍：推进状态机并发布 ----------
 static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
-    if (!g_on || !g_in_run.load()) return;   // 浮层没开 / 不在局内：照旧让手柄与键盘的输入走 | overlay off / not in a run: leave pad and keyboard input alone
+    if (!g_on || !g_in_run.load() || g_pad_in.load()) return;   // 浮层没开 / 不在局内 / 手柄接管中：照旧让手柄与键盘的输入走 | overlay off / not in a run / controller owns it: leave pad and keyboard input alone
     std::lock_guard<std::mutex> lk(g_mx);
     dm_tc_tick(&g_tc, (double)now / 1e9);
     // 取证：按键组合变化打一行（无桌面截屏权限时，这是「点圆钮真的变成按键」的直接证据）| evidence: log each button-set change (the direct proof
@@ -119,6 +147,27 @@ int dm_win_touch_pointer(int op, float nx, float ny, int slot) {
     double now = (double)now_ns() / 1e9;
     std::lock_guard<std::mutex> lk(g_mx);
     if (op == 0) {
+        // 落点先按「差一点」修正一次再交给状态机：指头落在圆钮外沿 25% 以内 = 就算按在这颗钮的正中。
+        // 只对圆钮（主技能 / 四个技能 / 回城）这样做，且只在完全没命中任何控件时；摇杆不吸——它的落点就是底盘位置。
+        // 修正放在 begin_at 之前（一次进入），不做事后 cancel + 重按：两次状态迁移会把瞄准轴带偏。
+        // Correct the landing point once before handing it to the state machine: a finger within a quarter radius outside a round button counts as
+        // centred on it. Only the round buttons (main / four skills / portal), and only when nothing at all was hit; the stick never snaps, since its
+        // touch point *is* the base position. The correction happens before begin_at (one entry), not as a cancel plus a second press afterwards:
+        // two state transitions kick the aim axis off centre.
+        if (dm_tc_hit(&g_tc.layout, x, y) == DM_TC_NONE) {
+            const dm_tc_layout &l = g_tc.layout; int best = -1; float bd = 0;
+            for (int i = 0; i <= DM_TC_PORTAL; ++i) {
+                if (!(g_tc.enabled_targets & (1u << i))) continue;
+                const dm_tc_target &t = l.target[i];
+                if (!(t.r > 0) || !t.button) continue;
+                float d = sqrtf((x - t.x) * (x - t.x) + (y - t.y) * (y - t.y));
+                if (d <= t.r * 1.25f && (best < 0 || d < bd)) { best = i; bd = d; }
+            }
+            if (best >= 0) {
+                LOG("触屏浮层：落点吸附到圆钮 %d（离中心 %.1f 点，半径 %.1f）", best, (double)bd, (double)l.target[best].r);
+                x = l.target[best].x; y = l.target[best].y;
+            }
+        }
         dm_tc_begin_at(&g_tc, slot, x, y, now);
         // 只有真命中控件才算「吃掉」：没命中就撤销这根手指，让调用方当普通触点交给游戏（前端页面的按钮、局内界面按钮都靠它点）
         // Only a real hit is consumed: on a miss the finger is taken back so the caller hands it to the game as an ordinary touch point
@@ -650,7 +699,10 @@ void dm_win_touch_tick(void) {
         if (rb != prev_rebuilds) { prev_rebuilds = rb; ++world_epoch; }   // 布局重建 = HUD 控件全换，技能钮要重新认 | a layout rebuild replaced every HUD widget, so the buttons have to re-identify
         dm_touch_game_set_scene(run, scene_epoch, world_epoch);
     }
-    if (!g_in_run.load()) {
+    // 布局切换事务进行中也收起：整块界面正在重建成另一版，浮层压在上面会盖住重建中的界面（iOS 的 front_ios.m:497 每帧把 dm_padmode_busy() 也算进 hide）
+    // Also hidden while a layout switch transaction runs: the whole UI is being rebuilt into the other version, and an overlay on top would cover the
+    // half-built screens (iOS front_ios.m:497 folds dm_padmode_busy() into hide every frame)
+    if (!g_in_run.load() || g_pad_in.load() || dm_padmode_busy()) {
         if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE);
         return;
     }
@@ -719,7 +771,7 @@ void dm_win_touch_start(void *game_hwnd) {
     g_on = 1;
     RECT rc; GetClientRect(g_game, &rc);
     dm_win_touch_layout(0, 0, rc.right, rc.bottom);
-    SetTimer(g_game, 3, 30, NULL);   // 30 ms：重画与进 / 出局切换 | 30 ms: repaint and switch layouts on entering / leaving a run
+    SetTimer(g_game, 3, 16, NULL);   // 16 ms：重画与进 / 出局切换（原先 30 ms，按住态跟着手指走会慢半拍）| 16 ms: repaint and switch layouts (was 30 ms, which made the held look lag the finger)
     LOG("触屏浮层：已接（DM_WIN_TOUCH=1，局内显示；DM_WIN_TOUCH_ALWAYS=1 前端页面也用触屏布局）");
 
     // ---------- 冒烟测试：DM_TOUCH_TEST='<秒>,<目标>' 在开机后按一下某个圆钮（无人操作时验证整条链）----------

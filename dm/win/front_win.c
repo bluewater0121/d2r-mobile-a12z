@@ -102,6 +102,7 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
 static void set_finger(int down) {    if (down && !g_mouse_down) {
         g_mouse_down = 1; g_finger = 1;
         dm_win_pad_touch();
+        dm_win_touch_screen_input();   // 碰画面 = 触屏侧：手柄模式交回触屏（iOS 的 dm_gamepad_touched）| the picture was touched = touch side: hand back from controller mode
     } else if (!down && g_mouse_down) {
         g_mouse_down = 0; g_finger = 0;
         dm_touch_set(NULL, 0);
@@ -130,6 +131,7 @@ static void on_key_msg(int vk, int down) {
     if (down && (b >= 0 || vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D')) {
         dm_padmode_request_glyph(DM_GLYPH_KBD);
         dm_win_pad_touch();   // 键盘 = 触屏侧：手柄布局切回触屏布局 | keyboard counts as the touch side: back to the touch layout
+        dm_win_touch_screen_input();
     }
     if (b >= 0) g_btn = down ? (g_btn | 1ull << b) : (g_btn & ~(1ull << b));
     push_input();
@@ -166,6 +168,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0; }
     case WM_LBUTTONDOWN:
         SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y);
+        dm_win_touch_screen_input();   // 点画面（含点到圆钮）= 触屏侧接管，浮层重新露出来 | a press on the picture (round buttons included) = touch side takes over, the overlay comes back
         if (dm_win_touch_enabled() && dm_win_touch_pointer(0, g_mouse_x, g_mouse_y, 0)) { g_mouse_down = 1; return 0; }
         // 没落在浮层控件上的点击 = 界面点击（和 iOS 一样走 dm_ui_touch），别当触点喂给游戏——否则「进入游戏 / 开始游戏」这类按钮、
         // 以及局内的物品栏 / 技能树 / 选项面板全都没反应（面板也是原版 UI，走的是同一条界面点击通道）。

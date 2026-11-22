@@ -56,6 +56,9 @@ typedef int(__stdcall *xi_get_state)(unsigned int idx, xi_state *st);
 #define XI_DEAD_R 8688           // 摇杆死区 | right-stick dead zone
 
 void dm_padmode_request(int pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | host dm_padmode.c: switch to the original controller / touch layout
+int dm_padmode_busy(void);          // 切换事务进行中（输入被冻结）| a switch transaction is running (input frozen)
+void dm_win_touch_pad_input(void), dm_win_touch_screen_input(void);
+int dm_win_touch_in_run(void);      // 在不在局内（触屏浮层）| in a run (touch overlay)
 static xi_get_state g_get_state;
 static int g_nintendo, g_log;
 static int g_mode;               // 当前布局：1 = 手柄版 | current layout: 1 = controller
@@ -82,17 +85,43 @@ static void set_mode(int pad) {
     if (!pad && getenv("DM_APP")) { g_need_center = 1; return; }
     g_mode = pad;
     dm_padmode_request(pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | host dm_padmode.c: switch to the original controller / touch layout
+    // 浮层跟着输入来源走（iOS 的 onMode 回调 → front_ios 的 padMode）：手柄模式收起浮层，触屏模式露出浮层
+    // The overlay follows the input source (iOS's onMode callback -> padMode in front_ios): controller mode hides it, touch mode shows it
+    if (pad) dm_win_touch_pad_input(); else dm_win_touch_screen_input();
     LOG("手柄：%s", pad ? "有明确输入 → 手柄布局" : "碰了画面 / 敲键盘 → 触屏布局");
 }
 
 // 把各手柄合起来、定布局、交给宿主（与 iOS apply() 同一套判据）
 // Merge the controllers, decide the layout and hand the result to the host (the same rules as iOS apply())
+static uint64_t g_replay;   // 触发切换的那一下（局内）：事务完成后补发一次 | the press that triggered the switch (in a run): re-sent once afterwards
+static int g_replay_left;
 static void publish(uint64_t b, int32_t ax[4]) {
     g_on[0] = stick_on(g_on[0], ax[0], ax[1]); g_on[1] = stick_on(g_on[1], ax[2], ax[3]);
     if (!g_on[0] && !g_on[1]) g_need_center = 0;   // 摇杆回中了：之后再推出来算数 | stick is back to center: pushing it out counts again
-    if ((b & ~g_prev_b) || ((g_on[0] || g_on[1]) && !g_need_center)) {
+    // 补发触发切换的那一下。切布局时输入闸会把当时按着的键扣下、要松开一次才再交（dm_modetx.h 的 hold），所以玩家在局内
+    // 从触屏版按手柄第一下时看不到任何动作——「按了没反应」。事务结束、键也松开了，替他再按一次短按（靠 dm_pad_set 的按下沿锁存，
+    // 一个采样就够游戏看见）。只在局内补：菜单里补发等于替他「确认」刚重建出来的界面，那是输入闸特意要避免的。
+    // Re-send the press that triggered the switch. While the layout switches, the input gate withholds whatever was held at that moment until it is
+    // released once (dm_modetx.h, hold), so the player's first controller press inside a run -- coming from the touch layout -- moves nothing:
+    // "I pressed and nothing happened". Once the transaction is over and the key is released, press it again for them as a short tap (dm_pad_set
+    // latches the press edge, so one sample is enough for the game to see it). Only inside a run: in a menu a re-send would mean "confirm" on the
+    // freshly built screens, exactly what the input gate exists to prevent.
+    if (g_replay) {
+        if (dm_padmode_busy()) { }                             // 事务还没完：等 | the transaction is still running: wait
+        else if (b & g_replay) { }                             // 玩家还按着：输入闸要求先松一次 | still held: the gate needs one release first
+        else {
+            if (!g_replay_left) { g_replay_left = 8; LOG("手柄：补发触发切换的那一下 %#llx（这一下原来被切换冻掉了）", (unsigned long long)g_replay); }
+            b |= g_replay; --g_replay_left;                    // 8 拍 = 64 ms，够游戏按 60 Hz 取到 | 8 ticks = 64 ms, plenty for the game's 60 Hz sampling
+            if (g_replay_left <= 0) { g_replay_left = 0; g_replay = 0; }
+        }
+    }
+    uint64_t edge = b & ~g_prev_b;
+    if (edge || ((g_on[0] || g_on[1]) && !g_need_center)) {
         dm_padmode_request_glyph(DM_GLYPH_XBOX);   // 先报键帽样式，同一次切换里就换成本套 | report the glyph style first so the same switch uses it
+        int was = g_mode;
         set_mode(1);
+        // 这一次是「切过去的那一下」：把它记下来，事务完成后补发 | This is the press that switched: remember it and re-send it once the transaction is over
+        if (!was && edge && dm_win_touch_in_run()) g_replay |= edge;
     }
     g_prev_b = b;
     if (!g_mode || !g_on[0]) ax[0] = ax[1] = 0;

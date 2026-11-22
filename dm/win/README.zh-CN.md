@@ -149,6 +149,16 @@ mingw 的 `gdiplus/gdiplusimaging.h` 用了 `PROPID` 却没带 `ole2.h`，所以
 **16. 剩下的那 2 帧不在浮层里，在客体主线程的等锁唤醒上。**
 `DM_STALL_PROBE=1` 取栈（营地静置、浮层开着、`DM_LONGFRAME=0`）：长帧命中的是 `ntdll!NtWaitForAlertByThreadId <- ntdll`（`WaitOnAddress` 那类 futex 等待）和少量 `NtWriteFile <- WriteFile`，`host+0xd3xxx` 是我们的 `hle_thread.c`。也就是客体主线程每 9 帧左右等一次客体锁 / 条件变量，唤醒晚 12~15 ms。这条与浮层无关（不挂桥、无浮层同样存在），`DM_HLE_SPIN_US=800` 对它无效。现状：带浮层 avg 57.5 / 末 20 窗口 58.2 / 峰值 60.8；不挂浮层 56.5~57.6。
 
+**17. 输入源接管照 iOS，但「切过去的那一下」会被输入闸吃掉——要补发。**
+iOS 的判据（`dm_gamepad.m` `apply` / `front_ios.m` `padMode:`）只有两条：手柄有**明确输入**（按任何一颗键，或摇杆推过 25%，回 15% 内算回中）→ 手柄模式、收起浮层、`dm_tc_cancel_all`；碰画面 / 敲键盘 → 触屏模式、露出浮层。Windows 原先没有这层概念（进局就亮、一直亮），现在按同一套做（`touch_win.cpp` 的 `g_pad_in` + `dm_win_touch_pad_input/_screen_input`）：
+- 浮层显隐 = `!in_run || pad_in || dm_padmode_busy()`；最后一条是 iOS `front_ios.m:497` 每帧也算进去的——切换事务那 12 帧整块界面在重建，浮层压在上面等于盖住半成品。
+- 布局请求跟着输入源走（`scene_apply`：`(in_run && !pad_in) ? 0 : 1`），`pad_step` 在手柄接管时早退（触控按键不再合进游戏读的那一拍）。
+
+坑在这里：`dm_padmode` 切布局时输入闸（`dm_modetx.h` 的 `hold`）会把**当时按着的键全扣下，且要松开一次才再交**——设计如此（「按 A 切界面，这一下 A 不能落到刚建好的界面上」）。结果是从触屏版按手柄第一下：镜头不转、技能不放，玩家只会说「手柄没反应」，而这一下其实全花在切换上了。iOS 也吃这一下，但它那边手柄模式一旦成立就基本不再碰屏幕，所以碰不到；Windows 是鼠标点面板 → 再用手柄，来回切，每切一次丢一下。
+现在 `pad_win.c` 的 `publish` 把**触发切换的那一下**记进 `g_replay`，等事务结束（`!dm_padmode_busy()`）、玩家**也松开**之后再补发 8 拍（64 ms，`dm_pad_set` 有按下沿锁存，一拍就够游戏看见）。只在**局内**补：菜单里补发等于替玩家「确认」刚重建出来的界面，正是输入闸要避免的。日志 `手柄：补发触发切换的那一下 %#llx`。
+
+同一处还有个自己挖的坑：圆钮「差一点没点到就吸附」最初写成 `cancel_finger` 后在同一 slot 再 `begin_at` 钮心，实测按下那一拍发布的是 `瞄准 -32767,32767`（旧日志全是 `0,0`）。`dm_tc_begin_at` 自带早退、`cancel_finger` 会 `++gesture_epoch` 并 `update` 一次，两次状态迁移把瞄准轴带偏了。改成**落点先吸附再单次 `begin_at`**（`dm_tc_hit == NONE` 时找 ≤1.25r 的圆钮、改写 x/y、摇杆不吸），aim 回到 `0,0`。触控灵敏度另外两项：tick 30 ms → **16 ms**（发布延迟 ≤1 帧），圆钮命中放宽到 1.25r。
+
 
 ## 排障
 
