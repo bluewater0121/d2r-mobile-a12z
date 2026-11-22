@@ -54,6 +54,7 @@ static float g_dpw, g_dph;             // 布局点数（dm_tc 的坐标空间�
 static uint64_t g_latch;               // 两次取手柄之间按着过的键 | keys held since the last controller read
 static std::atomic<int> g_dirty;
 static std::atomic<int> g_dump_req;    // 按键组合变了：下一张位图要落盘（按住态取证） | the button set changed: dump the next bitmap (to capture the held look)
+static uint64_t g_dump_last_ns;        // 上一次落盘的时刻（按住时每 0.35 s 再存一张）| time of the last dump (one more every 0.35 s while held)
 static double g_move_x = -1, g_move_y = -1;   // 上次重画时摇杆头的位置 | thumb position at the last repaint
 
 // ---------- 场景（进局 / 出局）----------
@@ -428,6 +429,7 @@ static void dump_bmp(void) {
     // DIB 自上而下、BMP 自下而上：逐行倒着写（alpha 原样带上，PNG 转换用得上）| DIB is top-down, BMP bottom-up: write rows in reverse (alpha kept for the PNG conversion)
     for (int y = g_bh - 1; y >= 0; --y) fwrite((const char *)g_bits + (size_t)y * g_bw * 4, 4, (size_t)g_bw, f);
     fclose(f);
+    g_dump_last_ns = now_ns();
     LOG("触屏浮层：位图已存 %s（%dx%d）", path, g_bw, g_bh);
 }
 
@@ -460,6 +462,9 @@ void dm_win_touch_tick(void) {
       float oy = g_tc.joy_slot >= 0 ? g_tc.joy_origin_y : g_tc.layout.joy_y;
       tx = ox + g_tc.lx / 32767.0f * r; ty = oy - g_tc.ly / 32767.0f * r;
       if (g_tc.joy_slot >= 0) g_dirty.store(1); }
+    // 按住时每 0.35 s 再存一张：第一次落盘可能赶在按键发布之前（那一张还是静止态）
+    // While something is held, dump one more every 0.35 s: the first dump can land before the buttons are published (that one is still the resting look)
+    if (g_tc.buttons && now_ns() - g_dump_last_ns > 350000000ull) g_dump_req.store(1);
     if (fabsf(tx - g_move_x) > 0.25f || fabsf(ty - g_move_y) > 0.25f) { g_move_x = tx; g_move_y = ty; g_dirty.store(1); }
     if (!g_dirty.exchange(0)) return;
     paint();
