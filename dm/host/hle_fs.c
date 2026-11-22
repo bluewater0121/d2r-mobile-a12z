@@ -450,6 +450,35 @@ void (*g_dm_pre_commit_hook[5])(const char *workdir);   // 提交前调（工作
 void (*g_dm_save_commit_hook)(const char *commit_dir);   // 存档提交成功后调（已提交目录）；iOS 的 iCloud 同步设它，宿主为空 | called after a save commit succeeds (committed directory); the iOS iCloud sync sets it, NULL on the host
 static _Atomic uint64_t g_save_commits;   // 成功提交过几次（前端进后台时等「游戏这次存盘已提交」用） | number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
+// 原子互换失败时的退路：逐个文件把新版本覆盖进已提交目录。Windows 上「目录改名」会被任何开着目录里文件的句柄挡掉
+//（杀毒扫描 / 索引器 / 我们刚读的 Settings.json），而文件级覆盖走的是写句柄，通常照样成功——宁可慢一点也不能把这次进度丢掉。
+// 不删已提交目录里多出来的旧文件（多留一份旧角色档无害）；写不成的文件数打进日志，非 0 记红。
+// Fallback when the atomic swap fails: copy the new version over the committed directory file by file. On Windows the directory rename
+// is blocked by any handle holding a file inside it open (antivirus scan / indexer / a Settings.json we just read), while file-level
+// overwrite goes through a write handle and usually still works -- better slow than losing this session's progress.
+// Extra stale files in the committed directory are not deleted (an extra old character file is harmless); the number of files that could
+// not be written goes into the log, and a non-zero count is reported as a failure.
+static int copy_over_tree(const char *src, const char *dst) {
+    DIR *d = opendir(src); if (!d) return -1;
+    struct dirent *e; char s[1100], t[1100]; int bad = 0;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (snprintf(s, sizeof s, "%s/%s", src, e->d_name) >= (int)sizeof s || snprintf(t, sizeof t, "%s/%s", dst, e->d_name) >= (int)sizeof t) { bad++; continue; }
+        struct stat sb; if (stat(s, &sb)) { bad++; continue; }
+        if (S_ISDIR(sb.st_mode)) { mkdir(t, 0755); if (copy_over_tree(s, t)) bad++; continue; }
+        FILE *fs = fopen(s, "rb"); if (!fs) { bad++; continue; }
+        FILE *ft = NULL;
+        for (int i = 0; i < 8 && !ft; i++) { ft = fopen(t, "wb"); if (!ft) usleep(30000 + i * 20000); }
+        if (!ft) { fclose(fs); bad++; continue; }
+        size_t got, put; int cerr = 0; unsigned char buf[0x10000];
+        while ((got = fread(buf, 1, sizeof buf, fs)) > 0) if ((put = fwrite(buf, 1, got, ft)) != got) { cerr = 1; break; }
+        if (fclose(ft)) cerr = 1;
+        fclose(fs);
+        if (cerr) bad++;
+    }
+    closedir(d);
+    return bad;
+}
 HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整树 clone 后与已提交目录原子互换（renamex_np RENAME_SWAP）", Result, h_fs_Commit, const char *name) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
@@ -489,7 +518,11 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
     Result r = RES_OK;
     if (!access(neu, F_OK)) rm_tree(neu);
     if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("【红】存档提交：clonefile %s 失败 errno=%d（已提交版本不变）", neu, errno); r = RES_FAIL; }
-    else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { LOG("【红】存档提交：原子互换失败 errno=%d（已提交版本不变）", errno); rm_tree(neu); r = RES_FAIL; }
+    else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { int e2 = errno;   // 目录改名被占用挡掉：改走逐个文件覆盖，绝不把这次进度丢掉 | the directory rename was blocked by a held handle: fall back to file-by-file overwrite, never lose this session's progress
+        int bad = copy_over_tree(neu, g_mnt[i].commit);
+        if (bad < 0) { LOG("【红】存档提交：原子互换失败 errno=%d，逐个文件覆盖也打不开工作目录（已提交版本没更新）", e2); r = RES_FAIL; }
+        else { LOG("存档提交：原子互换失败 errno=%d → 已逐个文件覆盖进已提交目录（%d 个文件没写成）", e2, bad); if (bad) LOG("【红】存档提交：覆盖时有 %d 个文件没写成，进度可能不全", bad); }
+        rm_tree(neu); }
     else rm_tree(neu);                                                  // 换下来的旧版 | the old version that was swapped out
     // 耗时读数（整数微秒，不带浮点）：提交前钩子、克隆 + 原子互换各多久；从本事务第一次存档写到提交完一共多久（游戏写文件 + 提交，0 = 本事务没有存档写）
     // Timing readouts (integer microseconds, no floating point): how long the pre-commit hook and the clone + atomic swap each took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
@@ -658,6 +691,34 @@ HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv；打开方�
 
 // ---------- 路径操作 ----------
 // ---------- Path operations ----------
+// 存档目录里的瞬时失败要等：Windows 上别的进程（杀毒扫描 / 索引器 / 我们自己刚读过的设置文件）开着同一个文件时，
+// unlink 与 rename 会拿到 ERROR_SHARING_VIOLATION（EACCES），而这种占用只持续几十毫秒。原先一击即错：游戏的「写临时文件 → 删旧的 →
+// 改名」那一步失败一次，这次存盘就等于没写（角色档还是旧的），而提交本身照常成功——表现就是「有时候保存并退出没把进度存上」。
+// 现在只在事务式存档的路径上重试 10 次、间隔 30–210 ms（合计约 1.2 秒），仍失败才如实报错。
+// Transient failures inside the save directory have to be waited out: on Windows, while another process (antivirus scan / indexer /
+// a settings file of ours just read) holds the same file open, unlink and rename fail with ERROR_SHARING_VIOLATION (EACCES), and that
+// hold lasts only tens of milliseconds. Previously one failure was final: when the game's "write temp -> delete the old -> rename"
+// step failed once, that save wrote nothing (the character file stayed old) while the commit itself still succeeded -- which is exactly
+// "sometimes Save and Exit does not persist the progress". Now, only on transactional save paths, retry 10 times at 30-210 ms (about
+// 1.2 s in total) and report a real failure only when it still fails.
+static int wr_retry_unlink(const char *p) {
+#if defined(_WIN32)
+    if (!in_txn_dir(p)) return unlink(p);
+    for (int i = 0; i < 10; i++) { if (!unlink(p)) return 0; int e = errno; if (i == 9) { errno = e; break; } usleep(30000 + i * 20000); }
+    return -1;
+#else
+    return unlink(p);
+#endif
+}
+static int wr_retry_rename(const char *a, const char *b) {
+#if defined(_WIN32)
+    if (!in_txn_dir(a) && !in_txn_dir(b)) return rename(a, b);
+    for (int i = 0; i < 10; i++) { if (!rename(a, b)) return 0; int e = errno; if (i == 9) { errno = e; break; } usleep(30000 + i * 20000); }
+    return -1;
+#else
+    return rename(a, b);
+#endif
+}
 HLE_FORCE("_ZN2nn2fs10CreateFileEPKcl", "fsp-srv → open(O_CREAT|O_EXCL)+ftruncate", Result, h_fs_CreateFile, const char *path, int64_t sz) {
     HP_EX(path, 1); RW_CREATE();
     int fd = open(hp, O_WRONLY | O_CREAT | O_EXCL, 0644);
@@ -667,7 +728,7 @@ HLE_FORCE("_ZN2nn2fs10CreateFileEPKcl", "fsp-srv → open(O_CREAT|O_EXCL)+ftrunc
     if (rc) unlink(hp);
     errno = e; return rc ? err_res("create", hp) : RES_OK;
 }
-HLE_FORCE("_ZN2nn2fs10DeleteFileEPKc", "fsp-srv → unlink(2)", Result, h_fs_DeleteFile, const char *path) { HP(path); RW(); return unlink(hp) ? err_res("unlink", hp) : RES_OK; }
+HLE_FORCE("_ZN2nn2fs10DeleteFileEPKc", "fsp-srv → unlink(2)（存档目录里的瞬时占用会重试）", Result, h_fs_DeleteFile, const char *path) { HP(path); RW(); return wr_retry_unlink(hp) ? err_res("unlink", hp) : RES_OK; }
 HLE_FORCE("_ZN2nn2fs15CreateDirectoryEPKc", "fsp-srv → mkdir(2)", Result, h_fs_CreateDirectory, const char *path) { HP_EX(path, 1); RW_CREATE();
     if (mkdir(hp, 0755)) return err_res("mkdir", hp);
     if (set_guest_name(hp, path)) { int e = errno; rmdir(hp); errno = e; return err_res("mkdir name", hp); }
@@ -693,13 +754,13 @@ static int rm_tree(const char *p) {
 HLE_FORCE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", "fsp-srv → 递归删除（只在可写挂载内）", Result, h_fs_DeleteDirRec, const char *path) {
     HP(path); RW(); return rm_tree(hp) ? err_res("rmtree", hp) : RES_OK;
 }
-HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_RenameFile, const char *from, const char *to) {
+HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)（存档目录里的瞬时占用会重试）", Result, h_fs_RenameFile, const char *from, const char *to) {
     HP(from); RW(); char hp2[1024];
     if (!host_path_ex(to, hp2, sizeof hp2, NULL, 1)) return err_res("rename path", to);
     if (!access(hp2, F_OK)) return RES_PATH_EXISTS;
-    if (rename(hp, hp2)) return err_res("rename", hp);
+    if (wr_retry_rename(hp, hp2)) return err_res("rename", hp);
     if (dm_fs_test_fail("guestname") || set_guest_name(hp2, to)) { int e = errno ? errno : EIO;
-        if (dm_fs_test_fail("renameback") || rename(hp2, hp)) {   // 回退也失败：文件留在新路径、客体名元数据不对；不退出——在事务存档里就让本事务提交被拒（已提交版本不变，重新克隆即复原） | Rollback also failed: the file stays at the new path with wrong guest-name metadata; do not exit. In a transactional save, this transaction's commit is refused (the committed version is unchanged and recloning restores it)
+        if (dm_fs_test_fail("renameback") || wr_retry_rename(hp2, hp)) {   // 回退也失败：文件留在新路径、客体名元数据不对；不退出——在事务存档里就让本事务提交被拒（已提交版本不变，重新克隆即复原） | Rollback also failed: the file stays at the new path with wrong guest-name metadata; do not exit. In a transactional save, this transaction's commit is refused (the committed version is unchanged and recloning restores it)
             LOG("【红】fs 改名元数据失败且回退失败 errno=%d：%s 留在新路径%s", errno, hp2, in_txn_dir(hp2) ? "，本事务存档提交将被拒" : ""); if (in_txn_dir(hp2)) save_poison(e); }
         errno = e; return err_res("rename name", hp2); }
     if (is_d2s(to)) atomic_store(&g_d2s_wseq, dm_seq_next());

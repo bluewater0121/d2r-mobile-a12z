@@ -94,20 +94,34 @@ int clonefile(const char *src, const char *dst, int flags) {
 // 中途失败尽量走回滚，回滚也失败时留下 .rtmp 残留（下次挂载前由 hle_fs.c 清理）。
 // A -> A.rtmp, B -> A, A.rtmp -> B. Each step uses MoveFileEx's "replace if target exists" semantics; on a mid-way failure we roll back
 // as far as we can, and if that fails too the .rtmp residue is left for hle_fs.c to clean before the next mount.
+// 目录互换要等：Windows 上目录改名在任何句柄开着目录里某个文件时都可能失败（杀毒扫描、索引器、我们自己刚读过的设置文件），
+// 这种失败是瞬时的。每次 MoveFileEx 最多重试 8 次、间隔 40–180 ms，把「有时候存不上」这类瞬时失败挡掉。
+// The directory swap has to wait: on Windows a directory rename can fail whenever any handle has a file inside it open
+// (antivirus scanning, the indexer, a settings file of ours just read), and such failures are transient. Each MoveFileEx is
+// retried up to 8 times at 40-180 ms intervals, so "sometimes it does not save" transient failures never reach the caller.
+static BOOL mv_retry(const char *from, const char *to, DWORD flags) {
+    for (int i = 0; i < 8; i++) {
+        if (MoveFileExA(from, to, flags)) return TRUE;
+        DWORD e = GetLastError();
+        if (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION && e != ERROR_DIR_NOT_EMPTY && e != ERROR_BUSY) { SetLastError(e); return FALSE; }
+        Sleep(40 + i * 20);
+    }
+    return FALSE;
+}
 int renamex_np(const char *from, const char *to, unsigned flags) {
     if (flags & RENAME_EXCL) {
-        if (!MoveFileExA(from, to, MOVEFILE_WRITE_THROUGH)) { errno = EEXIST; return -1; }
+        if (!mv_retry(from, to, MOVEFILE_WRITE_THROUGH)) { errno = EEXIST; return -1; }
         return 0;
     }
     if (!(flags & RENAME_SWAP)) {
-        if (!MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
+        if (!mv_retry(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
         return 0;
     }
     char tmp[1300];
     if (snprintf(tmp, sizeof tmp, "%s.rtmp", from) >= (int)sizeof tmp) { errno = ENAMETOOLONG; return -1; }
-    if (!MoveFileExA(from, tmp, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
-    if (!MoveFileExA(to, from, 0)) { MoveFileExA(tmp, from, 0); errno = EIO; return -1; }
-    if (!MoveFileExA(tmp, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
+    if (!mv_retry(from, tmp, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
+    if (!mv_retry(to, from, 0)) { mv_retry(tmp, from, 0); errno = EIO; return -1; }
+    if (!mv_retry(tmp, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { errno = EIO; return -1; }
     return 0;
 }
 

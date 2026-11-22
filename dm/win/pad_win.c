@@ -147,19 +147,48 @@ void dm_win_pad_touch(void) {   // 玩家碰了画面 / 敲键盘：手柄布局
     g_prev_b = 0;
 }
 
-// DM_PAD_TEST：没有实体手柄时注入一次 A 短按，验「宿主手柄 → 游戏」这条通路
-// DM_PAD_TEST: inject one short A press at that time, to check the host-controller -> game path without hardware
+// DM_PAD_TEST：没有实体手柄时按时间注入按键，验「宿主手柄 → 游戏」这条通路
+// 写法：`<秒>[:<键>[/<键>…]]`，逗号分隔多个时刻；不写键 = A。键名 A/B/X/Y/UP/DOWN/LEFT/RIGHT/PLUS/MINUS/L/R/ZL/ZR/LS/RS。
+// 每次按下 0.25 秒。除了注入按键，它和真手柄走同一条 publish()→dm_pad->游戏 的路，也会触发「手柄接管」切布局——所以既能验通路，也能演玩家用手柄走菜单。
+// DM_PAD_TEST: inject buttons on a schedule without hardware, to check the host-controller -> game path.
+// Format: `<second>[:<button>[/<button>...]]`, comma-separated events; no button = A. Names A/B/X/Y/UP/DOWN/LEFT/RIGHT/PLUS/MINUS/L/R/ZL/ZR/LS/RS.
+// Each event presses for 0.25 s. Besides injecting buttons it goes through the same publish()->dm_pad->game path as a real controller and also triggers the "controller took over" layout switch -- so it checks the path and can also play a menu with a controller.
+static uint64_t pad_test_btn(const char *nm) {
+    if (!strcmp(nm, "A")) return DM_BTN_A; if (!strcmp(nm, "B")) return DM_BTN_B; if (!strcmp(nm, "X")) return DM_BTN_X; if (!strcmp(nm, "Y")) return DM_BTN_Y;
+    if (!strcmp(nm, "UP")) return DM_BTN_UP; if (!strcmp(nm, "DOWN")) return DM_BTN_DOWN; if (!strcmp(nm, "LEFT")) return DM_BTN_LEFT; if (!strcmp(nm, "RIGHT")) return DM_BTN_RIGHT;
+    if (!strcmp(nm, "PLUS")) return DM_BTN_PLUS; if (!strcmp(nm, "MINUS")) return DM_BTN_MINUS;
+    if (!strcmp(nm, "L")) return DM_BTN_L; if (!strcmp(nm, "R")) return DM_BTN_R; if (!strcmp(nm, "ZL")) return DM_BTN_ZL; if (!strcmp(nm, "ZR")) return DM_BTN_ZR;
+    if (!strcmp(nm, "LS")) return DM_BTN_LS; if (!strcmp(nm, "RS")) return DM_BTN_RS;
+    return 0;
+}
 static void maybe_test_press(double t, uint64_t *out_b) {
-    static double times[8]; static int n = -1, logged;
-    if (n < 0) {   // "52,70,88"：每次在第 N 秒按下 0.25 s | "52,70,88": press for 0.25 s at each listed second
+    static struct { double t; uint64_t m; } ev[16]; static int n = -1, logged;
+    if (n < 0) {
         n = 0; const char *e = getenv("DM_PAD_TEST"); if (!e) return;
-        const char *c = e; while (*c && n < 8) { double v = atof(c); if (v > 0) times[n++] = v; c = strchr(c, ','); if (!c) break; ++c; }
+        // 手写切分（不能用两层 strtok：内层会把外层的游标冲掉，7 个时刻只认出 1 个）
+        // Hand-rolled split (no nested strtok: the inner one clobbers the outer cursor, so 7 events parsed as 1)
+        const char *p = e;
+        while (*p && n < 16) {
+            while (*p == ',' || *p == ' ') p++;
+            if (!*p) break;
+            double v = atof(p); uint64_t m = 0;
+            while (*p && *p != ',' && *p != ':' && *p != ' ') p++;
+            if (*p == ':') {
+                p++;
+                while (*p && *p != ',') {
+                    char nm[16]; int k = 0;
+                    while (*p && *p != ',' && *p != '/' && k < 15) nm[k++] = *p++;
+                    nm[k] = 0;
+                    if (*p == '/') p++;
+                    if (nm[0]) m |= pad_test_btn(nm);
+                }
+                while (*p && *p != ',') p++;
+            }
+            if (v > 0) { ev[n].t = v; ev[n].m = m ? m : DM_BTN_A; n++; }   // 只写秒数 = 注入 A（老写法） | seconds only = inject A (the old form)
+        }
+        if (n && !logged) { logged = 1; LOG("手柄：DM_PAD_TEST 注入 %d 次（首次 t=%.1fs 键 %#llx）", n, ev[0].t, (unsigned long long)ev[0].m); }
     }
-    for (int i = 0; i < n; i++) {
-        if (t < times[i] || t > times[i] + 0.25) continue;
-        *out_b |= DM_BTN_A;
-        if (!logged) { logged = 1; LOG("手柄：DM_PAD_TEST 注入 A（t=%.1fs~%.1fs）", times[i], times[i] + 0.25); }
-    }
+    for (int i = 0; i < n; i++) if (t >= ev[i].t && t <= ev[i].t + 0.25) *out_b |= ev[i].m;
 }
 
 static DWORD WINAPI poll_thread(void *p) {
