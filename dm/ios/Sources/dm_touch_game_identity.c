@@ -70,8 +70,9 @@ static uint64_t add(uint64_t h,uint64_t v) {
 #if defined(DM_WIN) || defined(_WIN32)
 #define DM_TG_NEG 1
 static struct {uint64_t fp,seen;} g_neg[1024];
+static uint64_t g_fast_next;   /* 缓存直出有效期（ms）；到期后放一次慢路径抽检 | how long the cache-only path stays valid (ms); one slow-path spot check when it expires */
 static uint64_t g_neg_now(void) { return (uint64_t)GetTickCount64(); }
-int dm_tg_neg_hits, dm_tg_neg_marks;
+int dm_tg_neg_hits, dm_tg_neg_marks, dm_tg_neg_fast;
 #else
 #define DM_TG_NEG 0
 #endif
@@ -85,6 +86,23 @@ int dm_tg_hud_identity(dm_tg_hud_cohort *c,const uint64_t *regs,uint64_t base,in
     uint32_t arg=(uint32_t)regs[19];
     dm_tg_identity_reason=3;
     if(!game || !world || arg>=12 || base>UINT64_MAX-0x3e2f74)return DM_TG_IDENTITY_UNCONFIRMED;
+#if DM_TG_NEG
+    /* 确认之后走缓存直出——这一条是 iOS 不用付的税：Mach 的 vm_read 便宜、整机余量也大，而 Windows 上一次调用要贵好几 µs。
+       六槽 widget 已经学到、world 没变，槽号就是 arg（或 arg+6），widget 与 hud 都是缓存值，所以**这次既不读栈也不读控件**。
+       每 500 ms 放一次慢路径做抽检：控件 enum 对不上就清掉 confirmed 重新学（换角色 / 换面板 / 切副手组都在这里重新对上）。
+       After confirmation, straight out of the cache -- the tax iOS does not pay: Mach's vm_read is cheap and the device has more head, while a call
+       costs several us here. The six slot widgets are already learned and the world has not changed, the slot index is arg (or arg+6), and widget and hud
+       are both cached, so **this call reads neither the stack nor the widget**. Once every 500 ms one call takes the slow path as a spot check: a widget
+       whose enum no longer matches clears confirmed and the cohort is learned again (new character / panel / off-hand set all re-align there). */
+    if(c->confirmed) {
+        uint64_t t=g_neg_now();
+        if(t<g_fast_next) {
+            uint32_t fslot=arg<6?arg:arg-6;
+            if(c->widget[fslot]) { *caller=base+0x3e2f74; *hud=c->hud_identity; dm_tg_identity_slot=fslot;
+                dm_tg_neg_fast++; dm_tg_identity_reason=0; return DM_TG_IDENTITY_NATIVE; }
+        }
+    }
+#endif
     dm_tg_identity_reason=4;
     /* 原Get栈帧一次读完：fp-8=调用者x19（widget）、fp=上一帧fp、fp+8=savedLR；三者同在原Get序言刚写下的0x30字节帧里。 | Read the original Get's stack frame in one go: fp-8 = caller's x19 (widget), fp = previous frame's fp, fp+8 = savedLR; all three are in the 0x30-byte frame the original Get's prologue has just written. */
     uint64_t fp=regs[29],frame[3]={0},lr=0,widget=0;
@@ -111,13 +129,29 @@ int dm_tg_hud_identity(dm_tg_hud_cohort *c,const uint64_t *regs,uint64_t base,in
     }
     /* widget的enum（+b18）与alwaysGetAlt（+c90）同一对象内，一次读[+b18,+c91)。 | The widget's enum (+b18) and alwaysGetAlt (+c90) are inside the same object; read [+b18,+c91) in one go. */
     uint32_t slot=UINT32_MAX;unsigned char always_alt=255;static unsigned char span[0xc91-0xb18]; /* 调用方（bridge 的门回调）持锁；不占客体线程的栈 | The caller (bridge's gate callback) holds the lock; does not use the guest thread's stack */ dm_tg_identity_reason=5;
-    if(read_fn(widget+0xb18,span,sizeof span)){memcpy(&slot,span,4);always_alt=span[0xc90-0xb18];}
-    if(slot>=6 || always_alt ||
-       (arg!=slot && arg!=slot+6)) { dm_tg_identity_slot=slot; return DM_TG_IDENTITY_UNCONFIRMED; }
+    int ok=read_fn(widget+0xb18,span,sizeof span);
+    if(ok){memcpy(&slot,span,4);always_alt=span[0xc90-0xb18];}
+    if(ok && (slot>=6 || always_alt || (arg!=slot && arg!=slot+6))) {
+        /* 抽检发现 HUD 换了一套（换角色 / 面板变了 / 这槽切到副手组）：清掉重新学，别拿旧缓存继续报 | The spot check found a different HUD (new character / panel changed / this slot switched to the off-hand set): clear it and learn again instead of reporting the stale cache */
+#if DM_TG_NEG
+        if(c->confirmed) { c->confirmed=0; c->seen=0; memset(c->widget,0,sizeof c->widget); }
+#endif
+        dm_tg_identity_slot=slot; return DM_TG_IDENTITY_UNCONFIRMED;
+    }
+    if(slot>=6 || always_alt || (arg!=slot && arg!=slot+6)) { dm_tg_identity_slot=slot; return DM_TG_IDENTITY_UNCONFIRMED; }
     dm_tg_identity_reason=6; dm_tg_identity_slot=slot;
-    if(c->widget[slot] && c->widget[slot]!=widget)return DM_TG_IDENTITY_UNCONFIRMED;
+    if(c->widget[slot] && c->widget[slot]!=widget) {
+#if DM_TG_NEG
+        if(c->confirmed) { c->confirmed=0; c->seen=0; memset(c->widget,0,sizeof c->widget); }
+#endif
+        return DM_TG_IDENTITY_UNCONFIRMED;
+    }
     for(unsigned i=0;i<6;i++)if(i!=slot && c->widget[i]==widget)return DM_TG_IDENTITY_UNCONFIRMED;
-    if(c->confirmed){*caller=lr;*hud=c->hud_identity;dm_tg_identity_reason=0;return DM_TG_IDENTITY_NATIVE;}
+    if(c->confirmed){*caller=lr;*hud=c->hud_identity;dm_tg_identity_reason=0;
+#if DM_TG_NEG
+        g_fast_next=g_neg_now()+500;   /* 抽检周期：之后 500 ms 全走缓存直出 | spot-check period: the next 500 ms come straight from the cache */
+#endif
+        return DM_TG_IDENTITY_NATIVE;}
     dm_tg_identity_reason=7;   /* 学习中：六槽未齐 | Learning: the six slots are not all filled yet */
     c->widget[slot]=widget;c->seen|=1u<<slot;
     if(c->seen==63) {

@@ -45,13 +45,17 @@ int dm_touch_game_snapshot(dm_tg_snapshot *out) {
     pthread_mutex_unlock(&lock);return match;
 }
 /* 诊断（DM_BINDING_DIAG=1）：各返回点计数，每 3 秒一行；身份确认失败再按原因码细分（identity.c） | Diagnostic (DM_BINDING_DIAG=1): counts per return point, one line every 3 seconds; identity confirmation failures are further broken down by reason code (identity.c) */
-static unsigned dg[8], dg_id[8]; static uint64_t dg_last;
+static unsigned dg[8], dg_id[8], dg_slot[6]; static uint64_t dg_last;
 static void diag_tick(void) {
     static int on=-1; if(on<0) on=getenv("DM_BINDING_DIAG")!=NULL; if(!on) return;
     uint64_t t=now_ns(); if(t-dg_last<3000000000ull) return; dg_last=t;
-    LOG("绑定诊断：调用 %u｜寄存器不符 %u｜槽越界 %u｜组不符 %u｜不在局内 %u｜身份未确认 %u（原因 3:%u 4:%u 5:%u 6:%u 7:%u，LR 偏移 %#llx 槽 %u）｜成功 %u｜负缓存 命中 %d 标记 %d｜scene_game %d world %llu",
+    LOG("绑定诊断：调用 %u｜寄存器不符 %u｜槽越界 %u｜组不符 %u｜不在局内 %u｜身份未确认 %u（原因 3:%u 4:%u 5:%u 6:%u 7:%u，LR 偏移 %#llx 槽 %u）｜成功 %u｜负缓存 命中 %d 标记 %d｜缓存直出 %d｜scene_game %d world %llu",
         dg[0],dg[1],dg[2],dg[3],dg[4],dg[5],dg_id[3],dg_id[4],dg_id[5],dg_id[6],dg_id[7],(unsigned long long)dm_tg_identity_lr,dm_tg_identity_slot,dg[6],
-        dm_tg_neg_hits,dm_tg_neg_marks,scene_game,(unsigned long long)world_epoch);
+        dm_tg_neg_hits,dm_tg_neg_marks,dm_tg_neg_fast,scene_game,(unsigned long long)world_epoch);
+    LOG("绑定快照：valid %d ready %d portal %d group_seen %d identity %#llx captured %llu age_ms %.0f｜cohort confirmed %d seen %d",
+        latest.valid,latest.ready,latest.portal.valid,latest.group_seen,(unsigned long long)latest.hud_identity,(unsigned long long)latest.captured_ns,
+        latest.captured_ns? (double)(now_ns()-latest.captured_ns)/1e6 : -1.0, hud_cohort.confirmed,hud_cohort.seen);
+    LOG("绑定槽过：0:%u 1:%u 2:%u 3:%u 4:%u 5:%u｜group seen %d lastslot %d",dg_slot[0],dg_slot[1],dg_slot[2],dg_slot[3],dg_slot[4],dg_slot[5],group.seen,group.pending.getter_input_slot);
 }
 static int live_check;   /* 真游戏里才开（要调游戏函数）；单测的假模块上不开 | Turned on only in the real game (it calls game functions); not turned on for the unit tests' fake module */
 void dm_touch_game_live_check(int on) { live_check=on; }
@@ -103,6 +107,22 @@ static void binding_getter(const uint64_t *regs) {
     if(regs[23]!=regs[19]) {dg[5]++;dg_id[4]++;return;}
 #endif
     if(st==3)return;
+#if defined(DM_WIN) || defined(_WIN32)
+    /* 学会之后就没必要每次真算（这是 iOS 不用操心的一段：Mach 的 vm_read 便宜、机器余量也大；Windows 上这颗 getter 每秒进宿主 3~6 千次，
+       每次进门本身就是上万条指令的账）。六槽身份一旦确认，**一帧过一次**就够（快照有最大年龄，太稀会过期退回键位字母），其余直接返回；
+       **学习阶段一律不节流**——早先不分阶段地节流，六槽永远学不齐、图标退回键位字母，就是这么坏的。
+       Once learned nothing has to be recomputed per call (the stretch iOS never worries about: Mach's vm_read is cheap and the device has head; on
+       Windows this getter enters the host 3-6k times a second and every entry alone costs thousands of instructions). As soon as the six-slot identity
+       is confirmed **one pass per frame** is enough (the snapshot has a max age and would otherwise expire back to key letters) and the rest return
+       immediately. **Learning is never throttled** -- throttling it wholesale is exactly what left the cohort incomplete and the icons falling back to
+       key letters. */
+    if(hud_cohort.confirmed) { static uint64_t win_ns; static int used; static long budget=-1;
+        if(budget<0){const char *e=getenv("DM_BINDING_CONF_BUDGET"); budget=e&&*e?atol(e):16;}   /* 0 = 关（对照用）| 0 = off (for A/B) */
+        uint64_t t=now_ns();
+        if(t-win_ns>=16000000ull){win_ns=t;used=0;}
+        if(budget>0 && used>=budget){dg[7]++;return;}
+        used++; }
+#endif
     /* 节流（放在 HUD 前置筛之后，且**按槽位**各算一个间隔；Windows 缺省 0 = 不节流）：这颗 getter 在 Windows 上被游戏叫到 3~6 千次/秒，
        每次都要离开客体进宿主函数。实测 15 ms 的按槽位节流能多回 1 帧左右，但**六槽身份学习会时好时坏**（学不齐就退回键位字母、图标出不来），
        所以缺省关掉、只留开关做对照；日常开销已经由「栈读页缓存 + 按 fp 的负缓存」压下去了。
@@ -133,6 +153,7 @@ static void binding_getter(const uint64_t *regs) {
 #endif
     if(scope==DM_TG_IDENTITY_UNCONFIRMED) {dg[5]++;if(dm_tg_identity_reason>=0&&dm_tg_identity_reason<8)dg_id[dm_tg_identity_reason]++;pthread_mutex_unlock(&lock);return;} // cache/unknown/readFail全IGNORE，不清HUD快照/不续时。 | cache/unknown/readFail are all IGNORE; do not clear the HUD snapshot / do not extend the time.
     if(st==6) {pthread_mutex_unlock(&lock);return;}
+    if(dm_tg_identity_slot<6) dg_slot[dm_tg_identity_slot]++;
     unsigned char mapping[72],bindings[DM_TG_SLOTS*DM_TG_STRIDE]={0};
     memcpy(mapping,m->base+MAPPING_OFFSET,sizeof mapping);
     for(int i=0;i<DM_TG_SLOTS;i++)memcpy(bindings+i*DM_TG_STRIDE,m->base+BINDING_OFFSET+(selected_bank+i)*DM_TG_STRIDE,4);

@@ -453,7 +453,7 @@ static void paint(void) {
         { std::lock_guard<std::mutex> lk(g_mx); s = g_tc; seen = g_tc.enabled_targets; }
         (void)seen;
         // 当前技能绑定的快照（锁内一份副本；共享桥保证只读）| snapshot of the current skill bindings (one copy; the shared bridge keeps it read-only)
-        dm_tg_snapshot snap; memset(&snap, 0, sizeof snap); dm_touch_game_snapshot(&snap);
+        dm_tg_snapshot snap; memset(&snap, 0, sizeof snap); dm_touch_game_snapshot(&snap); const uint64_t now = now_ns();
         const dm_tc_layout &l = s.layout;
         float k = 1.0f;                 // 布局点数 → 像素 | layout points to pixels
         float px = g_px;
@@ -490,7 +490,16 @@ static void paint(void) {
             int empty = 0, charges = 0;
             dm_ta_glyph glg; memset(&glg, 0, sizeof glg); glg.status = DM_TA_UNKNOWN;
             if (i <= DM_TC_SKILL4 && b) {
-                glg = dm_ta_current_set(&snap, b, now_ns(), (int)s.skill_set);
+                // 快照年龄：桥里六槽「一组」要等整帧的六次调用才拼齐（实测约 4 次/秒），iOS 的 250 ms 门在这里会把两组之间
+                // 的空档全判过期、图标退回键位字母。图标是纯装饰、换技能一秒内看出来就够了，所以这里拿快照自己的采集时刻当查询
+                // 时刻（只放宽这一步的年龄判定，快照本身仍按它自己的规则失效）。
+                // Snapshot age: in the bridge a six-slot "group" needs the whole frame's six calls (about 4 groups a second in practice),
+                // so iOS's 250 ms gate would call every gap between groups expired and the icons would fall back to key letters. The icon is
+                // decoration and one second of lag is plenty to notice a rebind, so query as of the snapshot's own capture time (only this
+                // age check is relaxed; the snapshot itself still expires by its own rules).
+                uint64_t q = now;
+                if (snap.captured_ns && (snap.captured_ns > q || q - snap.captured_ns > DM_TG_MAX_AGE_NS)) q = snap.captured_ns + 1;
+                glg = dm_ta_current_set(&snap, b, q, (int)s.skill_set);
                 if (glg.status == DM_TA_EMPTY) empty = 1;
             } else if (i == DM_TC_PORTAL) {
                 glg = dm_ta_skill(359);   // 回城：原版通用的那张技能图（iOS 同一张）| town portal: the original game's shared skill image (the same one iOS uses)
