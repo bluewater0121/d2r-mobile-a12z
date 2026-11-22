@@ -19,6 +19,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
+#include <time.h>
 
 static HWND g_hwnd;
 static volatile LONG g_closing;
@@ -572,9 +574,17 @@ int dm_win_stdio_to_log(void) {
     if (e && e != INVALID_HANDLE_VALUE) return 0;
     const char *p = getenv("DM_LOG_FILE");
     if (!p || !*p) p = "dmhost.log";
-    if (!freopen(p, "w", stderr)) return -1;
+    // 追加、不覆盖：一次会话的日志就有 1–2 MB，覆盖式会让「上一次那次失败」的现场直接消失（用户报「保存并退出有时没用」时，
+    // 上一把失败的日志一定被这次启动清空了，什么都查不到）。长到 16 MiB 才滚掉重来，连着试几次都还能翻到前一次。
+    // Append, do not truncate: one session already logs 1-2 MB, and truncating destroys the scene of "the last attempt failed" (when the user
+    // reports "save and exit sometimes doesn't work", the failing run's log was already wiped by the next launch, leaving nothing to look at).
+    // Only past 16 MiB does it roll over, so several attempts back stay readable.
+    { struct stat st; if (!stat(p, &st) && st.st_size > (off_t)(16u << 20)) remove(p); }
+    if (!freopen(p, "a", stderr)) return -1;
     freopen(p, "a", stdout);
-    LOG("日志落到 %s（没有控制台：GUI 子系统启动）", p);
+    { char ts[64]; time_t now = time(NULL); struct tm *lt = localtime(&now);
+      if (lt && strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt)) LOG("======== 会话开始 %s（追加到 %s）========", ts, p);
+      else LOG("======== 会话开始（追加到 %s）========", p); }
     return 0;
 }
 

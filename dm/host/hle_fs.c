@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 
@@ -479,6 +480,69 @@ static int copy_over_tree(const char *src, const char *dst) {
     closedir(d);
     return bad;
 }
+// 已提交目录的指纹（相对路径 + 字节数 + mtime，整树求和）。提交前后指纹一样 = 这次提交一个字节都没换进来。
+// 游戏存角色是「写临时文件 → 删旧的 → 改名」，Windows 上删/改名撞上瞬时占用时那一步失败、临时文件白写，工作目录里还是旧档——
+// 但这次提交照样成功，光看「存档提交 #N」判不出真假。指纹不变就把这句话打出来，让「这次到底存上没有」在日志里一眼可见。
+// Fingerprint of the committed directory (relative path + size + mtime, summed over the whole tree). The same fingerprint before and after a
+// commit means nothing at all was swapped in. The game saves a character as "write temp -> delete old -> rename"; on Windows a momentary
+// sharing violation makes that step fail and the temp file go to waste, leaving the old file in the working directory -- yet the commit itself
+// still succeeds, so "存档提交 #N" alone cannot tell the truth. When the fingerprint does not move, say so, so the log answers "did it save?"
+static uint64_t tree_stamp(const char *root) {
+    DIR *d = opendir(root); if (!d) return 0;
+    struct dirent *e; char s[1100]; uint64_t h = 0xCBF29CE484222325ull; int depth = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;                                  // 跳过 . .. 与临时 / 换下来的目录 | skip . .. and temp / swapped-out directories
+        if (snprintf(s, sizeof s, "%s/%s", root, e->d_name) >= (int)sizeof s) continue;
+        struct stat sb; if (stat(s, &sb)) continue;
+        h = (h ^ ((uint64_t)sb.st_size * 0x9E3779B97F4A7C15ull)) * 0x100000001B3ull;
+        h = (h ^ ((uint64_t)sb.st_mtime + 1)) * 0x100000001B3ull;
+        if (S_ISDIR(sb.st_mode)) { DIR *d2 = opendir(s); struct dirent *e2; char t[1100];      // 存档目录只有两层（角色 / Settings） | the save tree is only two levels deep (character / Settings)
+            while (d2 && (e2 = readdir(d2))) {
+                if (e2->d_name[0] == '.') continue;
+                if (snprintf(t, sizeof t, "%s/%s", s, e2->d_name) >= (int)sizeof t) continue;
+                struct stat sb2; if (stat(t, &sb2)) continue;
+                h = (h ^ ((uint64_t)sb2.st_size * 0x9E3779B97F4A7C15ull)) * 0x100000001B3ull;
+                h = (h ^ ((uint64_t)sb2.st_mtime + 1)) * 0x100000001B3ull; depth++; }
+            if (d2) closedir(d2); }
+    }
+    closedir(d);
+    return depth ? h : 1;                                                    // 空目录也不与「打不开」混为一谈 | an empty tree must not look like "cannot open"
+}
+static uint64_t g_pubstamp[MAX_MOUNT];   // 上一次提交后的指纹（按挂载位） | fingerprint after the last commit, per mount slot
+// 角色档那一行：整棵树有没有动（指纹）还是粗的——真正要回答的是「这次退出，角色档有没有写新」。所以再挑出已提交目录里
+// **最新的那个** .d2s（存角色 = 写临时文件 → 删旧的 → 改名，正常存盘它一定刷新），把大小 / 时刻 / 这次动没动打进日志。
+// 指纹变了但角色档没变 = 这次只写了旁路文件（Settings / 临时文件残留），正是「删旧档那一步吃了占用」的样子。
+// The character line: whether the whole tree moved (fingerprint) is coarse -- the real question is "did this exit rewrite the character file".
+// So also pick the newest .d2s in the committed directory (saving a character = write temp -> delete old -> rename, so a real save always
+// touches it) and log its size / time / whether it moved. Fingerprint moved but character did not = only side files were written (Settings /
+// a leftover temp file), which is exactly what "the delete-old step ate a sharing violation" looks like.
+static struct { char rel[64]; long long size; long long mt; } g_d2s_last;
+static void d2s_report(const char *commit, int n) {
+    DIR *d = opendir(commit); if (!d) return;
+    struct dirent *e; char s[1100], f[1100], rel[64]; struct stat newest; rel[0] = 0; int have = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (snprintf(s, sizeof s, "%s/%s", commit, e->d_name) >= (int)sizeof s) continue;
+        struct stat sb; if (stat(s, &sb) || !S_ISDIR(sb.st_mode)) continue;
+        DIR *d2 = opendir(s); struct dirent *e2;
+        while (d2 && (e2 = readdir(d2))) {
+            size_t l = strlen(e2->d_name); if (l <= 4 || strcmp(e2->d_name + l - 4, ".d2s")) continue;
+            if (snprintf(f, sizeof f, "%s/%s", s, e2->d_name) >= (int)sizeof f) continue;
+            struct stat fb; if (stat(f, &fb)) continue;
+            if (!have || fb.st_mtime > newest.st_mtime) { newest = fb; have = 1; snprintf(rel, sizeof rel, "%s/%s", e->d_name, e2->d_name); }
+        }
+        if (d2) closedir(d2);
+    }
+    closedir(d);
+    if (!have) return;
+    char ts[32] = ""; struct tm *lt = localtime(&newest.st_mtime);
+    if (!(lt && strftime(ts, sizeof ts, "%m-%d %H:%M:%S", lt))) snprintf(ts, sizeof ts, "%lld", (long long)newest.st_mtime);
+    int moved = g_d2s_last.rel[0] && (strcmp(g_d2s_last.rel, rel) || g_d2s_last.size != (long long)newest.st_size || g_d2s_last.mt != (long long)newest.st_mtime);
+    if (!g_d2s_last.rel[0]) LOG("存档提交 #%d：角色档 %s %lld 字节（%s）", n, rel, (long long)newest.st_size, ts);
+    else if (moved) LOG("存档提交 #%d：角色档 %s %lld 字节（%s）已更新", n, rel, (long long)newest.st_size, ts);
+    else LOG("存档提交 #%d：角色档 %s %lld 字节（%s）没变——这次退出没有写新档（只顾了旁路文件）", n, rel, (long long)newest.st_size, ts);
+    snprintf(g_d2s_last.rel, sizeof g_d2s_last.rel, "%s", rel); g_d2s_last.size = (long long)newest.st_size; g_d2s_last.mt = (long long)newest.st_mtime;
+}
 HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整树 clone 后与已提交目录原子互换（renamex_np RENAME_SWAP）", Result, h_fs_Commit, const char *name) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
@@ -529,6 +593,13 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         LOG("存档提交 #%d：%s 原子换入 %s（此前存档写 %d 次）（钩子 %llu 微秒、克隆换入 %llu 微秒、自本事务首次写起 %llu 微秒）", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc1 - tc0) / 1000), (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
+        { uint64_t st = tree_stamp(g_mnt[i].commit);
+          d2s_report(g_mnt[i].commit, n);
+          // 指纹没动：这次提交把「和上次一模一样的存档」换进去了，也就是游戏那一步删/改名吃了瞬时占用——这次等于没存（见 README 坑 28）
+          // Same fingerprint: this commit swapped in exactly the save that was already there, i.e. the game's delete/rename ate a momentary sharing violation -- nothing was actually saved (README pit 28)
+          if (g_pubstamp[i] && st == g_pubstamp[i]) LOG("【红】存档提交 #%d：已提交目录一个字节都没变（这次没有真的写进存档——游戏那一步很可能删/改名撞了占用）", n);
+          else LOG("存档提交 #%d：已提交目录有更新（指纹 %#llx → %#llx）", n, (unsigned long long)g_pubstamp[i], (unsigned long long)st);
+          g_pubstamp[i] = st; }
         if (g_dm_save_commit_hook) g_dm_save_commit_hook(g_mnt[i].commit); }   // iCloud 同步（cloud_ios.m）：持着锁调，那边只做 clonefile 快照 | iCloud sync (cloud_ios.m): called with the lock held, that side only takes a clonefile snapshot
     pthread_mutex_unlock(&g_lock);
     return r;
