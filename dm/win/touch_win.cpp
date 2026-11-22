@@ -192,6 +192,7 @@ static void pulse_pump(dm_tc_state *s, double now) {
 // world-tap gestures ever started (which is why the scroll never triggered).
 static std::atomic<int> g_nav_msg{0};
 static std::atomic<int> g_nav_mode{0};   // 0 游戏态 1 面板态 2 死亡页 3 只开着对话菜单 | 0 game, 1 panel, 2 death, 3 dialog only
+static int g_nav_freec = -1;             // 上一次算圆钮名单时「这一页有自由光标」的读数（-1 = 还没算过）| the free-cursor reading used for the last round-button list (-1 = not computed yet)
 static void touch_uimsg_win(const char *cat, const char *act, const char *arg) {
     static int blocked;
     if (!strcmp(cat, "PanelManager")) blocked = dm_hud_stack_msg(act, arg ? arg : "");
@@ -227,16 +228,28 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
     // (computed from the UI messages plus the panel status bits); the round buttons and the stick stop publishing
     { int panel = dm_ui_panel_state();
       dm_tc_set_panel_state(panel);
-      int nav = g_nav_msg.load() != 0 || panel != 0;
-      if (nav != (g_tc.navigation_mode != 0)) {
-          dm_tc_set_navigation_mode(&g_tc, nav);
-          // 导航态只留名单里的圆钮（缺省一个都不给，同 iOS 的 DM_TOUCH_NAV_PAD 缺省）；游戏态全开
-          // In navigation only the listed round buttons stay (none by default, same as iOS's DM_TOUCH_NAV_PAD default); in game state all are on
-          uint32_t mask = nav ? dm_tc_nav_mask(getenv("DM_TOUCH_NAV_PAD") && *getenv("DM_TOUCH_NAV_PAD") == '1')
+      int nav = g_nav_msg.load() != 0 || panel != 0, freec = nav ? dm_ui_free_cursor() : 0;
+      // 导航态留哪几颗圆钮，按「这一页有没有自由光标」分：
+      //   有自由光标（物品栏 / 技能树 / 属性页）——照 iOS 一颗都不留，手指就是界面指针，点物品 / 点页签都靠手指本身；
+      //   没有自由光标（选项页 / 暂停菜单 / 小站 / 对话 / 死亡弹窗）——五颗圆钮留着（Windows 缺省，DM_TOUCH_NAV_PAD=0 退回 iOS 缺省）：
+      //     这些页上没有光标，手指按圆钮只会变成「点那个空白位置」，菜单项一点反应都没有（实测：选项页焦点在「编年史」时按浮层 A
+      //     既不开页也不确认，直接点那一行才生效；玩家拿可见的 A 确认菜单是最自然的按法）。
+      // Which round buttons stay in navigation depends on whether the page has a free cursor:
+      //   free cursor (inventory / skill tree / attributes) -- none, exactly as iOS: the finger itself is the UI pointer, tapping items and tabs;
+      //   no free cursor (options page / pause menu / waypoints / dialog / death popup) -- the five round buttons stay (Windows default; DM_TOUCH_NAV_PAD=0 restores the iOS default):
+      //     these pages have no cursor, so a finger on a round button only becomes "click that empty spot" and a menu item does nothing at all (measured: with the options page's focus on 「编年史」,
+      //     pressing the overlay A neither opened the page nor confirmed it; only tapping that row worked. Confirming a menu with the visible A is the most natural press for a touch player).
+      if (nav != (g_tc.navigation_mode != 0) || freec != g_nav_freec) {
+          int was_nav = g_tc.navigation_mode;
+          if (nav != was_nav) dm_tc_set_navigation_mode(&g_tc, nav);
+          g_nav_freec = freec;
+          const char *np = getenv("DM_TOUCH_NAV_PAD");
+          uint32_t mask = nav ? (freec ? dm_tc_nav_mask(0) : dm_tc_nav_mask(!(np && *np == '0')))
                              : ((1u << DM_TC_COUNT) - 1);
           if (nav && g_nav_mode.load() == 3) mask |= 1u << DM_TC_MENU;   // 只开着对话菜单：留一棵菜单钮关框 | dialog only: keep the menu button to close it
           dm_tc_enable_targets(&g_tc, mask);
-          LOG("触屏浮层：%s（面板位 %d，面板模式 %d）", nav ? "切面板态（手指当界面指针）" : "回游戏态（圆钮与摇杆）", panel, g_nav_mode.load());
+          if (nav != was_nav) LOG("触屏浮层：%s（面板位 %d，面板模式 %d，自由光标 %d，圆钮 %s）", nav ? "切面板态（手指当界面指针）" : "回游戏态（圆钮与摇杆）",
+                                  panel, g_nav_mode.load(), freec, (mask & dm_tc_nav_mask(1)) ? "留" : "不留");
       } }
     gesture_pump(ws);
     ++g_pad_polls;
