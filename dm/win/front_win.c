@@ -396,9 +396,20 @@ void front_run(void (*guest)(void)) {
     if (pthread_create(&g_guest_th, NULL, guest_main_tramp, NULL)) { fprintf(stderr, "[dm] 起客体线程失败\n"); guest(); return; }
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageA(&m); }
-    // 关窗口：已进局且还有没提交的进度，由 dm_host_shutdown 走正常收尾（存档提交完再退）
-    // Window closed: if a run is in progress with uncommitted progress, dm_host_shutdown does the orderly shutdown (commit the save, then exit)
+    // 关窗口：有局在就先请游戏走一次它自己的存盘、等存档提交（做法同 Mac 壳 app_quit / iOS 壳进后台），再有序收尾。
+    // 游戏自己的定时自动存盘约 5 分钟一次，直接关窗口会把这一段进度全丢掉；暂停菜单开着时游戏停拍，dm_save_wait 会临时放开暂停存这一次
+    // Window closed: if a run is in progress, first ask the game to do one of its own saves and wait for the save commit (same as the Mac shell's app_quit / the iOS shell going to the background), then shut down in order.
+    // The game's own autosave is about once every 5 minutes, so closing the window directly threw away all progress since then; when the pause menu is open the game stops ticking and dm_save_wait temporarily releases the pause for this one save
     LOG("窗口：关闭（客体%s）", atomic_load(&g_guest_running) ? "仍在跑" : "已结束");
+    {
+        int dm_ingame_now(void); int dm_uiscreen_ingame(void); int dm_save_wait(double max_s, uint64_t *commits, int *froze, double *ms);
+        if (!dm_ingame_now() && !dm_uiscreen_ingame()) LOG("窗口：退出（不在局内，没有待存的进度）");
+        else {
+            uint64_t n = 0; int froze = 0; double ms = 0; int asked = dm_save_wait(3, &n, &froze, &ms);
+            if (n && asked) LOG("窗口：退出前等游戏存盘 %.0f ms，期间存档提交 %llu 次%s", ms, (unsigned long long)n, froze ? "（原先暂停着：冻结世界存盘、已恢复暂停）" : "");
+            else LOG("【红】窗口：未存盘退出——3 秒内没等到存档提交（%s%s）", asked ? "已请游戏存盘" : "一直没到能请存盘的状态（读取画面？）", froze ? "，原先暂停着、冻结放开过" : "");
+        }
+    }
     dm_host_shutdown("关窗口");
     if (atomic_load(&g_guest_running)) { Sleep(3000); }
     ExitProcess(0);
