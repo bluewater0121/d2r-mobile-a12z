@@ -47,6 +47,10 @@ extern "C" void dm_padmode_request(int pad);
 extern "C" int dm_padmode_current(void);
 extern "C" int dm_padmode_busy(void);
 extern "C" void dm_tp_request(void);   // 回城钮（dm_freetp.c）| the town portal button (dm_freetp.c)
+// 原版界面的开合消息（dm_cursor.c 的 dm_hud_stack_msg = 面板栈读数；uimsg_subscribe 在 dm/host/diag.c）
+// The original UI's open / close messages (dm_cursor.c's dm_hud_stack_msg = the panel stack reading; uimsg_subscribe lives in dm/host/diag.c)
+extern "C" int dm_hud_stack_msg(const char *act, const char *arg);
+extern "C" void uimsg_subscribe(void (*fn)(const char *, const char *, const char *));
 
 using namespace Gdiplus;
 
@@ -175,6 +179,33 @@ static void pulse_pump(dm_tc_state *s, double now) {
 }
 
 // ---------- 取手柄那一拍：推进状态机并发布 ----------
+// 导航态（照 iOS front_ios.m 的 touch_ui_message，一字不差）：
+//   dm_tc_navigation 按面板名名单算（物品栏 / 技能树 / 暂停 / 角色 / 任务 / 储藏箱 / 魔盒 / 小站 / 对话 / 商店 / 按键绑定 / 技能选择 / 死亡弹窗），
+//   再并上「面板栈里还开着非常驻面板」（dm_hud_stack_msg > 0，雇佣名单这类不在名单里的页靠它）。
+// 原先这里只看 dm_ui_panel_state()——那个值只有 储藏箱 / 商人 / 死亡 / 单件槽 / 魔盒 几位，**物品栏不在里面**，所以打开物品栏时
+// 导航态一直是 0：手指还按游戏触点处理，长按 / 双击 / 点世界那整套手势一次都不会启动（这就是「卷轴长按触发不了」的根因）。
+// Navigation state, exactly as iOS's touch_ui_message does it: dm_tc_navigation judges by the panel-name list (inventory / skill tree / pause /
+// character / quests / stash / cube / waypoint / dialog / vendor / key binding / skill select / death popup), combined with "a non-resident
+// panel is still open in the panel stack" (dm_hud_stack_msg > 0, which covers pages such as the hire list that are not on the list).
+// This used to read dm_ui_panel_state() only -- that value has bits for stash / vendor / death / single slot / cube and **not for the inventory**,
+// so with the inventory open navigation stayed 0: the finger was still handled as a game touch and none of the long-press / double-tap /
+// world-tap gestures ever started (which is why the scroll never triggered).
+static std::atomic<int> g_nav_msg{0};
+static std::atomic<int> g_nav_mode{0};   // 0 游戏态 1 面板态 2 死亡页 3 只开着对话菜单 | 0 game, 1 panel, 2 death, 3 dialog only
+static void touch_uimsg_win(const char *cat, const char *act, const char *arg) {
+    static int blocked;
+    if (!strcmp(cat, "PanelManager")) blocked = dm_hud_stack_msg(act, arg ? arg : "");
+    dm_tc_set_panel_state(dm_ui_panel_state());
+    static dm_tc_scene scene;
+    int mode = dm_tc_navigation(&scene, cat, act, arg);
+    if (scene.game && blocked > 0) mode = 1;
+    g_nav_mode.store(dm_tc_panel_mode(mode, &scene, blocked));
+    g_nav_msg.store(mode);
+}
+// 面板态下的界面归一化尺寸（手势层画布）| the interface-normalised size the gesture layer uses
+static float gq_w(void) { return g_tc.layout.width > 0 ? g_tc.layout.width : 667.0f; }
+static float gq_h(void) { return g_tc.layout.height > 0 ? g_tc.layout.height : 375.0f; }
+
 static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     // 手柄接管时也要照常推进 / 合并：浮层此刻是收着的，可鼠标仍然可以点它藏着的那颗钮（点下去前端会先调 dm_win_touch_screen_input 把输入源交回触屏，
     // 但那一拍游戏正在重建布局，光靠那一次切换这一下就丢了）。这里不按输入源早退，只有「浮层没开 / 不在局内」才让开。
@@ -183,18 +214,41 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
     // lost to it). So this no longer bails out on the input source -- only "overlay off / not in a run" stands down.
     if (!g_on || !g_in_run.load()) return;   // 浮层没开 / 不在局内：照旧让手柄与键盘的输入走 | overlay off / not in a run: leave pad and keyboard input alone
     std::lock_guard<std::mutex> lk(g_mx);
-    // 面板态（物品栏 / 技能树 / 选项开着）= 手势层的导航态：手指变成界面指针，圆钮与摇杆停发（照 iOS / mac 宿主）
-    // Panel state (inventory / skill tree / options open) = the gesture layer's navigation state: fingers become UI pointers and the round
-    // buttons / stick stop publishing (same as the iOS and Mac hosts)
+    // 时间基准一律墙钟：pad_step 的 now 是 guest_ns()，而面板开着时（冻结面板）客体时钟不走，
+    // 手势层按它算「按住多久」就永远停在 0——长按判定（dm_tc_tick 里的 pointer_long）也就永远不成立。
+    // iOS / mac 用的是 wall clock 折成的拍。pulse_pump 同理由此（面板里点一下的脉冲也要靠时间收回）。
+    // Time base is the wall clock throughout: pad_step's now is guest_ns(), and the guest clock does not advance while a panel is open
+    // (panel freeze), so "how long has it been held" would stay at 0 forever and the long-press judgment (pointer_long in dm_tc_tick) would
+    // never come true. iOS / Mac use wall clock turned into beats. pulse_pump needs the same for the same reason (a tap's pulse inside a panel
+    // has to be withdrawn by time too).
+    double ws = (double)now_ns() / 1e9;
+    (void)now;   // 入参是 guest_ns，面板开着时被冻结，见上面 | the argument is guest_ns, frozen while a panel is open, see above
+    // 面板态：手势层的导航态（界面消息算出来的 + 面板状态位），圆钮与摇杆停发 | panel state: the gesture layer's navigation state
+    // (computed from the UI messages plus the panel status bits); the round buttons and the stick stop publishing
     { int panel = dm_ui_panel_state();
       dm_tc_set_panel_state(panel);
-      dm_tc_set_navigation_mode(&g_tc, panel != 0);
-      static int nav_prev = -1;
-      if ((panel != 0) != nav_prev) { nav_prev = (panel != 0); LOG("触屏浮层：%s（面板位 %d）", panel ? "切面板态（手指当界面指针）" : "回游戏态（圆钮与摇杆）", panel); } }
-    gesture_pump((double)now / 1e9);
+      int nav = g_nav_msg.load() != 0 || panel != 0;
+      if (nav != (g_tc.navigation_mode != 0)) {
+          dm_tc_set_navigation_mode(&g_tc, nav);
+          // 导航态只留名单里的圆钮（缺省一个都不给，同 iOS 的 DM_TOUCH_NAV_PAD 缺省）；游戏态全开
+          // In navigation only the listed round buttons stay (none by default, same as iOS's DM_TOUCH_NAV_PAD default); in game state all are on
+          uint32_t mask = nav ? dm_tc_nav_mask(getenv("DM_TOUCH_NAV_PAD") && *getenv("DM_TOUCH_NAV_PAD") == '1')
+                             : ((1u << DM_TC_COUNT) - 1);
+          if (nav && g_nav_mode.load() == 3) mask |= 1u << DM_TC_MENU;   // 只开着对话菜单：留一棵菜单钮关框 | dialog only: keep the menu button to close it
+          dm_tc_enable_targets(&g_tc, mask);
+          LOG("触屏浮层：%s（面板位 %d，面板模式 %d）", nav ? "切面板态（手指当界面指针）" : "回游戏态（圆钮与摇杆）", panel, g_nav_mode.load());
+      } }
+    gesture_pump(ws);
     ++g_pad_polls;
-    dm_tc_tick(&g_tc, (double)now / 1e9);
-    pulse_pump(&g_tc, (double)now / 1e9);
+    dm_tc_tick(&g_tc, ws);
+    pulse_pump(&g_tc, ws);
+    // 面板态把鼠标光标交给宿主（ce 光标在这儿才看得见、也才有「指着的这件是什么」的读数，免鉴定 / 拖放判类全靠它）
+    // In panel state hand the cursor to the host (that is where the game cursor is visible and where "what is under it" is read from;
+    // free identify and drag classification depend on it)
+    if (g_tc.navigation_mode) {
+        if (g_tc.pointer_valid) dm_cursor_set_screen(g_tc.pointer_x, g_tc.pointer_y, gq_w(), gq_h());
+        else dm_cursor_clear();
+    }
     // 取证：按键组合变化打一行（无桌面截屏权限时，这是「点圆钮真的变成按键」的直接证据）| evidence: log each button-set change (the direct proof
     // that tapping a round button becomes a key press when the desktop cannot be captured)
     static uint64_t last_btn;
@@ -225,7 +279,7 @@ static void pad_step(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, 
 // the events in touch_mac.c and does the same on the controller-read tick. Here we follow the Mac host: the window thread only enqueues, and
 // the game thread (pad_step) drives the state machine and calls the host (the host reads game memory and must not be called cross-thread).
 #define DM_GQ_MAX 64
-static struct { int op, slot; float x, y; } g_gq[DM_GQ_MAX];
+static struct { int op, slot; float x, y; double t; } g_gq[DM_GQ_MAX];   // t = 事件到达时的墙钟秒（手势层按它算按住多久）| t = wall-clock seconds when the event arrived (the gesture layer times holds by it)
 static int g_gqn;
 static int g_ui_drag_on;
 static int g_claim[DM_TC_MAX_TOUCH];    // 这根手指归触屏控件（命中了圆钮 / 摇杆 / 边缘区，或面板态的界面指针）| this finger belongs to the touch controls
@@ -243,14 +297,16 @@ static float ui_y_to_screen(float uy) {
 // Gesture pump for panel state: hand the queued finger events to the gesture layer and, at release, send the requests to the host according
 // to the counters (the release block of touch_mac.c)
 static void gesture_pump(double now) {
-    const float W = g_tc.layout.width > 0 ? g_tc.layout.width : 667.0f;
-    const float H = g_tc.layout.height > 0 ? g_tc.layout.height : 375.0f;
+    (void)now;   // 每个事件带自己的到达时刻：一批里连着的按下 / 抬起也能算出真实间隔 | each event carries its own arrival time, so a press and release
+                 // queued in the same batch still get a real interval between them
+    const float W = gq_w(), H = gq_h();
     for (int i = 0; i < g_gqn; ++i) {
         int op = g_gq[i].op, slot = g_gq[i].slot;
         float x = g_gq[i].x, y = g_gq[i].y;
+        double t = g_gq[i].t;
         if (slot < 0 || slot >= DM_TC_MAX_TOUCH) continue;
         if (op == 0) {
-            dm_tc_begin_at(&g_tc, slot, x, y, now);
+            dm_tc_begin_at(&g_tc, slot, x, y, t);
             // 命中结果一出来就告诉手势层（1 物品区 / 2 页签 / 3 面板外 / 其余 = 面板内别处）
             // Tell the gesture layer the hit result as soon as it exists (1 item area / 2 tab / 3 outside the panel / anything else = elsewhere)
             if (g_tc.navigation_mode && g_tc.pointer_slot == slot) {
@@ -259,7 +315,7 @@ static void gesture_pump(double now) {
                 if (getenv("DM_TOUCH_LOG")) LOG("触屏浮层：界面手指分类 %d（%.3f,%.3f）", kind, (double)(x / W), (double)(y / H));
             }
         } else if (op == 1) {
-            dm_tc_move_at(&g_tc, slot, x, y, now);
+            dm_tc_move_at(&g_tc, slot, x, y, t);
             dm_tc_finger *f = &g_tc.finger[slot];
             if (g_tc.navigation_mode && slot == g_tc.pointer_slot && f->ui_drag) {
                 if (!g_ui_drag_on) { g_ui_drag_on = 1; dm_ui_drag_lift(DM_TC_POINTER_LIFT_PT / H);
@@ -287,7 +343,10 @@ static void gesture_pump(double now) {
                     else { if (dk == 7) { dm_shop_sell_cursor(); dk = 0; } dm_tc_pointer_release(&g_tc, dk); }   // 7 = 松在商人货架上：卖 | 7 = released on the vendor shelf: sell
                 }
             }
-            dm_tc_end_at(&g_tc, slot, now);
+            if (getenv("DM_TOUCH_LOG")) { const dm_tc_finger *fd = &g_tc.finger[slot];
+                LOG("触屏浮层：松手前 槽 %d 指针槽 %d 分类 %d 按住 %.2f 秒 拖动 %d 长按 %d 上次点间隔 %.2f", slot, g_tc.pointer_slot,
+                    g_tc.pointer_item, (double)(t - fd->start_time_s), fd->pointer_dragged, fd->pointer_long, (double)(t - g_tc.last_tap_s)); }
+            dm_tc_end_at(&g_tc, slot, t);
             if (g_tc.tab_tap_seq != tt) dm_ui_tab_go();
             if (g_tc.long_press_seq != lps) { LOG("触屏浮层：物品区长按 → 宿主界面长按"); dm_ui_long_press(); }
             if (g_tc.item_tap_seq != its) dm_ui_item_tap();
@@ -313,7 +372,7 @@ int dm_win_touch_pointer(int op, float nx, float ny, int slot) {
     // Panel state: the finger is a UI pointer, queued for the game thread (host calls may only happen there); it is not handed to the game as a
     // touch point -- panels take mouse clicks instead
     if (g_tc.navigation_mode) {
-        if (g_gqn < DM_GQ_MAX) { g_gq[g_gqn].op = op; g_gq[g_gqn].slot = slot; g_gq[g_gqn].x = x; g_gq[g_gqn].y = y; ++g_gqn; }
+        if (g_gqn < DM_GQ_MAX) { g_gq[g_gqn].op = op; g_gq[g_gqn].slot = slot; g_gq[g_gqn].x = x; g_gq[g_gqn].y = y; g_gq[g_gqn].t = now; ++g_gqn; }
         g_dirty.store(1);
         return 1;
     }
@@ -1178,7 +1237,16 @@ void dm_win_touch_start(void *game_hwnd) {
     }
     if (!g_ov) { LOG("触屏浮层：覆盖层窗口建不出来（%lu）", GetLastError()); return; }
 
-    { std::lock_guard<std::mutex> lk(g_mx); dm_tc_init(&g_tc, 667.0f, 375.0f); }
+    { std::lock_guard<std::mutex> lk(g_mx); dm_tc_init(&g_tc, 667.0f, 375.0f);
+      // 照 iOS front_ios.m:149：非物品区的点按走界面鼠标点击（暂停菜单 / 设置页 / 小站那些只认鼠标的按钮），
+      // 不开这一位的话面板里点一下会当成「按一下 A」，点击什么都不发生 | same as iOS front_ios.m:149: taps outside the item area go through
+      // UI mouse clicks (the pause menu / settings / waypoint buttons only take the mouse); without this bit a panel tap becomes "press A" and nothing responds
+      g_tc.mouse_click_mode = 1;
+      // 缺省游戏态：12 个控件全开（导航态在 pad_step 里按名单收窄）| default game state: all 12 widgets enabled (navigation narrows it in pad_step)
+      dm_tc_enable_targets(&g_tc, (1u << DM_TC_COUNT) - 1); }
+    // 面板开合消息 → 手势层导航态（同 iOS / mac 的那个订阅）| panel open / close messages -> the gesture layer's navigation state (the same subscription as iOS / Mac)
+    uimsg_subscribe(touch_uimsg_win);
+    LOG("触屏浮层：已订阅界面消息（导航态按面板名单 + 面板栈）");
     dm_pad_hook = pad_step;
     g_on = 1;
     RECT rc; GetClientRect(g_game, &rc);
