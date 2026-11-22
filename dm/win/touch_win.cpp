@@ -487,8 +487,8 @@ static void stick_thumb_draw(Graphics &g, float cx, float cy, float r, int activ
 }
 
 static void paint(void) {
-    if (!g_ov || g_vw <= 0 || g_vh <= 0) return;
-    if (surface_make(g_vw, g_vh) != 0) return;
+    if (!g_ov || g_vw <= 0 || g_vh <= 0) { static int once; if (!once++) LOG("触屏浮层：paint 跳过（窗口 %p 视图 %dx%d）", (void *)g_ov, g_vw, g_vh); return; }
+    if (surface_make(g_vw, g_vh) != 0) { static int once; if (!once++) LOG("触屏浮层：paint 跳过（surface_make 失败 %dx%d）", g_vw, g_vh); return; }
     memset(g_bits, 0, (size_t)g_vw * g_vh * 4);
     {
         // 位图直接包在 DIB 上（预乘 alpha = UpdateLayeredWindow 要的格式）| the bitmap wraps the DIB directly (premultiplied alpha is what UpdateLayeredWindow wants)
@@ -676,8 +676,17 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
 }
 
-void dm_win_touch_layout(int vx, int vy, int vw, int vh) {
-    if (!g_on) return;
+// z 序排名（0 = 最靠前）：从桌面的最上层窗口顺着 GW_HWNDNEXT 往下数。GW_HWNDPREV 只给紧邻一号，中间夹着任务栏 / IME 时看不出
+// Z-order rank (0 = frontmost): walk GW_HWNDNEXT down from the desktop's top window. GW_HWNDPREV gives only the immediate neighbour, which hides
+// the overlay's real position when the taskbar / IME sits in between
+static int z_rank(HWND h) {
+    if (!h) return -1;
+    int i = 0;
+    for (HWND w = GetTopWindow(NULL); w; w = GetWindow(w, GW_HWNDNEXT)) { if (w == h) return i; if (++i > 4000) break; }
+    return -1;
+}
+
+void dm_win_touch_layout(int vx, int vy, int vw, int vh) {    if (!g_on) return;
     g_vx = vx; g_vy = vy; g_vw = vw; g_vh = vh;
     { std::lock_guard<std::mutex> lk(g_mx); layout_make(); }
     g_dirty.store(1);
@@ -702,6 +711,7 @@ void dm_win_touch_tick(void) {
     // 布局切换事务进行中也收起：整块界面正在重建成另一版，浮层压在上面会盖住重建中的界面（iOS 的 front_ios.m:497 每帧把 dm_padmode_busy() 也算进 hide）
     // Also hidden while a layout switch transaction runs: the whole UI is being rebuilt into the other version, and an overlay on top would cover the
     // half-built screens (iOS front_ios.m:497 folds dm_padmode_busy() into hide every frame)
+    static int revealed;   // 这一次露出做过「抬到最前」了没有（隐藏时清零）| whether this reveal already did the raise (cleared on hide)
     {
         int run = g_in_run.load(), pad = g_pad_in.load(), busy = dm_padmode_busy() ? 1 : 0;
         int want = (run && !pad && !busy) ? 1 : 0;
@@ -710,14 +720,46 @@ void dm_win_touch_tick(void) {
         // immediately which condition did not hold
         static int want_prev = -1;
         if (want != want_prev) { want_prev = want; LOG("触屏浮层：%s（运行 %d 手柄接管 %d 切换中 %d）", want ? "露出" : "收起", run, pad, busy); }
-        if (!want) { if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE); return; }
+        if (!want) { if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE); revealed = 0; return; }
     }
     if (!IsWindowVisible(g_ov)) {
         ShowWindow(g_ov, SW_SHOWNA);
-        // 两个都是 topmost：把浮层插到游戏窗口后面一号（即紧贴其上），免得别的 topmost 窗口夹在中间
-        // Both are topmost: insert the overlay right behind the game window (i.e. immediately above it) so no other topmost window sits between
-        SetWindowPos(g_ov, g_game, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         g_dirty.store(1);
+    }
+    // 露出之后必须确认它真的压在游戏窗口上面。`SetWindowPos(g_ov, g_game, …)` 那个写法是把浮层插到 g_game **下面**（z 序里 after = below），
+    // 于是「贴图成功、可见=1、桌面上什么都没有」；而改变窗口大小 / 最小化再恢复会让系统把 owned 窗口重新抬到 owner 上面，所以那两下能把它弄出来。
+    // 现在露出时用 HWND_TOPMOST 把它放到 topmost 带的最顶，并用 z 序排名核对（GW_HWNDPREV 只给紧邻上一号，中间夹着任务栏 / IME 就看不出来）。
+    // After revealing, make sure it really sits above the game window. `SetWindowPos(g_ov, g_game, ...)` inserts the overlay *below* g_game
+    // (after = below in z-order), which gives "blit succeeded, visible=1, nothing on screen"; resizing or minimizing/restoring makes the system
+    // raise the owned window above its owner, which is why those two gestures brought it back. HWND_TOPMOST puts it at the top of the topmost band
+    // instead, and the z-order rank is checked (GW_HWNDPREV only gives the immediate neighbour, and the taskbar / IME can sit in between).
+    {
+        int vis = IsWindowVisible(g_ov) ? 1 : 0;
+        // 只有当游戏窗口在前台时才把浮层抬到最顶：不然玩家切到别的程序，浮层会压在别人上面
+        // Only raise the overlay while the game window is in the foreground: otherwise it would sit on top of whatever app the player switched to
+        HWND fg = GetForegroundWindow();
+        int front = fg && (fg == g_game || IsChild(g_game, fg));
+        if (vis && !revealed) {
+            revealed = 1;
+            if (front) SetWindowPos(g_ov, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            RECT rr; GetWindowRect(g_ov, &rr);
+            LOG("触屏浮层：露出 可见=%d 矩形=%ld,%ld %ldx%ld 视图=%d,%d %dx%d z序 浮层=%d 游戏=%d（小 = 更靠前）", vis,
+                (long)rr.left, (long)rr.top, (long)(rr.right - rr.left), (long)(rr.bottom - rr.top), g_vx, g_vy, g_vw, g_vh,
+                z_rank(g_ov), z_rank(g_game));
+        } else if (vis && front) {
+            // 露着的时候每 8 拍核一次 z 序：点游戏窗口 / 切回前台都会把游戏窗口抬上来，浮层就被压回它下面（视觉上「浮层没了」）
+            // Every 8 ticks while visible, check the z order: clicking into the game or switching back to it raises the game window, which drops
+            // the overlay behind it (visually "the overlay is gone")
+            static int beat;
+            if (++beat >= 8) {
+                beat = 0;
+                int a = z_rank(g_ov), b = z_rank(g_game);
+                if (a < 0 || (b >= 0 && a > b)) {
+                    SetWindowPos(g_ov, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                    LOG("触屏浮层：掉到游戏窗口后面，重新抬起（浮层 %d 游戏 %d）", a, b);
+                }
+            }
+        }
     }
     // 摇杆头没动、状态没变就不重画（拖动时每帧一张全屏位图太贵）| skip repainting when neither the thumb nor anything else moved
     float tx, ty;
