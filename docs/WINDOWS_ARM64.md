@@ -100,9 +100,31 @@ The output is `build\win\overlay`, and `start-win-arm64.bat` wires it into `DM_R
 A few notes:
 - The script needs python (with PIL / numpy / scipy) and clang (without a system clang, point `-ToolchainBin` at llvm-mingw's `bin`).
 - It compiles a texture conversion library that has to match the architecture of the python running it (x64 python -> x86_64 build, ARM64 python -> aarch64 build); a mismatch shows up as `WinError 193`, and the script picks by python's architecture itself.
-- The overlay carries two layout sets: the touch version (its front-end button ribbon is drawn by the host) and the original controller version. Windows has no such drawing layer, so it runs in the desktop form (`DM_APP=1`, booting straight into the original controller layouts) — otherwise the main menu is bare background and the keyboard's A does nothing.
+- The overlay carries two layout sets: the touch version (its front-end button ribbon is drawn by the host) and the original controller version. Windows now brings that host-drawn layer along itself; see the next section.
 
-The easy way is to double-click `start-win-arm64.bat` at the checkout root: it sets all of the above (RomFS defaults to `..\Diablo\RomFS`), creates `save` / `temp`, and closes an older instance first. `--rebuild` rebuilds, `--res 1280x720` changes the render resolution.
+### The touch control overlay (drawn by the Windows host)
+
+The virtual stick, the skill buttons, the skill-set switch, town portal and map are not drawn by the game: on Android / iOS the host lays a separate layer over the picture. On Windows that layer is `dm/win/touch_win.cpp`: it runs the **same** touch state machine as the mobile ports (`dm/ios/Sources/dm_touch_controls.c`), feeds the mouse in as a finger, publishes the result as buttons / stick through the same `dm_pad_hook` the controller uses, and paints the result onto a layered window with GDI+.
+
+- Geometry is in the same point space as iOS / Android (points on the 667×375 landscape base, scaled by screen height), so all three look like the same layout.
+- The look follows iOS's vector recipe (`dm/ios/Sources/DmTouchControlArt.h`): iron-rimmed sockets with a charcoal well, an extra ring on the primary button, a silver lift while held, a feathered stick base with four directional etchings, and a matte thumb with a curved highlight. The machine has neither the `sil_*` silver cut-outs nor the skill-atlas slices, so skill buttons carry key letters, the same fallback iOS uses.
+- Input never goes through the overlay: it is `WS_EX_TRANSPARENT` and every mouse event lands on the game window (`wnd_proc` → `dm_win_touch_pointer`), so a transparent area stays clickable.
+- The six bottom-bar cells (difficulty number, four belt columns, the function entry), the life / mana numbers and the experience bar are drawn by bottom-bar HUD v4 itself; the overlay keeps only their hit areas, exactly as on iOS.
+
+Switches:
+
+| Variable | Effect |
+|---|---|
+| default | entering a run (`dm_hud` has a character) switches to the touch layout and shows the overlay; leaving a run switches back |
+| `DM_WIN_TOUCH=1` | master switch (also stops `dm_padmode.c` from locking the controller layout) |
+| `DM_WIN_TOUCH_ALWAYS=1` | use the touch layout on the front-end pages too (their button ribbon is not drawn yet, so the menu comes up bare; debugging only) |
+| `DM_WIN_TOUCH_DUMP=<path with %d>` | save the overlay's own bitmap as a 32-bit BMP on every repaint (first one, then every 5th) for review |
+
+Screen capture on this machine comes back black (`CopyFromScreen` and `PrintWindow` alike) and the `DM_WIN_SHOT` readback never contains a layered window, so **`DM_WIN_TOUCH_DUMP` is the only way to see the overlay**. Two gotchas when reading that BMP: its rows are bottom-up, and Pillow drops the alpha of a 32-bit BMP — read the raw BGRA and flip the rows to see the transparent background.
+
+Whether a tap really becomes a key press shows up in the log as `触屏浮层：按键 0 → 0x1` — that is the button set the state machine published (`0x1` = A).
+
+The easy way is to double-click `start-win-arm64.bat` at the checkout root: it sets all of the above (including `DM_WIN_TOUCH=1`; set it to `0` beforehand to play without the overlay), creates `save` / `temp`, and closes an older instance first. `--rebuild` rebuilds, `--res 1280x720` changes the render resolution.
 
 The **title bar** shows the current render resolution and the live frame rate (`1600x900 · 52 fps`, refreshed once a second, counted from the frames the presentation layer actually put on screen).
 

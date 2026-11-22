@@ -96,6 +96,17 @@ The UI overlay (`gen_overlay_win.ps1` output) carries two layout sets: in the to
 **7. Do not use `PrintWindow` for screenshots; use `DM_WIN_SHOT`.**
 For a window presenting from a Vulkan swapchain, `PrintWindow` + `PW_RENDERFULLCONTENT` does not capture the complete picture: in game it grabs a zoomed-in world view with the whole bottom HUD missing (which briefly looked like the HUD was not drawn at all, while the `DM_WIN_SHOT` readback showed it fine). The front end (main menu / character select) is accurate though.
 
+**8. Nothing can capture the touch overlay (a layered window), so it saves its own bitmap.**
+The overlay is its own `WS_EX_LAYERED` window: `DM_WIN_SHOT` reads back the Vulkan picture only, `PrintWindow` misses it, and even `CopyFromScreen` comes back pure black on this machine (a 2048x1152 `VirtualScreen` grab is all zeros). `touch_win.cpp` therefore has `DM_WIN_TOUCH_DUMP=<path with %d>`: every repaint writes its own 32-bit BMP (the first one, then every 5th). Two things to know when looking at that bitmap:
+- BMP rows are **bottom-up** (`biHeight` is positive), so a naive composite shows the whole overlay upside down — flip the rows first.
+- Pillow **drops the alpha channel** when reading a 32-bit BI_RGB BMP (everything reads 255). Read the raw BGRA instead: `np.frombuffer(d, dtype=np.uint8, offset=54).reshape(-1,4)`, which is how the alpha 0 background and the 0-235 range on the buttons becomes visible.
+
+**9. `gdiplus.h` is missing `PROPID` in C++, and has no `ColorBlend`.**
+mingw's `gdiplus/gdiplusimaging.h` uses `PROPID` without pulling in `ole2.h`, so `#include <ole2.h>` has to come between `windows.h` and `gdiplus.h` (otherwise ~20 `unknown type name 'PROPID'` errors). These headers also have no `ColorBlend`, so multi-stop gradients are interpolated row by row (`grad_v()` in `touch_win.cpp`); and `Pen::SetLineCap` takes three arguments here (start / end / dash cap).
+
+**10. A relink that fails with `Permission denied` means the old `dmhost.exe` is still running.**
+`ld.lld: error: failed to write output 'dmhost.exe': Permission denied` is not a permission problem: the previous process has not exited yet. Stop it first (`Get-Process dmhost | Stop-Process -Force`), give it 2-3 s to release the image, then run ninja.
+
 ## Diagnostics
 
 - For crashes, look at the `FAULT` line from `dm/host/crash.c` (`pcmod=` names the guest module); the VEH stage markers are only printed with `DM_VEH_LOG=1` / `DM_VEH_TRACE=1` — otherwise hundreds of page faults a frame would flood stderr.

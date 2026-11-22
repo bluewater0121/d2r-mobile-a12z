@@ -15,6 +15,7 @@
 #include "../host/dm_uiscreen.h"
 #include "vulkan_present_win.h"
 #include "sched_win.h"
+#include "touch_win.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -93,6 +94,7 @@ static void mouse_to_pic(int cx, int cy, float *nx, float *ny) {
     float x = vr[2] > 0 ? (float)(cx - vr[0]) / (float)vr[2] : 0.0f;
     float y = vr[3] > 0 ? (float)(cy - vr[1]) / (float)vr[3] : 0.0f;
     if (x < 0) x = 0; if (x > 0.999f) x = 0.999f; if (y < 0) y = 0; if (y > 0.999f) y = 0.999f;
+    (void)cx; (void)cy;
     *nx = x; *ny = y;
 }
 static void set_finger(int down) {
@@ -141,7 +143,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         // GetClientRect 的第二个参数不能是 NULL（USER32 会直接解引用）；客户端尺寸由呈现层自己取
         // The second argument of GetClientRect must not be NULL (USER32 dereferences it); the presentation layer reads the client size itself
-        if (wp != SIZE_MINIMIZED) { RECT rc; GetClientRect(h, &rc); dm_win_vk_notify_resize(); }
+        if (wp != SIZE_MINIMIZED) { RECT rc; GetClientRect(h, &rc); dm_win_vk_notify_resize();
+            { int vr[4]; view_rect(rc.right, rc.bottom, vr); dm_win_touch_layout(vr[0], vr[1], vr[2], vr[3]); } }
         return 0;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -153,15 +156,27 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         int cx = (int)(short)LOWORD(lp), cy = (int)(short)HIWORD(lp);
         mouse_to_pic(cx, cy, &g_mouse_x, &g_mouse_y);
+        // 触屏浮层开着（DM_WIN_TOUCH=1 且局内）：鼠标当一根手指喂给共用的触屏状态机 | overlay on (DM_WIN_TOUCH=1, in a run): the mouse is one finger for the shared touch state machine
+        if (dm_win_touch_enabled()) { if (g_mouse_down) dm_win_touch_pointer(1, g_mouse_x, g_mouse_y, 0); return 0; }
         if (g_mouse_down) set_finger(1);   // 拖动 = 手指移动 | drag = finger move
         return 0; }
     case WM_LBUTTONDOWN:
+        if (dm_win_touch_enabled()) {
+            SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y);
+            g_mouse_down = 1; dm_win_touch_pointer(0, g_mouse_x, g_mouse_y, 0); return 0;
+        }
         SetCapture(h); mouse_to_pic((int)(short)LOWORD(lp), (int)(short)HIWORD(lp), &g_mouse_x, &g_mouse_y); set_finger(1); return 0;
     case WM_LBUTTONUP:
+        if (dm_win_touch_enabled()) { ReleaseCapture(); g_mouse_down = 0; dm_win_touch_pointer(2, g_mouse_x, g_mouse_y, 0); return 0; }
         ReleaseCapture(); set_finger(0); return 0;
-    case WM_RBUTTONDOWN: g_btn |= DM_BTN_B; push_input(); return 0;
-    case WM_RBUTTONUP: g_btn &= ~(uint64_t)DM_BTN_B; push_input(); return 0;
+    case WM_RBUTTONDOWN:
+        if (dm_win_touch_enabled()) return 0;   // 触屏模式没有右键（B 在圆钮上）| no right button in touch mode (B lives on a round button)
+        g_btn |= DM_BTN_B; push_input(); return 0;
+    case WM_RBUTTONUP:
+        if (dm_win_touch_enabled()) return 0;
+        g_btn &= ~(uint64_t)DM_BTN_B; push_input(); return 0;
     case WM_MOUSEWHEEL: {
+        if (dm_win_touch_enabled()) return 0;
         int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1;
         g_stick_rx = d * 32767; push_input();
         SetTimer(h, 1, 80, NULL);   // 80 ms 后回中（松开摇杆） | recenter after 80 ms (release the stick)
@@ -169,11 +184,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1) { KillTimer(h, 1); g_stick_rx = 0; push_input(); }
         else if (wp == 2) update_title();
+        else if (wp == 3) dm_win_touch_tick();   // 触屏浮层：30 ms 一拍，按需重画 / 进局切布局 | overlay: 30 ms tick, repaint on demand, switch layout on entering a run
+        return 0;
+    case WM_MOVE:
+        // 浮层是独立的窗口，跟着游戏窗口走 | the overlay is a separate window; keep it on top of the game window
+        { RECT rc; GetClientRect(h, &rc); int vr[4]; view_rect(rc.right, rc.bottom, vr); dm_win_touch_layout(vr[0], vr[1], vr[2], vr[3]); }
         return 0;
     case WM_SETFOCUS: return 0;
     case WM_KILLFOCUS:
         // 失焦时全抬起，避免「按住状态」卡在游戏里 | Release everything on focus loss so a held state does not stick in the game
         g_kw = g_ka = g_ks = g_kd = 0; g_btn = 0; g_stick_rx = 0; push_input(); if (g_mouse_down) set_finger(0);
+        dm_win_touch_cancel();   // 触屏浮层：手指全部抬起 | overlay: lift every finger
+        g_mouse_down = 0;
         return 0;
     }
     return DefWindowProcA(h, msg, wp, lp);
@@ -371,10 +393,14 @@ static void tuning_defaults(void) {
     // boot stays on the main menu, A = Enter Game -> character select page, and A on the character select page = start the game
     env_default("DM_FE_AUTO", "0");
     // 桌面形态：布局按 Mac App 那套走原版手柄版（DM_APP），不切触屏版。触屏版有整套宿主自画的圆钮 / 底栏 / 按钮栏，Windows 没有那一层绘制；
-    // 界面覆盖层里触屏版布局把这些控件整排挪到屏幕外，一旦切过去主菜单就只剩背景、键盘按 A 不响应（实测）
+    // 界面覆盖层里触屏版布局把这些控件整排挪到屏幕外，一旦切过去主菜单就只剩背景、键盘按 A 不响应（实测）。
+    // 触屏浮层（DM_WIN_TOUCH=1）仍保持 DM_APP：开机要用手柄版才走得了主菜单 / 选角页，局内再由 front 请求切到触屏版（dm_padmode.c 的 g_lock 在
+    // DM_WIN_TOUCH 下不锁）
     // Desktop form: use the original controller layouts the way the Mac App does (DM_APP) and never switch to the touch layouts. The touch version has a whole host-drawn
     // layer of round buttons / bottom bar / button ribbon that Windows does not draw, and the UI overlay's touch layouts move those widgets off screen as a block: switching
-    // there leaves the main menu as bare background and the keyboard's A does nothing (measured)
+    // there leaves the main menu as bare background and the keyboard's A does nothing (measured).
+    // The touch overlay (DM_WIN_TOUCH=1) still keeps DM_APP: boot needs the controller layout to walk the main menu / character select, and the front end asks for the
+    // touch layout once in a run (dm_padmode.c's g_lock is not taken under DM_WIN_TOUCH)
     env_default("DM_APP", "1");
 }
 
@@ -439,6 +465,7 @@ void front_run(void (*guest)(void)) {
     } else LOG("呈现：Vulkan 已就绪（%s）", dm_win_vk_device_name());
     g_guest = guest;
     dm_win_pad_start();
+    dm_win_touch_start(g_hwnd);   // DM_WIN_TOUCH=1 才真的接（自己看环境变量）| only connects when DM_WIN_TOUCH=1 (it checks the variable itself)
     // 排障：把映像基址打出来，崩溃日志里的绝对 pc 才能换算成 dmhost.exe 内的偏移（llvm-nm 对照）
     // Diagnostics: print the image base so absolute pcs in crash logs can be turned into offsets inside dmhost.exe (compare with llvm-nm)
     { extern IMAGE_DOS_HEADER __ImageBase; LOG("映像基址 %#llx", (unsigned long long)(uintptr_t)&__ImageBase); }

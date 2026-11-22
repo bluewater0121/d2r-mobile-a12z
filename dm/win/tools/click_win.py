@@ -1,6 +1,10 @@
 # 给 dmhost 窗口投鼠标点击（PostMessage，不需要前台焦点）：front_win 把左键当手指按在窗口客户区坐标上。
 # Send a mouse click to the dmhost window (PostMessage, no foreground focus needed): front_win treats the left button as a finger at the client coordinate.
-# 用法 | usage: python click_win.py <x> <y> [--hold 毫秒] [--right]
+# 坐标按窗口客户区像素给；在非 100% 缩放的屏幕上 PostMessage 的坐标会被系统按 DPI 再乘一次（120 dpi = ×1.25），
+# 所以这里先按 GetDpiForWindow 除回去，传 --raw 就原样投。
+# Coordinates are client pixels; on a display that is not at 100% scaling, PostMessage coordinates get scaled by the DPI a second time
+# (120 dpi = x1.25), so they are divided back by GetDpiForWindow here; pass --raw to post them unchanged.
+# 用法 | usage: python click_win.py <x> <y> [--hold 毫秒] [--right] [--raw]
 import ctypes, sys, time
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -30,6 +34,15 @@ def main():
     if not h:
         print("没找到 dmhost 窗口 | dmhost window not found")
         return 2
+    if "--raw" not in sys.argv:
+        try:
+            u32.GetDpiForWindow.restype = ctypes.c_uint
+            dpi = u32.GetDpiForWindow(h) or 96
+        except AttributeError:
+            dpi = 96
+        if dpi != 96:
+            x, y = int(round(x * 96.0 / dpi)), int(round(y * 96.0 / dpi))
+            print("DPI %d：实际投 (%d,%d)" % (dpi, x, y))
     lp = (y << 16) | (x & 0xFFFF)
     flag = MK_RBUTTON if right else MK_LBUTTON
     down = WM_RBUTTONDOWN if right else WM_LBUTTONDOWN

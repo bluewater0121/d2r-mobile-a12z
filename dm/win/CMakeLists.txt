@@ -90,6 +90,8 @@ set(WIN_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/pad_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/stall_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/sched_win.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/touch_win.cpp
+  ${DM}/ios/Sources/dm_touch_controls.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_win.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/tls_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/misc_win.c
@@ -120,7 +122,7 @@ target_link_libraries(dmhost PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-a
 # -static：把 libc++ / libunwind / libwinpthread 都静态链进去，dmhost.exe 单文件就能跑（双击启动的 bat 里没有工具链的 bin 目录，缺 dll 会以 0xC0000135 秒退）
 # -static: link libc++ / libunwind / libwinpthread statically so dmhost.exe runs on its own (the double-clickable bat has no toolchain bin directory on PATH; a missing dll made it exit at once with 0xC0000135)
 target_link_options(dmhost PRIVATE -static -Wl,--export-all-symbols -Wl,--enable-auto-import)
-target_link_libraries(dmhost PRIVATE ${DM_VULKAN_DLL})
+target_link_libraries(dmhost PRIVATE ${DM_VULKAN_DLL} gdiplus)
 set_target_properties(dmhost PROPERTIES OUTPUT_NAME dmhost)
 # 运行期 DLL 摆在 exe 旁边：llvm-mingw 的 -static 吃掉了 libc++ / libunwind，但 libwinpthread-1.dll 仍是导入项，
 # 而双击启动的 bat 里没有工具链的 bin 目录（缺 dll 时进程以 0xC0000135 秒退、日志里一个字都没有）

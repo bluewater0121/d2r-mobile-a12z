@@ -159,6 +159,10 @@ void dm_padmode_boot(void) {   // 开机：游戏建面板之前（main.c，nnMa
     if (!m || !getenv("DM_ROMFS_OVERLAY")) return;
     if (!dm_overlay_file("ctrl_touch", mk, sizeof mk)) { LOG("手柄 / 触屏布局：覆盖层没有 ctrl_touch 标记，照原版布局"); return; }
     int pad = getenv("DM_APP") != NULL;   // Mac App：没有触屏圆钮与底栏的绘制层，开机就用原版手柄版（我们的功能页在手柄版布局里同样有），之后也不切 | Mac App: there is no drawing layer for the touch buttons and bottom bar, so it starts in the original gamepad UI (our feature pages exist in the gamepad layout as well) and never switches afterwards
+    // Windows 的触屏浮层（DM_WIN_TOUCH=1，dm/win/touch_win.cpp）：开机仍走手柄版（前端页面要它），但局内由前端请求切到触屏版，所以布局不锁
+    // Windows touch overlay (DM_WIN_TOUCH=1, dm/win/touch_win.cpp): boot still uses the controller layout (the front-end pages need it), but the
+    // front end asks for the touch layout once in a run, so the layout is not locked
+    int lock = pad && !(getenv("DM_WIN_TOUCH") && strcmp(getenv("DM_WIN_TOUCH"), "1") == 0);
 #if TARGET_OS_OSX
     g_app = pad;
 #endif
@@ -167,7 +171,7 @@ void dm_padmode_boot(void) {   // 开机：游戏建面板之前（main.c，nnMa
     g_glyph = g_glyph_next = g_glyph_have[DM_GLYPH_KBD] ? DM_GLYPH_KBD : DM_GLYPH_PAD; atomic_store(&g_glyph_want, g_glyph);   // Mac App 开机先用键盘键帽（多数人没接手柄）；实体手柄一有输入就按它的类型换 | The Mac App starts with keyboard glyphs (most people have no controller connected); as soon as a physical controller gives input, switch by its type
     g_glyph_have[DM_GLYPH_PS] = dm_overlay_file(k_glyph_mark[DM_GLYPH_PS], mk, sizeof mk);
     LOG("手柄 / 触屏布局：键帽 键盘 %d、Xbox %d、PlayStation %d", g_glyph_have[DM_GLYPH_KBD], g_glyph_have[DM_GLYPH_XBOX], g_glyph_have[DM_GLYPH_PS]);
-    if (pfx_write((uint8_t *)m->base, pad)) { g_have = 1; g_cur = pad; g_lock = pad; atomic_store(&g_want, pad); g_b = (uint8_t *)m->base; str_load(); LOG("手柄 / 触屏布局：开机用%s", pad ? "原版手柄版（Mac App）" : "触屏版（layouts/xtouch_lay 等三个目录）"); }
+    if (pfx_write((uint8_t *)m->base, pad)) { g_have = 1; g_cur = pad; g_lock = lock; atomic_store(&g_want, pad); g_b = (uint8_t *)m->base; str_load(); LOG("手柄 / 触屏布局：开机用%s", pad ? "原版手柄版（Mac App）" : "触屏版（layouts/xtouch_lay 等三个目录）"); }
 }
 void dm_padmode_request(int pad) { pad = pad ? 1 : 0;
 #if TARGET_OS_OSX

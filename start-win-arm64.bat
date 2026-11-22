@@ -75,6 +75,10 @@ if not defined DM_TACT_PREFETCH set "DM_TACT_PREFETCH=0"
 rem UI overlay (bottom HUD v4, panel changes, keyboard key caps). Generate it once with
 rem dm\win\tools\gen_overlay_win.ps1; without it the game runs with the original UI.
 if not defined DM_ROMFS_OVERLAY if exist "%ROOT%\build\win\overlay" set "DM_ROMFS_OVERLAY=%ROOT%\build\win\overlay"
+rem Touch overlay: the virtual stick, the twelve round buttons, the skill-set switch, town portal and map are drawn by the host
+rem (dm\win\touch_win.cpp) and appear once you are in a run; it also keeps dm_padmode from locking the handheld layout.
+rem Set DM_WIN_TOUCH=0 before running this script to play without it.
+if not defined DM_WIN_TOUCH set "DM_WIN_TOUCH=1"
 if defined RES set "DM_GAME_RES=%RES%"
 
 rem one instance only: the save dir has a transaction log, two processes would fight over it.

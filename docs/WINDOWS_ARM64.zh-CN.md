@@ -100,7 +100,36 @@ powershell -ExecutionPolicy Bypass dm\win\tools\gen_overlay_win.ps1 -RomFS C:\wo
 几点：
 - 脚本要 python（带 PIL / numpy / scipy）与 clang（没有系统 clang 就用 `-ToolchainBin` 指 llvm-mingw 的 `bin`）。
 - 生成时会编一个贴图转换库，必须与跑脚本的 python 同架构（x64 python 编 x86_64 版、ARM64 python 编 aarch64 版），架构不对会报 `WinError 193`，脚本自己会按 python 的架构选。
-- 覆盖层里有两套布局：触屏版（前端按钮栏交给宿主画）和原版手柄版。Windows 没有触屏那层绘制，所以走桌面形态（`DM_APP=1`，开机就锁在原版手柄版布局）——否则主菜单只剩背景、键盘按 A 不起作用。
+- 覆盖层里有两套布局：触屏版（前端按钮栏交给宿主画）和原版手柄版。Windows 现在自带那层「宿主自绘」，见下一节。
+
+### 触屏操控浮层（Windows 自绘）
+
+安卓 / iOS 的虚拟摇杆、技能圆钮、换组、回城、地图这些**不是游戏画的**，是宿主在游戏画面上面另铺一层。Windows 这一层是 `dm/win/touch_win.cpp`：拿**同一份**触屏状态机（`dm/ios/Sources/dm_touch_controls.c`，和安卓 / iOS 逐字相同）算手指、按钮、摇杆和布局，再用 GDI+ 画到一个分层窗口上。
+
+- 位置与尺寸跟 iOS / 安卓一个坐标系（点 = iPhone 横屏 667×375 基准，按屏高换算），所以三家看起来是同一套位置。
+- 外观走 iOS 的矢量配方（`dm/ios/Sources/DmTouchControlArt.h`）：铁边圆钮 + 暗灰内槽、主钮多一道环、按住提亮、底盘渐隐 + 四段方向刻纹、摇杆头弧形高光。本机没有 `sil_*` 银色剪影与技能图集切片，技能钮按 iOS 的兜底画键位字母。
+- 输入不走浮层：浮层是 `WS_EX_TRANSPARENT`，鼠标事件都落在游戏窗口上（`wnd_proc` → `dm_win_touch_pointer`），再由状态机发布成按键 / 摇杆，走的是和手柄同一条 `dm_pad_hook`。
+- 底栏六格（难度数字、四列腰带、功能入口）、生命法力数字、经验条是底栏 HUD v4 自己画的，浮层只保留命中区（和 iOS 一致）。
+
+开关：
+
+| 变量 | 作用 |
+|---|---|
+| 缺省 | 进局（`dm_hud` 有角色）自动切触屏布局并显示浮层，出局切回手柄布局并隐藏 |
+| `DM_WIN_TOUCH=1` | 总开关（`dm_padmode.c` 在它面前不锁手柄版布局） |
+| `DM_WIN_TOUCH_ALWAYS=1` | 前端页面也用触屏布局（前端按钮栏还没画，会看到空菜单，仅供调试） |
+| `DM_WIN_TOUCH_DUMP=<路径带 %d>` | 每次重画把浮层自己的位图存成 32 位 BMP（第 1 次 + 每 5 次），用来验收 |
+
+本机桌面截屏是全黑的（`CopyFromScreen` 与 `PrintWindow` 都拿不到画面），`DM_WIN_SHOT` 走 Vulkan 读回又不含分层窗口，所以**浮层的唯一取证手段是 `DM_WIN_TOUCH_DUMP`**。看位图时注意两点：BMP 是自下而上的，PIL 读 32 位 BMP 会丢掉 alpha——按原始 BGRA 读、再翻一次行，合成到深色底就能看到透明区。
+
+键位点一下到底有没有送进游戏，看日志里的 `触屏浮层：按键 0 → 0x1`：这就是状态机发布出去的按键组合（`0x1` = A）。
+
+```
+cd build\win
+set DM_WIN_TOUCH=1
+set DM_WIN_TOUCH_DUMP=C:\work\prj\d2r-mobile\build\win\ov%d.bmp
+obj\dmhost.exe dmdata main sdk subsdk0
+```
 
 省事的办法是双击工程根目录的 `start-win-arm64.bat`：它把上面这些环境变量都设好（RomFS 缺省取 `..\Diablo\RomFS`），顺手建好 `save` / `temp`，并在启动前关掉旧实例。`--rebuild` 先重编译，`--res 1280x720` 换渲染分辨率。
 

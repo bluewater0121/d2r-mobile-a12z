@@ -13,6 +13,7 @@ English: [README.md](README.md)
 | `front_win.c` | 窗口、键盘鼠标注入、`swkbd` 宿主输入框。客户区缺省 1600x900，`DM_WIN_SIZE` 可改；画面按游戏比例居中留边 |
 | `pad_win.c` | 实体手柄：XInput 轮询线程 → 宿主 `dm_pad_set`，判据与 iOS `dm_gamepad.m` / 安卓 `PadInput.java` 一致（见下「手柄」） |
 | `vulkan_present_win.cpp` | 交换链（1600x900、3 张、格式 0x25、`imageUsage` 只有 `TRANSFER_DST`）、blit 上屏、`DM_WIN_SHOT` 读回 |
+| `touch_win.cpp` / `touch_win.h` | 触屏操控浮层：编进与安卓 / iOS 同一份 `dm/ios/Sources/dm_touch_controls.c` 状态机，鼠标当手指喂入，发布成按键 / 摇杆走 `dm_pad_hook`，并用 GDI+ 画到分层窗口（外观照 `DmTouchControlArt.h` 的矢量配方）。进局自动切触屏布局、出局切回手柄布局 |
 | `compat/` | Windows 兼容层：PE 段表、自写 `setjmp`/`longjmp`、二进制读 `open`、arena 用的 `aligned_alloc`/`dm_free`、栈预提交、VEH 崩溃处理 |
 | `tools/` | 平台工具，见下 |
 | `scratch/` | 排障用的小探针（不参与构建） |
@@ -32,7 +33,7 @@ ninja -C build/win/obj
 | 工具 | 用法 |
 |---|---|
 | `tools/keys_win.py` | `python keys_win.py "j u enter" --delay 400`：`PostMessage` 往 `dmhost_win` 窗口投键盘，不需要前台焦点。`"w:1200"` 表示按住 1200 ms（走路用）。**默认按下与松开之间留 140 ms**：客体每帧只采样一次按键状态，同帧按下又松开会被当成没按 |
-| `tools/click_win.py` | `python click_win.py <x> <y> [--hold 毫秒] [--right]`：往窗口客户区投鼠标，前进端会把左键当手指按在画面上（触屏 UI 只能这样点）。坐标是**窗口客户区像素**，不是游戏渲染分辨率 |
+| `tools/click_win.py` | `python click_win.py <x> <y> [--hold 毫秒] [--right] [--raw]`：往窗口客户区投鼠标，前进端会把左键当手指按在画面上（触屏 UI 只能这样点）。坐标是**窗口客户区像素**，不是游戏渲染分辨率。**125% 缩放的屏幕上 `PostMessage` 的坐标会被系统再乘一次 1.25**，脚本按 `GetDpiForWindow` 先除回去（`--raw` 不除） |
 | `tools/dbg_win.py` | `python dbg_win.py <exe> <args…>`：起进程并挂调试器，能读线程上下文、TEB 栈区间、虚拟内存查询。必须和 `$env:DM_*` 写在同一条命令里，且 `cwd=build\win` |
 | `tools/extract_casc.py` | `python extract_casc.py <RomFS> <输出目录>`：从静态 CASC 取出着色器包 |
 | `tools/asm_coff.py` | 把 Mach-O 写法的 `.S` 转成 COFF（构建时自动调用） |
@@ -95,6 +96,17 @@ XInput 一律按键帽位置报告（下 = A、右 = B、左 = X、上 = Y），
 
 **7. 截图取证别用 `PrintWindow`，用 `DM_WIN_SHOT`。**
 Vulkan 交换链上屏的窗口，`PrintWindow` + `PW_RENDERFULLCONTENT` 抓到的不是完整画面：局内会抓成放大的世界画面、把底栏 HUD 整条漏掉（一度以为 HUD 没出来，`DM_WIN_SHOT` 的读回里 HUD 好好的）。前端（主菜单 / 选角页）反而是准的。
+
+**8. 触屏操控浮层（分层窗口）谁都拍不到，只能让它自己存位图。**
+浮层是 `WS_EX_LAYERED` 的独立窗口，`DM_WIN_SHOT` 走 Vulkan 读回只含游戏自己的画面；`PrintWindow` 拿不到；本机连 `CopyFromScreen` 都是纯黑（`VirtualScreen 2048x1152` 抓出来全 0）。所以 `touch_win.cpp` 加了 `DM_WIN_TOUCH_DUMP=<路径带 %d>`：每次重画把自绘位图存一份 32 位 BMP（第 1 次 + 每 5 次）。看这份位图有两点要注意：
+- BMP 行序是**自下而上**（`bitmap.bmp` 里 `biHeight` 为正），直接合成会看到整个浮层上下颠倒——按行翻一次再看。
+- Pillow 读 32 位 BI_RGB BMP **会丢掉 alpha**（全读成 255）。按原始 BGRA 读：`np.frombuffer(d, dtype=np.uint8, offset=54).reshape(-1,4)`，才能看出背景 alpha=0、圆钮 alpha 0~235 的那几档。
+
+**9. `gdiplus.h` 在 C++ 里缺 `PROPID`；`ColorBlend` 也没有。**
+mingw 的 `gdiplus/gdiplusimaging.h` 用了 `PROPID` 却没带 `ole2.h`，所以 `#include <windows.h>` 之后要先 `#include <ole2.h>` 再 `#include <gdiplus.h>`（否则二十来处 `unknown type name 'PROPID'`）。另外这套头里**没有** `ColorBlend`，多色标渐变只能逐行插值填（`touch_win.cpp` 的 `grad_v()`）；`Pen::SetLineCap` 在这版头里要三个参数（起 / 止 / 虚线帽）。
+
+**10. 重链接 `Permission denied` = 旧 `dmhost.exe` 还在跑。**
+`ld.lld: error: failed to write output 'dmhost.exe': Permission denied` 不是权限问题，是上一次的进程没退。先 `Get-Process dmhost | Stop-Process -Force`（等 2~3 s 释放映像）再 ninja。
 
 ## 排障
 
