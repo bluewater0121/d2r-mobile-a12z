@@ -116,6 +116,18 @@ add_executable(dmhost ${HOST}/main.c)
 target_link_libraries(dmhost PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-archive)
 # 导出符号：崩溃回溯里 dladdr 能认出宿主函数（mingw 的 dladdr 走 PE 导出表）
 # Export symbols so dladdr in crash backtraces can name host functions (mingw's dladdr uses the PE export table)
-target_link_options(dmhost PRIVATE -Wl,--export-all-symbols -Wl,--enable-auto-import)
+# -static：把 libc++ / libunwind / libwinpthread 都静态链进去，dmhost.exe 单文件就能跑（双击启动的 bat 里没有工具链的 bin 目录，缺 dll 会以 0xC0000135 秒退）
+# -static: link libc++ / libunwind / libwinpthread statically so dmhost.exe runs on its own (the double-clickable bat has no toolchain bin directory on PATH; a missing dll made it exit at once with 0xC0000135)
+target_link_options(dmhost PRIVATE -static -Wl,--export-all-symbols -Wl,--enable-auto-import)
 target_link_libraries(dmhost PRIVATE ${DM_VULKAN_DLL})
 set_target_properties(dmhost PROPERTIES OUTPUT_NAME dmhost)
+# 运行期 DLL 摆在 exe 旁边：llvm-mingw 的 -static 吃掉了 libc++ / libunwind，但 libwinpthread-1.dll 仍是导入项，
+# 而双击启动的 bat 里没有工具链的 bin 目录（缺 dll 时进程以 0xC0000135 秒退、日志里一个字都没有）
+# Runtime dlls sit next to the exe: llvm-mingw's -static takes care of libc++ / libunwind, but libwinpthread-1.dll is still an import
+# and the double-clickable bat has no toolchain bin directory on PATH (a missing dll exits at once with 0xC0000135 and nothing in the log)
+get_filename_component(DM_MINGW_BIN ${CMAKE_CXX_COMPILER} DIRECTORY)
+foreach(dll libwinpthread-1.dll libc++.dll libunwind.dll)
+  if(EXISTS ${DM_MINGW_BIN}/${dll})
+    add_custom_command(TARGET dmhost POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DM_MINGW_BIN}/${dll} $<TARGET_FILE_DIR:dmhost>)
+  endif()
+endforeach()
