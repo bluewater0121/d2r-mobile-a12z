@@ -38,6 +38,7 @@ uint32_t dm_padmode_rebuilds(void);   // dm/host/dm_padmode.c：布局重建次�
 #include "../host/dm_i18n.h"
 #include "../host/dm_input.h"
 #include "../ios/Sources/dm_touch_controls.h"
+#include "../host/front.h"   // front_game_res：还原窗口时重新算视图矩形 | recompute the view rectangle when the window is restored
 }
 // dm_padmode 没有公共头，各家前端各自声明（它与 iOS / Mac 同一个实现）| dm_padmode has no public header; each front end declares it (same implementation as iOS / Mac)
 extern "C" void dm_padmode_request(int pad);
@@ -55,6 +56,7 @@ static int g_noart;                    // DM_WIN_TOUCH_NOICON=1：只画矢量�
 static std::atomic<int> g_in_run;      // 局内（浮层可见、触屏布局） | in a run (overlay visible, touch layout)
 static std::atomic<int> g_always;      // DM_WIN_TOUCH_ALWAYS=1：前端页面也用触屏布局（页面按钮栏还没有，测试用） | touch layout in the front end too (its ribbon is not implemented yet; for testing)
 static HWND g_game, g_ov;
+static int g_child;                    // g_ov 是游戏窗口的子窗口（正常路径）；0 = 退回独立置顶弹窗 | g_ov is a child of the game window (normal path); 0 = fell back to a topmost popup
 static std::atomic<int> g_pad_in;      // 实体手柄的「明确输入」接管（iOS 的 _padMode）：成立就收起浮层、手柄布局归手柄 | controller owns the input: overlay hidden
 static int g_vx, g_vy, g_vw, g_vh;     // 视图矩形（客户区像素） | view rectangle (client pixels)
 static float g_px = 1.0f;              // 每个 dp 几个像素 | pixels per dp
@@ -733,6 +735,12 @@ static void paint(void) {
     }
 
     POINT src = {0, 0};
+    SIZE sz = {g_vw, g_vh};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    // 位置：顶层窗口用屏幕坐标交给 UpdateLayeredWindow；子窗口的位置由 dm_win_touch_layout 用父客户区坐标摆好，
+    // 但 ULW 的 pptDst 还是按屏幕坐标解释（实测传 NULL 会 ERROR_INVALID_PARAMETER 87），所以这里给它的屏幕坐标
+    // Position: the top-level case hands screen coordinates to UpdateLayeredWindow; a child is placed by dm_win_touch_layout in the parent's
+    // client coordinates, but ULW still interprets pptDst as screen coordinates (passing NULL gave ERROR_INVALID_PARAMETER 87), so give it those.
     POINT dst = {0, 0};
     if (!ClientToScreen(g_game, &dst)) {
         static int once;
@@ -740,8 +748,6 @@ static void paint(void) {
         RECT rc; GetWindowRect(g_game, &rc); dst.x = rc.left; dst.y = rc.top;
     }
     dst.x += g_vx; dst.y += g_vy;
-    SIZE sz = {g_vw, g_vh};
-    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     BOOL ok = UpdateLayeredWindow(g_ov, NULL, &dst, &sz, g_mdc, &src, 0, &bf, ULW_ALPHA);
     // 分层窗口贴图是否真的成功：失败时桌面截屏又拿不到证据，只能靠返回值和 GetLastError 说话
     // Whether the layered blit actually succeeded: with no usable screen capture, the return value and GetLastError are the only evidence
@@ -749,7 +755,7 @@ static void paint(void) {
     int now = ok ? 1 : 2;
     if (now != said) {
         said = now;
-        if (ok) LOG("触屏浮层：贴图成功，窗口 %ld,%ld %ldx%ld（可见 %d）", (long)dst.x, (long)dst.y, (long)sz.cx, (long)sz.cy, IsWindowVisible(g_ov));
+        if (ok) LOG("触屏浮层：贴图成功，子窗口 %ldx%ld（可见 %d）", (long)sz.cx, (long)sz.cy, IsWindowVisible(g_ov));
         else LOG("触屏浮层：贴图失败，GetLastError=%lu", GetLastError());
     }
     dump_bmp();
@@ -794,9 +800,12 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
 }
 
-// z 序排名（0 = 最靠前）：从桌面的最上层窗口顺着 GW_HWNDNEXT 往下数。GW_HWNDPREV 只给紧邻一号，中间夹着任务栏 / IME 时看不出
-// Z-order rank (0 = frontmost): walk GW_HWNDNEXT down from the desktop's top window. GW_HWNDPREV gives only the immediate neighbour, which hides
-// the overlay's real position when the taskbar / IME sits in between
+// z 序排名（0 = 最靠前）：从桌面的最上层窗口顺着 GW_HWNDNEXT 往下数。top-level 弹窗时代用来核「浮层有没有掉到游戏窗口后面」；
+// 切成子窗口之后只剩兄弟之间比较（用 GW_HWNDPREV 就够），这个函数不再需要，留着是因为排障时还想全桌面数一遍。
+// Z-order rank (0 = frontmost), walking GW_HWNDNEXT down from the desktop's top window. It was used to check "did the overlay fall behind
+// the game window" back when this was a top-level popup; as a child window only siblings matter (GW_HWNDPREV suffices), so this is here purely
+// as a debugging aid for counting the whole desktop.
+static int z_rank(HWND h) __attribute__((unused));
 static int z_rank(HWND h) {
     if (!h) return -1;
     int i = 0;
@@ -805,8 +814,16 @@ static int z_rank(HWND h) {
 }
 
 void dm_win_touch_layout(int vx, int vy, int vw, int vh) {    if (!g_on) return;
+    // 最小化那一拍 WM_SIZE 给的是 0x0：别把布局和子窗口一起缩成 1x1（还原回来的 WM_SIZE 之前浮层会是一颗小点）
+    // The WM_SIZE fired by minimizing reports 0x0: do not shrink the layout and the child window down to 1x1 (the overlay would be a dot
+    // until the WM_SIZE that comes with restoring)
+    if (vw <= 0 || vh <= 0) return;
     g_vx = vx; g_vy = vy; g_vw = vw; g_vh = vh;
     { std::lock_guard<std::mutex> lk(g_mx); layout_make(); }
+    // 子窗口的位置是父客户区坐标：跟着视图矩形摆好（改窗口大小 / 全屏切换时由前端调进来）
+    // A child window's position is in the parent's client coordinates: place it on the view rectangle (the front end calls this on resize / fullscreen)
+    if (g_ov && g_child) SetWindowPos(g_ov, HWND_TOP, vx, vy, vw > 0 ? vw : 1, vh > 0 ? vh : 1,
+                                      SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     g_dirty.store(1);
 }
 
@@ -835,52 +852,70 @@ void dm_win_touch_tick(void) {
     // half-built screens (iOS front_ios.m:497 folds dm_padmode_busy() into hide every frame)
     static int revealed;   // 这一次露出做过「抬到最前」了没有（隐藏时清零）| whether this reveal already did the raise (cleared on hide)
     {
-        int run = g_in_run.load(), pad = g_pad_in.load(), busy = dm_padmode_busy() ? 1 : 0;
-        int want = (run && !pad && !busy) ? 1 : 0;
-        // 显隐变化时打一行（三个判据都打出来）：真机上「按了手柄浮层还在」时，一眼能看出是哪个判据没成立
-        // Log one line per visibility change with all three conditions: when the overlay stays up on a real controller press, this shows
+        int run = g_in_run.load(), pad = g_pad_in.load(), busy = dm_padmode_busy() ? 1 : 0, mini = IsIconic(g_game) ? 1 : 0;
+        int want = (run && !pad && !busy && !mini) ? 1 : 0;
+        // 显隐变化时打一行（判据都打出来）：真机上「按了手柄浮层还在」时，一眼能看出是哪个判据没成立
+        // Log one line per visibility change with every condition: when the overlay stays up on a real controller press, this shows
         // immediately which condition did not hold
         static int want_prev = -1;
-        if (want != want_prev) { want_prev = want; LOG("触屏浮层：%s（运行 %d 手柄接管 %d 切换中 %d）", want ? "露出" : "收起", run, pad, busy); }
+        if (want != want_prev) { want_prev = want; LOG("触屏浮层：%s（运行 %d 手柄接管 %d 切换中 %d 最小化 %d）", want ? "露出" : "收起", run, pad, busy, mini); }
         if (!want) { if (IsWindowVisible(g_ov)) ShowWindow(g_ov, SW_HIDE); revealed = 0; return; }
     }
     if (!IsWindowVisible(g_ov)) {
         ShowWindow(g_ov, SW_SHOWNA);
         g_dirty.store(1);
     }
-    // 露出之后必须确认它真的压在游戏窗口上面。`SetWindowPos(g_ov, g_game, …)` 那个写法是把浮层插到 g_game **下面**（z 序里 after = below），
-    // 于是「贴图成功、可见=1、桌面上什么都没有」；而改变窗口大小 / 最小化再恢复会让系统把 owned 窗口重新抬到 owner 上面，所以那两下能把它弄出来。
-    // 现在露出时用 HWND_TOPMOST 把它放到 topmost 带的最顶，并用 z 序排名核对（GW_HWNDPREV 只给紧邻上一号，中间夹着任务栏 / IME 就看不出来）。
-    // After revealing, make sure it really sits above the game window. `SetWindowPos(g_ov, g_game, ...)` inserts the overlay *below* g_game
-    // (after = below in z-order), which gives "blit succeeded, visible=1, nothing on screen"; resizing or minimizing/restoring makes the system
-    // raise the owned window above its owner, which is why those two gestures brought it back. HWND_TOPMOST puts it at the top of the topmost band
-    // instead, and the z-order rank is checked (GW_HWNDPREV only gives the immediate neighbour, and the taskbar / IME can sit in between).
+    // 子窗口的 z 序只在**同一父窗口的兄弟之间**有意义：浮层排到兄弟最前（HWND_TOP）就不会被游戏窗口自己的子窗口（IME 候选窗之类）压住。
+    // 早先 top-level 时代那套 HWND_TOPMOST + z_rank 全窗口排名到这里就没用了——子窗口本来就跟着父窗口走，不需要压住整个桌面。
+    // A child window's z order only matters among its **siblings under the same parent**: putting it at HWND_TOP keeps the game window's own
+    // child windows (IME candidates and such) from covering it. The old top-level HWND_TOPMOST + z_rank desktop ranking is pointless here -- a
+    // child already follows its parent and never needs to sit above the whole desktop.
     {
         int vis = IsWindowVisible(g_ov) ? 1 : 0;
-        // 只有当游戏窗口在前台时才把浮层抬到最顶：不然玩家切到别的程序，浮层会压在别人上面
-        // Only raise the overlay while the game window is in the foreground: otherwise it would sit on top of whatever app the player switched to
-        HWND fg = GetForegroundWindow();
-        int front = fg && (fg == g_game || IsChild(g_game, fg));
         if (vis && !revealed) {
             revealed = 1;
-            if (front) SetWindowPos(g_ov, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            SetWindowPos(g_ov, g_child ? HWND_TOP : HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            HWND par = GetParent(g_ov);
             RECT rr; GetWindowRect(g_ov, &rr);
-            LOG("触屏浮层：露出 可见=%d 矩形=%ld,%ld %ldx%ld 视图=%d,%d %dx%d z序 浮层=%d 游戏=%d（小 = 更靠前）", vis,
-                (long)rr.left, (long)rr.top, (long)(rr.right - rr.left), (long)(rr.bottom - rr.top), g_vx, g_vy, g_vw, g_vh,
-                z_rank(g_ov), z_rank(g_game));
-        } else if (vis && front) {
-            // 露着的时候每 8 拍核一次 z 序：点游戏窗口 / 切回前台都会把游戏窗口抬上来，浮层就被压回它下面（视觉上「浮层没了」）
-            // Every 8 ticks while visible, check the z order: clicking into the game or switching back to it raises the game window, which drops
-            // the overlay behind it (visually "the overlay is gone")
+            LOG("触屏浮层：露出 可见=%d %s=%ld,%ld %ldx%ld 视图=%d,%d %dx%d 父=%s 最小化=%d", vis,
+                g_child ? "子窗口" : "弹窗", (long)rr.left, (long)rr.top, (long)(rr.right - rr.left), (long)(rr.bottom - rr.top),
+                g_vx, g_vy, g_vw, g_vh, par == g_game ? "游戏窗口" : "不是游戏窗口", IsIconic(g_game) ? 1 : 0);
+        } else if (vis && g_child) {
+            // 露着的时候每 8 拍核一次兄弟 z 序：有东西排到它前面（GW_HWNDPREV 非空）就重新排到最前
+            // Every 8 ticks while visible, check the sibling z order: if anything sits in front of it (GW_HWNDPREV is non-null), move it back to the top
             static int beat;
             if (++beat >= 8) {
                 beat = 0;
-                int a = z_rank(g_ov), b = z_rank(g_game);
-                if (a < 0 || (b >= 0 && a > b)) {
-                    SetWindowPos(g_ov, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-                    LOG("触屏浮层：掉到游戏窗口后面，重新抬起（浮层 %d 游戏 %d）", a, b);
+                HWND prev = GetWindow(g_ov, GW_HWNDPREV);
+                if (prev) { SetWindowPos(g_ov, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER); LOG("触屏浮层：被兄弟窗口压住，重新排到最前"); }
+            }
+        }
+    }
+    // 游戏最小化时子窗口本来就不画：这一拍别再做全屏位图（省 CPU，也免得在还原的那一帧才补上）
+    // While the game is minimized the child window is not drawn at all, so skip the full-screen blit this tick (saves CPU and avoids catching up on restore)
+    // 还原回来不用单独挪窗口：贴图那一步把屏幕坐标重新算了一遍（ClientToScreen + 视图偏移），系统停在 -32000 的「停车位」
+    // 会被下一次 UpdateLayeredWindow 摆回来
+    // Nothing extra is needed on restore: the blit recomputes the screen position (ClientToScreen plus the view offset) every time, so the system's
+    // -32000 "parking spot" is corrected by the next UpdateLayeredWindow.
+    if (IsIconic(g_game)) return;
+    // 还原回来若视图还是 0（最小化那拍被挡掉的尺寸），重新从客户区量一次，别让浮层停在 1x1
+    // If the view is still 0 after restoring (the size was dropped while minimized), measure the client area again so the overlay does not
+    // stay at 1x1
+    if (g_vw <= 0 || g_vh <= 0) {
+        RECT rc; if (GetClientRect(g_game, &rc) && rc.right > 0 && rc.bottom > 0) {
+            // 视图矩形（客户区里的画面矩形，letterbox 两侧留黑）：和 front_win.c 的 view_rect 同一套算法
+            int vx = 0, vy = 0, vw = rc.right, vh = rc.bottom;
+            uint64_t r = front_game_res(1); double gw = (double)(uint32_t)r, gh = (double)(r >> 32);
+            if (gw > 0 && gh > 0) {
+                double ga = gw / gh, wa = (double)rc.right / rc.bottom;
+                if (fabs(wa / ga - 1) >= 0.01) {
+                    int w = rc.right, h = rc.bottom;
+                    if (wa > ga) w = (int)floor(rc.bottom * ga); else h = (int)floor(rc.right / ga);
+                    vx = (rc.right - w) / 2; vy = (rc.bottom - h) / 2; vw = w; vh = h;
                 }
             }
+            dm_win_touch_layout(vx, vy, vw, vh);
+            g_dirty.store(1);
         }
     }
     // 摇杆头没动、状态没变就不重画（拖动时每帧一张全屏位图太贵）| skip repainting when neither the thumb nor anything else moved
@@ -927,13 +962,26 @@ void dm_win_touch_start(void *game_hwnd) {
     wc.cbSize = sizeof wc; wc.lpfnWndProc = ov_proc; wc.hInstance = hi;
     wc.lpszClassName = "dmhost_touch_overlay";
     if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
-    // WS_EX_TOPMOST：游戏窗口自己是 topmost（front_win.c 的 create_window），普通 owned 弹出窗会被压在下面（贴图成功但看不见）
-    // WS_EX_LAYERED：贴预乘位图；WS_EX_TRANSPARENT：鼠标事件全部落到下面的游戏窗口；WS_EX_NOACTIVATE：点它不抢焦点
-    // WS_EX_TOPMOST: the game window itself is topmost (create_window in front_win.c), and an ordinary owned popup ends up *under* it
-    // (the blit succeeds but nothing is visible). WS_EX_LAYERED: blit a premultiplied bitmap; WS_EX_TRANSPARENT: every mouse event falls to
-    // the game window below; WS_EX_NOACTIVATE: it never takes the focus (unreachable anyway)
-    g_ov = CreateWindowExA(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+    // 做成游戏窗口的**子窗口**，不是独立置顶弹窗：子窗口天然跟着父窗口裁剪、移动、最小化、销毁，
+    // 也就是「画在游戏窗口里」——Alt-Tab 看不到它，切到别的程序它不会浮在人家上面，游戏最小化时它也不会留在桌面上。
+    // 但本机实测：带 WS_EX_LAYERED 建 WS_CHILD 直接失败（CreateWindowEx 返回空、错误码 0）；先建普通子窗口再补
+    // WS_EX_LAYERED 能建出来，可 UpdateLayeredWindow 一律 ERROR_INVALID_PARAMETER(87)，贴不上图。
+    // 于是改用「照常建分层弹窗（这条路径已验证可用）→ SetParent 挂到游戏窗口下」：分层表面保留，同时拿到子窗口的裁剪与随窗口生灭。
+    // Make it a **child window** of the game window rather than an independent topmost popup: a child is clipped, moved, minimized and destroyed
+    // together with its parent -- i.e. drawn inside the game window; Alt-Tab does not list it, another app does not get it floating on top, and
+    // minimizing the game does not leave it on the desktop. Measured here: creating WS_CHILD with WS_EX_LAYERED fails outright (CreateWindowEx
+    // returns NULL, error 0), and creating a plain child then adding WS_EX_LAYERED builds the window but UpdateLayeredWindow always returns
+    // ERROR_INVALID_PARAMETER (87). So: create the layered popup as before (that path is proven) and SetParent it under the game window -- the
+    // layered surface survives and the child-window behaviour (clipping, minimized with the parent) comes along.
+    g_ov = CreateWindowExA(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
                            wc.lpszClassName, "dmhost touch overlay", WS_POPUP, 0, 0, 1, 1, g_game, NULL, hi, NULL);
+    if (g_ov) {
+        SetWindowLongPtrA(g_ov, GWL_STYLE, (GetWindowLongPtrA(g_ov, GWL_STYLE) & ~(LONG_PTR)WS_POPUP) | WS_CHILD);
+        SetParent(g_ov, g_game);
+        g_child = (GetParent(g_ov) == g_game) ? 1 : 0;   // 认亲成功才算子窗口 | only a child if the reparenting took
+        SetWindowPos(g_ov, HWND_TOP, 0, 0, 1, 1, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        LOG("触屏浮层：覆盖层挂成子窗口（父=游戏窗口 %d）", g_child);
+    }
     if (!g_ov) { LOG("触屏浮层：覆盖层窗口建不出来（%lu）", GetLastError()); return; }
 
     { std::lock_guard<std::mutex> lk(g_mx); dm_tc_init(&g_tc, 667.0f, 375.0f); }

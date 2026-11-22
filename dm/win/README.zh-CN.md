@@ -226,6 +226,32 @@ z 序里 `hWndInsertAfter = g_game` 是**放到它后面**（below），所以�
 
 实测：`-Hold 8`（8 ms 的超短点按，必定走脉冲）→ `按键 0 → 0x4` → `脉冲收回 0x4（取了 9 次，按住 158 ms）` → `按键 0x4 → 0`，不再永久按住；`tap-seq` 连点十下，每一下都是 `0 → 0x?` 紧接 `0x? → 0`。
 
+**22. 浮层不在游戏窗口里（全局浮在最上面，游戏最小化还留在桌面上）——它原先是一个独立置顶弹窗。**
+`dm_win_touch_start` 建的是 `WS_POPUP + WS_EX_TOPMOST` 的独立窗口，再用 `UpdateLayeredWindow` 的 `pptDst` 把它摆到游戏客户区原点。这样它和游戏窗口之间只有「碰巧对齐」的关系：不裁剪、不随窗口移动、最小化不跟着收，Alt-Tab 也能看到它，切到别的程序它照样压在人家上面。
+
+改法是把它做成游戏窗口的**子窗口**。这里踩了三层：
+
+- 直接带 `WS_EX_LAYERED` 建 `WS_CHILD`：本机（Windows 11 ARM64）`CreateWindowEx` 返回空、`GetLastError` 是 **0**；
+- 先建普通子窗口再 `SetWindowLongPtr(GWL_EXSTYLE, … | WS_EX_LAYERED)`：窗口能建出来，但 `UpdateLayeredWindow` 一律 `ERROR_INVALID_PARAMETER (87)`，贴不上图（`pptDst` 传 NULL、传屏幕坐标都一样）；
+- 能跑通的写法：**照常建分层弹窗（这条路径已经验证可用），再 `SetWindowLongPtr(GWL_STYLE, …) 去掉 WS_POPUP 加上 WS_CHILD` + `SetParent(g_ov, g_game)`**。分层表面保留，同时拿到子窗口的全部性质。
+
+配套改动：
+
+- 位置由 `dm_win_touch_layout` 用父客户区坐标摆（`SetWindowPos(g_ov, HWND_TOP, vx, vy, vw, vh, …)`），贴图那一步仍按屏幕坐标给 `pptDst`（`ClientToScreen(g_game) + 视图偏移`）——两者不冲突，且还原窗口时正是靠这一步把系统停在 −32000 的「停车位」摆回来；
+- 显隐判据加上 `IsIconic(g_game)`：最小化就收起（日志 `收起（运行 1 手柄接管 0 切换中 0 最小化 1）`）；
+- `dm_win_touch_layout` 忽略 0×0（最小化那一拍 WM_SIZE 给的就是 0×0，否则子窗口会被缩成 1×1）；还原后若视图仍为 0，就用 `front_game_res` 重算一次视图矩形；
+- z 序只在**同一父窗口的兄弟之间**有意义了：露出时 `HWND_TOP`，露着时每 8 拍看 `GetWindow(g_ov, GW_HWNDPREV)` 有没有东西压上来（原来那套全桌面 `HWND_TOPMOST` + `z_rank` 排名不再需要）。
+
+实测（`touch-probe` 里 68 s 最小化、8 s 后还原）：
+```
+覆盖层挂成子窗口（父=游戏窗口 1）
+露出 可见=1 子窗口=480,254 1600x900 视图=0,0 1600x900 父=游戏窗口 最小化=0
+贴图成功，子窗口 1600x900（可见 1）
+收起（运行 1 手柄接管 0 切换中 0 最小化 1）          ← 最小化那一拍
+露出 可见=1 子窗口=480,254 1600x900 … 最小化=0       ← 还原之后位置与尺寸都对
+```
+点按链路不受影响（`手指按下 … 目标 0/1/2 → 触屏控件` 后照常 `按键 0 → 0x1/0x2/0x4`）；`tap-seq` 帧率 `avg 52.5 / 末 20 51.5`，与之前同档。
+
 
 ## 排障
 
