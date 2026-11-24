@@ -22,6 +22,9 @@
 #include <time.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
+#if defined(_WIN32)
+#include <save_txn_win.h>   // 存档快照代（dm/win/compat/save_txn_win.c）：提交不再换目录名 | save snapshots: commit never renames a directory
+#endif
 
 #define RES_PATH_NOT_FOUND 0x202u      // fs 模块 2，描述 1 | fs module 2, description 1
 #define RES_PATH_EXISTS    0x402u      // fs 模块 2，描述 2 | fs module 2, description 2
@@ -99,6 +102,62 @@ static int dm_fs_test_fail(const char *pt) {
     return 0;
 }
 static int in_txn_dir(const char *hp) { for (int i = 0; i < g_nmnt; i++) { size_t n = strlen(g_mnt[i].dir); if (g_mnt[i].commit[0] && !strncmp(hp, g_mnt[i].dir, n) && (hp[n] == '/' || !hp[n])) return 1; } return 0; }
+// 存档挂载内的逻辑删除（墓碑）：删不掉的文件记在这里，访客一律当它不存在；紧接着对同名目标的改名按「替换」处理。
+// 于是游戏的「写临时文件 → 删旧的 → 改名」在宿主上塌缩成一次 MoveFileEx(REPLACE_EXISTING)：两个可能失败的步骤变成一个，
+// 失败也不再被「提交照常成功」吞掉（这是「保存并退出偶尔没存上」的根）。
+// Logical deletion inside the save mount (tombstone): a file that cannot be removed is remembered here, the guest is told it no longer
+// exists, and a rename onto the same name right afterwards is done as a replace. The game's "write temp -> delete old -> rename"
+// collapses into one MoveFileEx(REPLACE_EXISTING); two fallible steps become one, and a failure is no longer swallowed by a
+// commit that "succeeds" anyway (the root of "Save and Exit sometimes does not persist").
+#if defined(_WIN32)
+#define TOMB_MAX 32
+static char g_tomb[TOMB_MAX][1024];
+static int g_ntomb;
+static pthread_mutex_t g_tomb_lock = PTHREAD_MUTEX_INITIALIZER;
+static int tomb_has(const char *hp) {
+    int r = 0; pthread_mutex_lock(&g_tomb_lock);
+    for (int i = 0; i < g_ntomb; i++) if (!_stricmp(g_tomb[i], hp)) { r = 1; break; }
+    pthread_mutex_unlock(&g_tomb_lock); return r;
+}
+static void tomb_add(const char *hp) {
+    pthread_mutex_lock(&g_tomb_lock);
+    int have = 0; for (int i = 0; i < g_ntomb; i++) if (!_stricmp(g_tomb[i], hp)) { have = 1; break; }
+    if (!have && g_ntomb < TOMB_MAX) strlcpy(g_tomb[g_ntomb++], hp, sizeof g_tomb[0]);
+    pthread_mutex_unlock(&g_tomb_lock);
+}
+static void tomb_del(const char *hp) {
+    pthread_mutex_lock(&g_tomb_lock);
+    for (int i = 0; i < g_ntomb; i++) if (!_stricmp(g_tomb[i], hp)) { strlcpy(g_tomb[i], g_tomb[--g_ntomb], sizeof g_tomb[0]); break; }
+    pthread_mutex_unlock(&g_tomb_lock);
+}
+static void tomb_clear(void) { pthread_mutex_lock(&g_tomb_lock); g_ntomb = 0; pthread_mutex_unlock(&g_tomb_lock); }
+static int tomb_hide(const char *hp) { return in_txn_dir(hp) && tomb_has(hp); }
+// 提交前把这批路径交给快照模块跳过（物理上还删不掉的文件不能进快照） | hand the still-locked paths to the snapshot module to skip
+static void tomb_to_skip(void) {
+    pthread_mutex_lock(&g_tomb_lock);
+    const char *p[TOMB_MAX]; int n = g_ntomb;
+    for (int i = 0; i < n; i++) p[i] = g_tomb[i];
+    save_txn_skip(n ? p : NULL, n);
+    pthread_mutex_unlock(&g_tomb_lock);
+}
+#else
+static int tomb_hide(const char *hp) { (void)hp; return 0; }
+static void tomb_clear(void) {}
+static void tomb_add(const char *hp) { (void)hp; }
+static void tomb_del(const char *hp) { (void)hp; }
+static void tomb_to_skip(void) {}
+#endif
+#if defined(_WIN32)
+#define TXN_MOUNT_NOTE "（事务式存档：原地写，提交时成快照）"
+#define TXN_REEXPAND_FAIL "重新展开工作目录失败"
+#define TXN_REEXPANDED "已按最新快照重新展开"
+#define TXN_REEXPAND_FAILED "没能重新展开（见上一行）"
+#else
+#define TXN_MOUNT_NOTE "（事务式存档：工作目录，Commit 原子换入）"
+#define TXN_REEXPAND_FAIL "重新克隆工作目录失败"
+#define TXN_REEXPANDED "已从已提交版重新克隆"
+#define TXN_REEXPAND_FAILED "没能重新克隆（见上一行）"
+#endif
 static int rm_tree(const char *p);
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
@@ -111,6 +170,24 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         strlcpy(g_mnt[g_nmnt].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[0].overlay);
     int txn_err = 0;   // 事务目录建不起来（清不掉残留 / 克隆失败，盘满时真实可能）：不退出，改成只读挂载已提交目录——角色照常读得到，写一律失败、提交为空操作，已提交版本一个字节不动 | The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only instead. Characters still load, every write fails, commits are no-ops, and not one byte of the committed version changes
     if (txn) {
+#if defined(_WIN32)
+        // 快照代：锁 → 迁移 / 找最新 → 展开回 $DM_SAVE。挂载点就是 $DM_SAVE 本身，没有 .work。
+        // Snapshot generations: lock, migrate / find newest, expand back over $DM_SAVE. The mount point is $DM_SAVE itself, no .work.
+        char gen[64] = "";
+        int pr = save_txn_lock(dir) == 0 ? save_txn_prepare(dir, gen, sizeof gen) : -2;
+        if (pr < 0) { txn_err = errno ? errno : EIO; g_mnt[g_nmnt].ro = 1; strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
+            LOG("【红】存档事务：%s（errno=%d）——改为只读挂载 %s：本局存档写不进去，已提交版本不变",
+                pr == -2 ? "另一个实例持有存档锁" : "快照目录扫描 / 迁移失败", txn_err, dir); }
+        else if (pr > 0 && save_txn_restore(dir, gen)) { txn_err = errno ? errno : EIO; g_mnt[g_nmnt].ro = 1; strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
+            LOG("【红】存档事务：快照 %s 展开回 %s 失败 errno=%d——改为只读挂载（已提交版本仍在 .txn 里）", gen, dir, txn_err); }
+        else {
+            strlcpy(g_mnt[g_nmnt].commit, dir, sizeof g_mnt[0].commit);
+            strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);           // 挂载点就是 $DM_SAVE：本局写在这里，提交时成快照 | mount point is $DM_SAVE: the run writes here and a commit turns it into a snapshot
+            atomic_store(&g_save_poison, 0);                                // 刚从快照展开（或本来就和它一致），完好 | just expanded from the snapshot (or already equal to it), intact
+            tomb_clear();
+            const char *kp = getenv("DM_SAVE_KEEP"); save_txn_gc(dir, kp ? atoi(kp) : 3);
+            LOG("存档事务：已提交版本 %s（%s）", gen[0] ? gen : "无（本局是第一代）", dir); }
+#else
         char work[1100], neu[1100]; snprintf(work, sizeof work, "%s.work", dir); snprintf(neu, sizeof neu, "%s.new", dir);
         mkdir(dir, 0755);
         const char *why = NULL;
@@ -123,12 +200,13 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
             strlcpy(g_mnt[g_nmnt].commit, dir, sizeof g_mnt[0].commit);
             atomic_store(&g_save_poison, 0);                                // 工作目录刚从已提交版克隆，完好 | the working directory was just cloned from the committed version, intact
             strlcpy(g_mnt[g_nmnt].dir, work, sizeof g_mnt[0].dir); }
+#endif
     } else strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
     g_nmnt++;
     pthread_mutex_unlock(&g_lock);
     if (txn_err) front_save_failed(txn_err);
     if (!ro && !txn) mkdir(dir, 0755);
-    LOG("fs 挂载 %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? "（只读）" : txn ? "（事务式存档：工作目录，Commit 原子换入）" : "", g_mnt[g_nmnt - 1].overlay[0] ? "（overlay 优先）" : "");
+    LOG("fs 挂载 %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? "（只读）" : txn ? TXN_MOUNT_NOTE : "", g_mnt[g_nmnt - 1].overlay[0] ? "（overlay 优先）" : "");
     return RES_OK;
 }
 static Result mount(const char *name, const char *dir, int ro) { return mount_ex(name, dir, ro, 0); }
@@ -543,7 +621,7 @@ static void d2s_report(const char *commit, int n) {
     else LOG("存档提交 #%d：角色档 %s %lld 字节（%s）没变——这次退出没有写新档（只顾了旁路文件）", n, rel, (long long)newest.st_size, ts);
     snprintf(g_d2s_last.rel, sizeof g_d2s_last.rel, "%s", rel); g_d2s_last.size = (long long)newest.st_size; g_d2s_last.mt = (long long)newest.st_mtime;
 }
-HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整树 clone 后与已提交目录原子互换（renamex_np RENAME_SWAP）", Result, h_fs_Commit, const char *name) {
+HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：$DM_SAVE 整树写成新一代快照（.txn 里建目录 + 写 DONE，不改名、不删除）；mac/ios/android 仍是 clone 后与已提交目录原子互换", Result, h_fs_Commit, const char *name) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
     if (i == g_nmnt || !g_mnt[i].commit[0]) { pthread_mutex_unlock(&g_lock); return RES_OK; }   // 非事务挂载：无可提交 | non-transactional mount: nothing to commit
@@ -563,6 +641,14 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
         }
         if (d0) closedir(d0);
         int nopen = 0; for (int k = 0; k < 65536; k++) nopen += g_fsave[k];   // 仍开着的存档文件：重新克隆后这些句柄指向被删的旧工作目录 | save files still open: after re-cloning, these handles point into the deleted old working directory
+#if defined(_WIN32)
+        // 快照代：已提交版本还躺在 .txn 里、一个字节没动，所以只要把 $DM_SAVE 按最新快照重新展开就行——没有改名，被占用的句柄挡不住
+        // Snapshot generations: the committed version still sits untouched in .txn, so just expand $DM_SAVE again from the newest
+        // snapshot -- no rename involved, so a held handle cannot block it
+        char gen[64] = ""; int rerr = 0;
+        int kk = save_txn_prepare(g_mnt[i].commit, gen, sizeof gen);
+        if (kk < 0 || (kk > 0 && save_txn_restore(g_mnt[i].commit, gen))) rerr = errno ? errno : EIO;
+#else
         // 先把已提交版克隆到同级临时目录，成了再与被污染的工作目录原子互换、删掉换下来的；任一步失败都不退出：工作目录留着、「已污染」标记放回去
         // （下次提交照样拒绝、再试一次重新克隆），已提交版本不变（原先先删工作目录再克隆，克隆失败就 die，盘满时进程直接退出、工作目录也没了）
         // First clone the committed version into a sibling temporary directory; once that succeeds, atomically swap it with the tainted work directory and delete the swapped-out one. If any step fails, do not exit: the work directory stays and the "tainted" mark is put back
@@ -572,14 +658,25 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
         else if (dm_fs_test_fail("reclone") || clonefile(g_mnt[i].commit, re, 0)) { rerr = errno ? errno : EIO; rm_tree(re); }
         else if (renamex_np(re, g_mnt[i].dir, RENAME_SWAP)) { rerr = errno ? errno : EIO; rm_tree(re); }
         else rm_tree(re);                                               // 换下来的被污染工作目录 | The swapped-out tainted work directory
-        if (rerr) { save_poison(perr); LOG("【红】存档事务：重新克隆工作目录失败 errno=%d——工作目录不动、保持已污染（下次提交照样拒绝并重试），已提交版本不变", rerr); }
+#endif
+        if (rerr) { save_poison(perr); LOG("【红】存档事务：%s errno=%d——工作目录不动、保持已污染（下次提交照样拒绝并重试），已提交版本不变", TXN_REEXPAND_FAIL, rerr); }
         pthread_mutex_unlock(&g_lock);
-        LOG("【红】存档提交拒绝：本事务有存档写失败 errno=%d（工作目录里 0 字节文件：%s）；已提交版本不变，工作目录%s%s", perr, tl ? torn + 1 : "无", rerr ? "没能重新克隆（见上一行）" : "已从已提交版重新克隆", nopen ? "；【红】仍有存档文件开着" : "");
+        LOG("【红】存档提交拒绝：本事务有存档写失败 errno=%d（工作目录里 0 字节文件：%s）；已提交版本不变，工作目录%s%s", perr, tl ? torn + 1 : "无", rerr ? TXN_REEXPAND_FAILED : TXN_REEXPANDED, nopen ? "；【红】仍有存档文件开着" : "");
         front_save_failed(perr);
         return RES_FAIL;
     }
-    char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
     Result r = RES_OK;
+#if defined(_WIN32)
+    // 提交 = 把 $DM_SAVE 整树复制成新一代快照，最后写 DONE。没有改名、没有删除：这两件事在 Windows 上会被句柄挡住。
+    // Commit = copy the whole $DM_SAVE tree into a new generation and write DONE last. No rename, no delete: those are exactly
+    // what Windows blocks when a handle is open.
+    char snap_gen[64] = ""; int snap_nf = 0; long long snap_nb = 0; unsigned long long snap_dg = 0;
+    tomb_to_skip();                                   // 逻辑删除、物理上还删不掉的文件不能进快照 | logically deleted but still locked: keep them out
+    if (save_txn_snapshot(g_mnt[i].commit, snap_gen, sizeof snap_gen, &snap_nf, &snap_nb, &snap_dg)) {
+        LOG("【红】存档提交：新快照 %s 失败 errno=%d（已提交版本不变）", g_mnt[i].commit, errno ? errno : EIO); r = RES_FAIL; }
+    save_txn_skip(NULL, 0);
+#else
+    char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
     if (!access(neu, F_OK)) rm_tree(neu);
     if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("【红】存档提交：clonefile %s 失败 errno=%d（已提交版本不变）", neu, errno); r = RES_FAIL; }
     else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { int e2 = errno;   // 目录改名被占用挡掉：改走逐个文件覆盖，绝不把这次进度丢掉 | the directory rename was blocked by a held handle: fall back to file-by-file overwrite, never lose this session's progress
@@ -588,9 +685,25 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
         else { LOG("存档提交：原子互换失败 errno=%d → 已逐个文件覆盖进已提交目录（%d 个文件没写成）", e2, bad); if (bad) LOG("【红】存档提交：覆盖时有 %d 个文件没写成，进度可能不全", bad); }
         rm_tree(neu); }
     else rm_tree(neu);                                                  // 换下来的旧版 | the old version that was swapped out
-    // 耗时读数（整数微秒，不带浮点）：提交前钩子、克隆 + 原子互换各多久；从本事务第一次存档写到提交完一共多久（游戏写文件 + 提交，0 = 本事务没有存档写）
-    // Timing readouts (integer microseconds, no floating point): how long the pre-commit hook and the clone + atomic swap each took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
+#endif
+    // 耗时读数（整数微秒，不带浮点）：提交前钩子、快照 / 克隆换入各多久；从本事务第一次存档写到提交完一共多久（游戏写文件 + 提交，0 = 本事务没有存档写）
+    // Timing readouts (integer microseconds, no floating point): how long the pre-commit hook and the snapshot / clone took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+#if defined(_WIN32)
+        LOG("存档提交 #%d：%s → 快照 %s（%d 个文件 %lld 字节）（此前存档写 %d 次）（钩子 %llu 微秒、快照 %llu 微秒、自本事务首次写起 %llu 微秒）",
+            ++n, g_mnt[i].dir, snap_gen, snap_nf, snap_nb, atomic_load(&g_save_writes),
+            (unsigned long long)((tc1 - tc0) / 1000), (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0));
+        atomic_fetch_add(&g_save_commits, 1);
+        d2s_report(g_mnt[i].commit, n);
+        // 新快照与上一代逐字节同摘要：这次提交把「和上次一模一样的存档」存了进去，也就是游戏那一步删/改名吃了瞬时占用——这次等于没存（见 README 坑 28）
+        // Same digest as the previous generation: this commit snapshotted exactly the save that was already there, i.e. the game's delete/rename ate a momentary
+        // sharing violation -- nothing was actually saved (README pit 28)
+        if (g_pubstamp[i] && snap_dg == (unsigned long long)g_pubstamp[i]) LOG("【红】存档提交 #%d：新快照与上一代逐字节相同（摘要 %#llx）——这次没有真的写进存档（游戏那一步很可能删/改名撞了占用）", n, snap_dg);
+        else LOG("存档提交 #%d：新快照内容有更新（摘要 %#llx → %#llx）", n, (unsigned long long)g_pubstamp[i], snap_dg);
+        g_pubstamp[i] = snap_dg;
+        { const char *kp = getenv("DM_SAVE_KEEP"); save_txn_gc(g_mnt[i].commit, kp ? atoi(kp) : 3); }
+        tomb_clear();
+#else
         LOG("存档提交 #%d：%s 原子换入 %s（此前存档写 %d 次）（钩子 %llu 微秒、克隆换入 %llu 微秒、自本事务首次写起 %llu 微秒）", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc1 - tc0) / 1000), (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
         { uint64_t st = tree_stamp(g_mnt[i].commit);
@@ -600,6 +713,7 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv；事务式存档：工作目录整�
           if (g_pubstamp[i] && st == g_pubstamp[i]) LOG("【红】存档提交 #%d：已提交目录一个字节都没变（这次没有真的写进存档——游戏那一步很可能删/改名撞了占用）", n);
           else LOG("存档提交 #%d：已提交目录有更新（指纹 %#llx → %#llx）", n, (unsigned long long)g_pubstamp[i], (unsigned long long)st);
           g_pubstamp[i] = st; }
+#endif
         if (g_dm_save_commit_hook) g_dm_save_commit_hook(g_mnt[i].commit); }   // iCloud 同步（cloud_ios.m）：持着锁调，那边只做 clonefile 快照 | iCloud sync (cloud_ios.m): called with the lock held, that side only takes a clonefile snapshot
     pthread_mutex_unlock(&g_lock);
     return r;
@@ -678,6 +792,7 @@ ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off) {   // 语义同 p
 }
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
     HP(path);
+    if (tomb_hide(hp)) return RES_PATH_NOT_FOUND;   // 逻辑删除的文件对访客不存在 | a logically deleted file does not exist for the guest
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
@@ -790,16 +905,48 @@ static int wr_retry_rename(const char *a, const char *b) {
     return rename(a, b);
 #endif
 }
+#if defined(_WIN32)
+// 一步替换（目标存在也允许）：MoveFileEx 的 REPLACE_EXISTING 本身就是一次原子文件替换，比「先删后改名」少一个失败点
+// One-step replace (destination may exist): MoveFileEx with REPLACE_EXISTING is an atomic file replacement, one failure point
+// fewer than "delete then rename"
+static int wr_replace_rename(const char *a, const char *b) {
+    for (int i = 0; i < 10; i++) {
+        if (MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+        DWORD e = GetLastError();
+        if (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION && e != ERROR_BUSY) break;
+        usleep(30000 + i * 20000);
+    }
+    errno = EACCES; return -1;
+}
+#endif
 HLE_FORCE("_ZN2nn2fs10CreateFileEPKcl", "fsp-srv → open(O_CREAT|O_EXCL)+ftruncate", Result, h_fs_CreateFile, const char *path, int64_t sz) {
     HP_EX(path, 1); RW_CREATE();
-    int fd = open(hp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#if defined(_WIN32)
+    // 逻辑删除过的名字：访客认为它不存在，这里就该建得出来（物理上还在的那份直接覆盖）
+    // A name that was logically deleted: the guest believes it is gone, so it must be creatable here (overwrite the physical leftover)
+    if (tomb_hide(hp)) { tomb_del(hp); flags = O_WRONLY | O_CREAT | O_TRUNC; }
+#endif
+    int fd = open(hp, flags, 0644);
     if (fd < 0) return err_res("create", hp);
     int rc = ftruncate(fd, sz); int e = errno; close(fd);
     if (!rc && set_guest_name(hp, path)) { rc = -1; e = errno; }
     if (rc) unlink(hp);
     errno = e; return rc ? err_res("create", hp) : RES_OK;
 }
-HLE_FORCE("_ZN2nn2fs10DeleteFileEPKc", "fsp-srv → unlink(2)（存档目录里的瞬时占用会重试）", Result, h_fs_DeleteFile, const char *path) { HP(path); RW(); return wr_retry_unlink(hp) ? err_res("unlink", hp) : RES_OK; }
+HLE_FORCE("_ZN2nn2fs10DeleteFileEPKc", "fsp-srv → unlink(2)（存档目录里的瞬时占用：重试，仍删不掉就记成逻辑删除）", Result, h_fs_DeleteFile, const char *path) {
+    HP(path); RW();
+#if defined(_WIN32)
+    if (wr_retry_unlink(hp)) {                       // 杀毒 / 索引器仍占着：对访客算删除成功，物理那份交给快照跳过
+        if (in_txn_dir(hp)) { tomb_add(hp); LOG("存档内删除被占用：%s → 记为逻辑删除（随后的同名改名按替换处理）", hp); return RES_OK; }
+        return err_res("unlink", hp);
+    }
+    tomb_del(hp);
+    return RES_OK;
+#else
+    return wr_retry_unlink(hp) ? err_res("unlink", hp) : RES_OK;
+#endif
+}
 HLE_FORCE("_ZN2nn2fs15CreateDirectoryEPKc", "fsp-srv → mkdir(2)", Result, h_fs_CreateDirectory, const char *path) { HP_EX(path, 1); RW_CREATE();
     if (mkdir(hp, 0755)) return err_res("mkdir", hp);
     if (set_guest_name(hp, path)) { int e = errno; rmdir(hp); errno = e; return err_res("mkdir name", hp); }
@@ -828,8 +975,18 @@ HLE_FORCE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", "fsp-srv → 递归删除
 HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)（存档目录里的瞬时占用会重试）", Result, h_fs_RenameFile, const char *from, const char *to) {
     HP(from); RW(); char hp2[1024];
     if (!host_path_ex(to, hp2, sizeof hp2, NULL, 1)) return err_res("rename path", to);
+#if defined(_WIN32)
+    // 目标是逻辑删除过的名字：允许「替换」——游戏存角色是「写临时 → 删旧的 → 改名」，删那一步失败也能在这里一步顶过去
+    // The destination is a logically deleted name: allow a replace -- the game's "write temp -> delete old -> rename" gets
+    // through in one step even when the delete failed
+    int replace = in_txn_dir(hp2) && tomb_has(hp2);
+    if (!replace && !access(hp2, F_OK)) return RES_PATH_EXISTS;
+    if (replace) { tomb_del(hp2); if (wr_replace_rename(hp, hp2)) { save_poison(errno); return err_res("rename", hp); } }
+    else if (wr_retry_rename(hp, hp2)) return err_res("rename", hp);
+#else
     if (!access(hp2, F_OK)) return RES_PATH_EXISTS;
     if (wr_retry_rename(hp, hp2)) return err_res("rename", hp);
+#endif
     if (dm_fs_test_fail("guestname") || set_guest_name(hp2, to)) { int e = errno ? errno : EIO;
         if (dm_fs_test_fail("renameback") || wr_retry_rename(hp2, hp)) {   // 回退也失败：文件留在新路径、客体名元数据不对；不退出——在事务存档里就让本事务提交被拒（已提交版本不变，重新克隆即复原） | Rollback also failed: the file stays at the new path with wrong guest-name metadata; do not exit. In a transactional save, this transaction's commit is refused (the committed version is unchanged and recloning restores it)
             LOG("【红】fs 改名元数据失败且回退失败 errno=%d：%s 留在新路径%s", errno, hp2, in_txn_dir(hp2) ? "，本事务存档提交将被拒" : ""); if (in_txn_dir(hp2)) save_poison(e); }
@@ -839,6 +996,7 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)（存档目录�
 }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) {
     HP(path); struct stat st;
+    if (tomb_hide(hp)) return RES_PATH_NOT_FOUND;    // 逻辑删除 | logically deleted
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
 }
@@ -899,6 +1057,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
         { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }   // 区段表不给游戏看 | The extent table is not shown to the game
         char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name);
         struct stat st; if (stat(c, &st)) continue;
+        if (tomb_hide(c)) continue;                                      // 逻辑删除的文件不出现在列举里 | a logically deleted file is not listed
         int isdir = S_ISDIR(st.st_mode);
         if (!(h->mode & (isdir ? DIRMODE_DIR : DIRMODE_FILE))) continue;
         DirectoryEntry *o = &ents[n++]; memset(o, 0, sizeof *o);

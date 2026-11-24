@@ -994,11 +994,24 @@ std::vector<uint8_t> load_pipeline_cache(){
 // the graphics thread as before. Only real compiles count as unsaved: a creation under 2 ms came from the driver's cache,
 // and with a warm cache each start counted its ~200 warm-up builds as new and rewrote the cache about six times.
 bool sync_cache_save=false;std::thread cache_saver;std::atomic<bool> cache_save_busy{false};
+// Windows 的 rename() 不覆盖已存在的目标（POSIX 上覆盖是一次原子替换）：缓存文件一旦写过就一直在盘上，
+// 所以改名失败（目标已存在）就先删旧的再改名。缓存丢了只是下次多编几条管线，不影响正确性。
+// Windows' rename() refuses to overwrite an existing target (on POSIX overwriting is one atomic replace): once written,
+// the cache file stays on disk, so a failed rename (target exists) removes the old one and renames again. A lost cache only
+// means a few more pipelines built next boot, never a correctness problem.
+static bool replace_file(const std::string &from, const std::string &to) {
+    if (rename(from.c_str(), to.c_str()) == 0) return true;
+#if defined(_WIN32)
+    remove(to.c_str());
+    if (rename(from.c_str(), to.c_str()) == 0) return true;
+#endif
+    return false;
+}
 void write_pipeline_cache(size_t unsaved){
     uint64_t t0=timing_clock();size_t n=0;bool ok=false;
     if(vkGetPipelineCacheData(cfg.device,pipeline_cache,&n,nullptr)==VK_SUCCESS && n){std::vector<uint8_t> data(n);
         if(vkGetPipelineCacheData(cfg.device,pipeline_cache,&n,data.data())==VK_SUCCESS){std::string path=pipeline_cache_path(),tmp=path+".tmp";
-            if(FILE *f=fopen(tmp.c_str(),"wb")){ok=fwrite(data.data(),1,n,f)==n;ok=fclose(f)==0&&ok;if(ok)ok=rename(tmp.c_str(),path.c_str())==0;}}}
+            if(FILE *f=fopen(tmp.c_str(),"wb")){ok=fwrite(data.data(),1,n,f)==n;ok=fclose(f)==0&&ok;if(ok)ok=replace_file(tmp,path);}}}
     xbg_logf("NVN pipeline cache save bytes=%zu new=%zu ok=%d ms=%.1f on=%s",n,unsaved,int(ok),double(timing_clock()-t0)/1e6,sync_cache_save?"graphics":"saver");
 }
 void cache_save_join(){if(cache_saver.joinable())cache_saver.join();}

@@ -18,18 +18,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
+// Windows 的兼容层把 pwrite 声明成 long / long long（见 dm_win_compat.h），这里跟着它的签名走
+// The Windows compat layer declares pwrite as long / long long (see dm_win_compat.h), so follow that signature here
+#if defined(DM_WIN)
+typedef long fs_ret; typedef long long fs_off;
+#else
+typedef ssize_t fs_ret; typedef off_t fs_off;
+#endif
+static fs_ret fake_pwrite(int fd, const void *buf, size_t n, fs_off off);
 #define pwrite fake_pwrite
 #include "../hle_fs.c"
 #undef pwrite
-ssize_t pwrite(int, const void *, size_t, off_t);
+fs_ret pwrite(int, const void *, size_t, fs_off);
 
 struct dm_flags g_flag; uint64_t g_t0_ns; uint64_t now_ns(void) { return 0; }   // 日志时间戳与读路径的桩（写路径不用） | stubs for log timestamps and the read path (not used by the write path)
 void dm_prof_add(int id, uint64_t ns, uint64_t b) { (void)id; (void)ns; (void)b; } void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
 void dm_fs_save_poison(int e);
 extern int g_nfail, g_lasterr;                                        // 前端通知计数（t_fs_stub.c 的强实现替掉 hle_fs.c 的弱实现） | front-end notification count (the strong implementation in t_fs_stub.c replaces the weak one in hle_fs.c)
 static int g_mode, g_calls;                   // 0 照常写；1 一律返回 0；2 第一次只写 3 字节 | 0 write normally; 1 always return 0; 2 write only 3 bytes the first time
-static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off) {
+static fs_ret fake_pwrite(int fd, const void *buf, size_t n, fs_off off) {
     g_calls++;
     if (g_mode == 1) { if (g_calls > 1000) { printf("  ✗ pwrite 返回 0 后被重试超过 1000 次（死循环）\n"); exit(1); } return 0; }
     if (g_mode == 2 && g_calls == 1 && n > 3) n = 3;

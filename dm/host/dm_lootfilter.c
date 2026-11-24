@@ -48,6 +48,18 @@ int dm_diag_difficulty(void);
 // Lite hides: Stamina / Antidote / Thawing potions, the two lowest tiers of Healing and Mana potions, Town Portal and Identify scrolls and tomes, all throwing potions, low quality (Cracked / Crude) gear, arrows and bolts (when no bow or crossbow is equipped).
 // Heavy also hides: the third tier of Healing and Mana potions; normal-tier white items (socketed / ethereal ones are kept, circlets have no tiers and are kept as a whole); normal-tier magic items (jewelry, circlets and class-specific items are kept).
 // Never hidden at any tier: Rejuvenation potions, keys, Unique, Set, Rare, runes, gems, charms, jewels, quest items and all kinds of materials, gold. The rules simply never mention them.
+// Windows 的 rename() 不覆盖已存在的目标（POSIX 上覆盖就是一次原子替换）。四份规则文件每次启动都还在盘上，
+// 所以改名失败（目标已存在）就先删旧的再改名。这里只是配置：中间少几毫秒不要紧，存档那一路不能这么干（见 docs/SAVE_TXN）。
+// Windows' rename() refuses to overwrite an existing target (on POSIX overwriting is one atomic replace). The four rule
+// files are still on disk on every launch, so a failed rename (target exists) removes the old one and renames again.
+// These are plain config files; a few milliseconds without them is fine, unlike the save path (see docs/SAVE_TXN).
+static int replace_rename(const char *from, const char *to) {
+#if defined(_WIN32)
+    if (!rename(from, to)) return 0;
+    if (remove(to)) return -1;
+#endif
+    return rename(from, to);
+}
 static void write_fltr(const char *dir, const char *name, int heavy, int ammo) {
     char p[1300], t[1320]; snprintf(p, sizeof p, "%s/%s.fltr", dir, name); snprintf(t, sizeof t, "%s.tmp", p);
     FILE *f = fopen(t, "w"); if (!f) { LOG("【红】掉落过滤：规则文件写不了 %s", p); return; }
@@ -63,7 +75,7 @@ static void write_fltr(const char *dir, const char *name, int heavy, int ammo) {
         fprintf(f, "  {\"name\": \"SHOW magic class items\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"magic\"], \"equipmentCategory\": [\"barbh\", \"druid\", \"palad\", \"necro\", \"warlo\", \"amazo\", \"assas\", \"sorce\"]},\n");
         fprintf(f, "  {\"name\": \"HIDE normal-tier white and magic\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"normal\", \"hiQuality\", \"magic\"], \"equipmentQuality\": [\"normal\"]},\n"); }
     fprintf(f, "  {\"name\": \"HIDE low quality\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"lowQuality\"]}\n ]\n}\n");
-    int ok = fclose(f) == 0 && rename(t, p) == 0; if (!ok) LOG("【红】掉落过滤：规则文件没写成 %s", p);
+    int ok = fclose(f) == 0 && replace_rename(t, p) == 0; if (!ok) { remove(t); LOG("【红】掉落过滤：规则文件没写成 %s", p); }
 }
 // 四份：轻 / 重 ×（藏箭矢 / 身上有弓弩不藏箭矢）。挂存档时调（hle_fs.c），内容是固定的，每次启动重写一遍（规则改了老存档也跟上）
 // Four files: lite / heavy × (hide arrows / do not hide arrows with a bow or crossbow equipped). Called on save mount (hle_fs.c); the contents are fixed and rewritten on every launch (so old saves follow rule changes)
